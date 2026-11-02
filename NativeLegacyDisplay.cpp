@@ -52,6 +52,9 @@ extern "C" uint64_t mach_continuous_time(void);
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
     return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1);
 }
+class NativeLegacyDisplay;
+static NativeLegacyDisplay *gTestDisplay;
+
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -158,8 +161,25 @@ public:
         if(!startDisplay(provider))return false;
         startVsync();return true;
     }
+    int drawTestPattern() {
+        if(!bootMapping) return 0;
+        uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
+        uint64_t bytes=bootMapping->getLength();
+        if(!w || !h || !bytes || bytes<h*4)return 0;
+        uint64_t stride=bytes/h;if(stride<w*4 || (stride&3))return 0;
+        volatile uint32_t *base=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
+        if(!base)return 0;
+        uint32_t bw=256,bh=256;if(bw>w)bw=w;if(bh>h)bh=h;
+        uint64_t words=stride/4;
+        for(uint32_t y=0;y<bh;++y){volatile uint32_t *row=base+(uint64_t)y*words;for(uint32_t x=0;x<bw;++x)row[w-bw+x]=0xffff00ffU;}
+        __asm__ volatile("dsb oshst" ::: "memory");
+        return 1;
+    }
     bool startDisplay(IOService *provider) {
+        IOLog("NATIVE_LEGACY: startDisplay provider=%p\n",provider);
         if(!IOMobileFramebufferLegacy::start(provider))return false;
+        gTestDisplay=this;
+        IOLog("NATIVE_LEGACY: base start ok primary=%u mapping=%p\n",primary,bootMapping);
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
@@ -466,13 +486,17 @@ public:
     bool startHardware() override {
         unsigned enabled=0;
         PE_parse_boot_argn("offline-legacy-gop",&enabled,sizeof(enabled));
+        IOLog("NATIVE_LEGACY: startHardware gop=%u\n",enabled);
         if(enabled!=1)return false;
         PE_Video video={};IOService *provider=getProvider();
+        IOLog("NATIVE_LEGACY: startHardware provider=%p\n",provider);
         if(!provider || PE_current_console(&video) || !video.v_baseAddr ||
            !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
+        IOLog("NATIVE_LEGACY: startHardware video=%llx %lux%lu row=%lu display=%lu\n",(unsigned long long)video.v_baseAddr,(unsigned long)video.v_width,(unsigned long)video.v_height,(unsigned long)video.v_rowBytes,(unsigned long)video.v_display);
         IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        IOLog("NATIVE_LEGACY: startHardware mapping=%p\n",mapping);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
@@ -485,6 +509,7 @@ public:
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
             }
         }
+        IOLog("NATIVE_LEGACY: startHardware valid=%d phys=%llx len=%llu\n",valid,mapping?(unsigned long long)mapping->getPhysicalAddress():0,mapping?(unsigned long long)mapping->getLength():0);
         OSSafeReleaseNULL(mapping);return valid;
     }
 #define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
@@ -498,5 +523,6 @@ public:
 #undef LEAF
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
+extern "C" int native_legacy_test_pattern(void) {return gTestDisplay?gTestDisplay->drawTestPattern():0;}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
