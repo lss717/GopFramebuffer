@@ -182,6 +182,8 @@ public:
         uint64_t stride=bytes/h;if(stride<w*4 || (stride&3))return 0;
         volatile uint32_t *base=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
         if(!base)return 0;
+        IOLog("NATIVE_LEGACY_PATTERN: enter base=%p w=%u h=%u stride=%llu\n",
+              base,w,h,(unsigned long long)stride);
         // Top-right 2x2 color panel. The console can overwrite it, so the UFS
         // heartbeat redraws it every ten seconds.
         uint32_t panel=128;
@@ -235,6 +237,8 @@ public:
         uint32_t progressColor=native_legacy_swap_validation_calls?purple:
                                 (native_legacy_transfer_calls?white:black);
         uint32_t x0=w-2*panel,y0=0;
+        IOLog("NATIVE_LEGACY_PATTERN: panel=%u x0=%u y0=%u stage=%08x client=%08x calls=%u\n",
+              panel,x0,y0,stageColor,clientColor,calls);
         fill(x0,y0,panel,panel,stageColor);
         fill(x0+panel,y0,panel,panel,clientColor);
         fill(x0,y0+panel,panel,panel,callsColor);
@@ -265,6 +269,7 @@ public:
         else if(native_cpu_freq_state==5)cpuColor=blue;
         fill(56,8,16,16,cpuColor);
         __asm__ volatile("dsb oshst" ::: "memory");
+        IOLog("NATIVE_LEGACY_PATTERN: exit blink=%u\n",blink);
         return 1;
     }
     bool startDisplay(IOService *provider) {
