@@ -39,6 +39,16 @@ static void finishUnitScalePolicy(bool keep) {
     }
     OSSafeReleaseNULL(unitScaleChosen);unitScaleAdded=false;unitRotationAdded=false;
 }
+static void publishRegistryWord64(IORegistryEntry *entry,const char *key,uint64_t value) {
+    if(!entry)return;
+    OSData *data=OSData::withBytes(&value,sizeof(value));
+    if(data){entry->setProperty(key,data);OSSafeReleaseNULL(data);}
+}
+static void publishRegistryWord32(IORegistryEntry *entry,const char *key,uint32_t value) {
+    if(!entry)return;
+    OSData *data=OSData::withBytes(&value,sizeof(value));
+    if(data){entry->setProperty(key,data);OSSafeReleaseNULL(data);}
+}
 static bool publishOrMatchWord(IORegistryEntry *entry,const char *key,uint32_t value,bool &added) {
     OSObject *previous=entry->getProperty(key);
     if(previous) {
@@ -466,7 +476,13 @@ void native_legacy_display_probe(void) {
     // postModLoad would attempt to register the same metaclasses again.
     if(native_legacy_stage)return;
     IOLog("NATIVE_LEGACY: probe enter\n");
-    native_legacy_stage=1;void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    native_legacy_stage=1;
+    // The original family must be loaded before this subclass registers its
+    // metaclass and publishes the provider. DinnerABC's working CPU path does
+    // the same prerequisite explicitly.
+    kern_return_t familyStatus=OSKextLoadKextWithIdentifier("com.apple.iokit.IOMobileGraphicsFamily");
+    if(familyStatus){native_legacy_meta_status=familyStatus;IOLog("NATIVE_LEGACY: family load status=%d\n",familyStatus);native_legacy_display_checkpoint();return;}
+    void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     IOLog("NATIVE_LEGACY: preModLoad handle=%p\n",handle);
     if(!handle){native_legacy_display_checkpoint();return;}
     native_legacy_display_static_init();native_gop_presenter_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
@@ -485,6 +501,11 @@ void native_legacy_display_probe(void) {
     native_legacy_parent_match=(display->metaCast("IOMobileFramebufferLegacy") && display->metaCast("IOMobileFramebuffer") && display->metaCast("IOService"));
     native_legacy_stage=3;native_legacy_init_result=display->init();
     IOLog("NATIVE_LEGACY: init=%d size=%u parent=%u\n",native_legacy_init_result,native_legacy_object_size,native_legacy_parent_match);
+    if(native_legacy_init_result)display->setProperty("NativeSandboxGrantProcess","backboardd");
+    if(native_legacy_init_result){
+        publishRegistryWord64(display,"IOFBDependentID",1);
+        publishRegistryWord32(display,"IOFBDependentIndex",0);
+    }
     unsigned phase=1;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
     if(native_legacy_init_result && (phase==2 || phase==3 || phase==4)) {
         // IOSurface matches the real IOBSD resource, published by bsd_autoconf.
@@ -544,6 +565,10 @@ void native_legacy_display_late_probe(void) {
         OSArray *ranges=OSArray::withCapacity(1);
         if(nub && memory && ranges && parent && nub->init()) {
             ranges->setObject(memory);nub->setDeviceMemory(ranges);nub->setName("NativeGOPFramebuffer");
+            // The IOMobileFramebuffer/CADisplay provider path expects the same
+            // dependent-display identity words an Apple display node carries.
+            publishRegistryWord64(nub,"IOFBDependentID",1);
+            publishRegistryWord32(nub,"IOFBDependentIndex",0);
             nubAttached=nub->attach(parent);if(nubAttached)nubStarted=nub->start(parent);
             IOLog("NATIVE_LEGACY: nub attach=%d start=%d\n",nubAttached,nubStarted);
             if(nubStarted) {

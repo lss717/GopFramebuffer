@@ -8,6 +8,8 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <kern/clock.h>
+#include <kern/task.h>
+#include <sys/proc.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -27,6 +29,17 @@ extern "C" uint32_t native_legacy_surface_format(OSObject *),native_legacy_surfa
 extern "C" void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy);
 extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *counts,uint64_t other);
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
+// Color-status panel inputs. These are diagnostics only; the panel is drawn
+// from the UFS heartbeat so it remains visible even when the console scrolls.
+extern "C" volatile uint32_t native_legacy_stage;
+extern "C" volatile uint32_t native_boot_flags;
+extern "C" volatile uint32_t native_legacy_client_calls;
+extern "C" volatile uint32_t native_legacy_swap_validation_calls;
+extern "C" volatile uint32_t native_legacy_transfer_calls;
+extern "C" volatile int native_legacy_client_status;
+extern "C" char native_legacy_client_comm[64];
+extern "C" volatile uint32_t native_cpu_freq_state;
+extern "C" volatile uint32_t native_a540_accel_state;
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
 extern "C" bool native_legacy_prepare_scanout(void);
@@ -169,9 +182,87 @@ public:
         uint64_t stride=bytes/h;if(stride<w*4 || (stride&3))return 0;
         volatile uint32_t *base=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
         if(!base)return 0;
-        uint32_t bw=256,bh=256;if(bw>w)bw=w;if(bh>h)bh=h;
-        uint64_t words=stride/4;
-        for(uint32_t y=0;y<bh;++y){volatile uint32_t *row=base+(uint64_t)y*words;for(uint32_t x=0;x<bw;++x)row[w-bw+x]=0xffff00ffU;}
+        // Top-right 2x2 color panel. The console can overwrite it, so the UFS
+        // heartbeat redraws it every ten seconds.
+        uint32_t panel=128;
+        if(panel*2>w)panel=w/2;
+        if(panel*2>h)panel=h/2;
+        if(!panel)return 0;
+        // No diagnostic cell uses pure black or cyan. The neutral cell is a
+        // visible dark gray; backboardd uses a deep blue distinct from green.
+        const uint32_t black=0xff404040U,red=0xffff0000U,green=0xff00ff00U,
+                       blue=0xff0000ffU,deepblue=0xff0080ffU,yellow=0xffffff00U,
+                       magenta=0xffff00ffU,orange=0xffff8000U,purple=0xff8000ffU,
+                       white=0xffffffffU;
+        auto fill=[&](uint32_t x0,uint32_t y0,uint32_t cw,uint32_t ch,uint32_t color) {
+            uint64_t words=stride/4;
+            for(uint32_t y=0;y<ch && y0+y<h;++y) {
+                volatile uint32_t *row=base+(uint64_t)(y0+y)*words;
+                for(uint32_t x=0;x<cw && x0+x<w;++x)row[x0+x]=color;
+            }
+        };
+        // Top-left is the userland frontier, not just the display stage:
+        // red none, yellow logd_helper, orange driverkitd, deep blue backboardd,
+        // green SpringBoard. The panel's presence already proves the GOP
+        // display backend is running.
+        uint32_t stageColor=red;
+        if(native_boot_flags&32)stageColor=purple;       // SpringBoard exited
+        else if(native_boot_flags&64)stageColor=magenta; // backboardd exited
+        else if((native_boot_flags&8) && (native_boot_flags&4))stageColor=white;
+        else if(native_boot_flags&8)stageColor=green;
+        else if(native_boot_flags&4)stageColor=deepblue;
+        else if(native_boot_flags&2)stageColor=orange;
+        else if(native_boot_flags&1)stageColor=yellow;
+        uint32_t clientColor=black;
+        if(native_legacy_client_calls) {
+            const char *comm=native_legacy_client_comm;
+            auto starts=[](const char *s,const char *p) {
+                while(*p)if(*s++!=*p++)return false;
+                return true;
+            };
+            if(starts(comm,"IOMFB_FDR"))clientColor=yellow;
+            else if(starts(comm,"backboard"))clientColor=deepblue;
+            else clientColor=magenta;
+        } else if(native_boot_flags&1024) {
+            clientColor=purple;      // backboardd queried IOMobile*, no match
+        } else if(native_boot_flags&512) {
+            clientColor=blue;        // backboardd queried IOMobile*, matched
+        } else if(native_boot_flags&128) {
+            clientColor=orange;     // backboardd queried some other IOKit class
+        }
+        uint32_t calls=native_legacy_client_calls;
+        uint32_t callsColor=!calls?black:(calls<10?blue:(calls<100?green:orange));
+        uint32_t progressColor=native_legacy_swap_validation_calls?purple:
+                                (native_legacy_transfer_calls?white:black);
+        uint32_t x0=w-2*panel,y0=0;
+        fill(x0,y0,panel,panel,stageColor);
+        fill(x0+panel,y0,panel,panel,clientColor);
+        fill(x0,y0+panel,panel,panel,callsColor);
+        // Right-bottom is split: top half = swap/transfer, bottom half =
+        // backboardd's IOKit matching state (not hidden by the FDR client).
+        uint32_t ikColor=black;
+        if(native_boot_flags&1024)ikColor=purple;
+        else if(native_boot_flags&512)ikColor=blue;
+        else if(native_boot_flags&128)ikColor=orange;
+        fill(x0+panel,y0+panel,panel,panel/2,progressColor);
+        fill(x0+panel,y0+panel+panel/2,panel,panel/2,ikColor);
+        static uint32_t blink;
+        fill(w-16,h-16,16,16,(blink++&1)?white:black);
+        // A540 accelerator probe state: black not attempted, green published,
+        // red IOGPUFamily/start/attach failure.
+        uint32_t accelColor=black;
+        if(native_a540_accel_state==6)accelColor=green;
+        else if(native_a540_accel_state)accelColor=red;
+        fill(w-40,h-16,16,16,accelColor);
+        // CPU frequency observation: gray not run, red low/disabled,
+        // green normal (>=1 GHz), purple OSM map failure.
+        uint32_t cpuColor=black;
+        if(native_cpu_freq_state==2)cpuColor=green;
+        else if(native_cpu_freq_state==1)cpuColor=red;
+        else if(native_cpu_freq_state==3)cpuColor=purple;
+        else if(native_cpu_freq_state==4)cpuColor=orange;
+        else if(native_cpu_freq_state==5)cpuColor=blue;
+        fill(w-64,h-16,16,16,cpuColor);
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
     }
@@ -480,6 +571,8 @@ public:
     }
     IOReturn newUserClient(task_t task,void *security,UInt32 type,IOUserClient **client) override {
         native_legacy_client_enter(task,type);
+        // DinnerABC parity: the FDR loader is allowed to create the real user
+        // client. It is the original family's client, not a synthetic shadow.
         IOReturn status=IOMobileFramebufferLegacy::newUserClient(task,security,type,client);
         native_legacy_client_observed(status,status==kIOReturnSuccess && client?*client:nullptr);return status;
     }
@@ -495,7 +588,7 @@ public:
            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
         IOLog("NATIVE_LEGACY: startHardware video=%llx %lux%lu row=%lu display=%lu\n",(unsigned long long)video.v_baseAddr,(unsigned long)video.v_width,(unsigned long)video.v_height,(unsigned long)video.v_rowBytes,(unsigned long)video.v_display);
-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapDefaultCache);
         IOLog("NATIVE_LEGACY: startHardware mapping=%p\n",mapping);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
