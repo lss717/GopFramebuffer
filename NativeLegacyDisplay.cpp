@@ -247,13 +247,14 @@ public:
         fill(x0+panel,y0+panel,panel,panel/2,progressColor);
         fill(x0+panel,y0+panel+panel/2,panel,panel/2,ikColor);
         static uint32_t blink;
-        fill(w-16,h-16,16,16,(blink++&1)?white:black);
+        // H103da: three 16x16 heartbeat/state blocks at top-left.
+        fill(8,8,16,16,(blink++&1)?white:black);
         // A540 accelerator probe state: black not attempted, green published,
         // red IOGPUFamily/start/attach failure.
         uint32_t accelColor=black;
         if(native_a540_accel_state==6)accelColor=green;
         else if(native_a540_accel_state)accelColor=red;
-        fill(w-40,h-16,16,16,accelColor);
+        fill(32,8,16,16,accelColor);
         // CPU frequency observation: gray not run, red low/disabled,
         // green normal (>=1 GHz), purple OSM map failure.
         uint32_t cpuColor=black;
@@ -262,7 +263,7 @@ public:
         else if(native_cpu_freq_state==3)cpuColor=purple;
         else if(native_cpu_freq_state==4)cpuColor=orange;
         else if(native_cpu_freq_state==5)cpuColor=blue;
-        fill(w-64,h-16,16,16,cpuColor);
+        fill(56,8,16,16,cpuColor);
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
     }
