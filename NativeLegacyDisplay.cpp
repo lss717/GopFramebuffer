@@ -247,7 +247,7 @@ public:
         fill(x0+panel,y0+panel,panel,panel/2,progressColor);
         fill(x0+panel,y0+panel+panel/2,panel,panel/2,ikColor);
         static uint32_t blink;
-        // H103da: three 16x16 heartbeat/state blocks at top-left.
+        // H103cg-7: three 16x16 heartbeat/state blocks at top-left.
         fill(8,8,16,16,(blink++&1)?white:black);
         // A540 accelerator probe state: black not attempted, green published,
         // red IOGPUFamily/start/attach failure.
