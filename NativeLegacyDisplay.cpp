@@ -250,7 +250,7 @@ public:
         static uint32_t blink;
         // The three 16x16 status cells sit at the top-left corner.
         // Left to right: CPU frequency, A540 accelerator, heartbeat.
-        fill(40,0,16,16,(blink++&1)?white:black);
+        fill(40,0,16,16,(blink++&1)?white:orange);
         // A540 accelerator probe state: black not attempted, green published,
         // red IOGPUFamily/start/attach failure.
         uint32_t accelColor=black;
@@ -266,11 +266,13 @@ public:
         else if(native_cpu_freq_state==4)cpuColor=orange;
         else if(native_cpu_freq_state==5)cpuColor=blue;
         fill(0,0,16,16,cpuColor);
-        // H103 slot writer state: black not ready, yellow window ready but no
-        // successful write, green at least one slot+header write succeeded.
-        uint32_t slotColor=black;
-        if(native_h103_slot_state==2)slotColor=green;
+        // H103 slot writer state: red = thread never entered, blue = thread
+        // entered but window not ready, yellow = ready but write failed,
+        // green = at least one slot+header write succeeded.
+        uint32_t slotColor=red;
+        if(native_h103_slot_state==3)slotColor=blue;
         else if(native_h103_slot_state==1)slotColor=yellow;
+        else if(native_h103_slot_state==2)slotColor=green;
         fill(60,0,16,16,slotColor);
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
