@@ -492,7 +492,6 @@ void native_legacy_display_probe(void) {
     native_legacy_display_static_init();native_gop_presenter_static_init();native_a540_accelerator_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
     IOLog("NATIVE_LEGACY: postModLoad status=%d\n",native_legacy_meta_status);
     if(native_legacy_meta_status){native_legacy_display_checkpoint();return;}
-    native_a540_accelerator_probe();
     PE_Video video={};native_legacy_stage=2;
     IOLog("NATIVE_LEGACY: before PE_current_console\n");
     if(PE_current_console(&video) || !video.v_baseAddr || !video.v_width || !video.v_height || video.v_depth!=32
