@@ -18,10 +18,6 @@ extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 extern "C" IOService *native_gop_presenter_create(void);
-// H103fp: register the A540 IOAcceleratorES subclass in the same
-// preModLoad/postModLoad window as the display classes, then publish it.
-extern "C" void native_a540_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeA540AcceleratorProbe.cpp");
-extern "C" int native_a540_accelerator_probe(void);
 static IOService *pendingLegacyDisplay;
 static IOService *activeGOPPresenter,*activeGOPNub;
 // GPU hand-off presenter (sheng-fb-gpu=1, phase 4): lives beside the display driver, which offers it frames instead of copying them.
@@ -489,7 +485,7 @@ void native_legacy_display_probe(void) {
     void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     IOLog("NATIVE_LEGACY: preModLoad handle=%p\n",handle);
     if(!handle){native_legacy_display_checkpoint();return;}
-    native_legacy_display_static_init();native_gop_presenter_static_init();native_a540_accelerator_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
+    native_legacy_display_static_init();native_gop_presenter_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
     IOLog("NATIVE_LEGACY: postModLoad status=%d\n",native_legacy_meta_status);
     if(native_legacy_meta_status){native_legacy_display_checkpoint();return;}
     PE_Video video={};native_legacy_stage=2;
