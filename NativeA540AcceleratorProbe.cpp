@@ -3,22 +3,24 @@
 // It never touches GPU registers, firmware, SMMU or command submission. Its
 // only purpose is to answer whether backboardd/Metal discovers and queries an
 // accelerator service before the real QcomGPU stack exists.
-#include "../NativeMetal/OriginalAcceleratorABI.h"
+#include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 
-class NativeA540AcceleratorProbe : public IOAcceleratorES {
+class NativeA540AcceleratorProbe : public IOService {
     OSDeclareDefaultStructors(NativeA540AcceleratorProbe)
 public:
     bool start(IOService *provider) override {
         if (!IOService::start(provider)) return false;
-        // H103fp: keep this a bare IOAcceleratorES stub. No MetalPluginName:
-        // there is no NativeAdrenoMetal plugin behind it yet.
+        // H103fs: property-only stub. Do not derive from the prelinked
+        // IOAcceleratorES: the absolute base-class bindings corrupt early
+        // OSMetaClass bookkeeping. Publish the class name as a property so
+        // discovery can be tested without the accelerator ABI.
         setProperty("IOClass", "IOAcceleratorES");
         setProperty("A540Probe", "minimal-no-hardware");
         return true;
     }
 };
-OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOAcceleratorES)
+OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOService)
 
 // Called by LegacyDisplayProbe.cpp between OSMetaClass::preModLoad() and
 // postModLoad(), together with the display and presenter constructors. The
