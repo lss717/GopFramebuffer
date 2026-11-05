@@ -6,6 +6,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 
 class NativeA540AcceleratorProbe : public IOService {
@@ -74,16 +75,28 @@ extern "C" unsigned native_a540_accelerator_instances(void) {
 // default because IOGPU::start expects a real GPU provider.
 extern "C" int native_iogpu_accel_probe(void) {
     native_a540_accel_state = 1;
-    OSObject *object = OSMetaClass::allocClassWithName("IOGPU");
-    const char *name = "IOGPU";
-    if (!object) {
-        object = OSMetaClass::allocClassWithName("IOAcceleratorES");
-        name = "IOAcceleratorES";
+    static const char *names[] = {
+        "IOGPU", "IOGPUDevice", "AGXAccelerator", "IOAcceleratorES", "IOGPUFamily"
+    };
+    OSObject *object = nullptr;
+    IOService *service = nullptr;
+    const char *name = "none";
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        const OSSymbol *symbol = OSSymbol::withCStringNoCopy(names[i]);
+        OSMetaClass *mc = symbol ? const_cast<OSMetaClass *>(OSMetaClass::getMetaClassWithName(symbol)) : nullptr;
+        OSObject *candidate = mc ? mc->alloc() : nullptr;
+        IOService *candidateService = OSDynamicCast(IOService, candidate);
+        IOLog("NATIVE_IOGPU_ACCEL: name=%s mc=%p obj=%p service=%p\n",
+              names[i], mc, candidate, candidateService);
+        if (!object && candidateService) {
+            object = candidate;
+            service = candidateService;
+            name = names[i];
+        } else if (candidate) {
+            candidate->release();
+        }
     }
-    IOService *service = OSDynamicCast(IOService, object);
-    IOLog("NATIVE_IOGPU_ACCEL: class=%s object=%p service=%p\n", name, object, service);
     if (!service) {
-        if (object) object->release();
         native_a540_accel_state = 3;
         return 0;
     }
