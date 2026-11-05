@@ -277,6 +277,27 @@ public:
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
     }
+    // H108: independent heartbeat. Paint only the 16x16 cell at (40,0) so a
+    // 1 Hz driver can prove the kernel is alive without a full 2x2 redraw and
+    // without touching any lock the display family may hold during a client
+    // swap. The framebuffer mapping is uncached device memory.
+    void drawHeartbeatCell() {
+        if(!bootMapping)return;
+        uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
+        uint64_t bytes=bootMapping->getLength();
+        if(!w || !h || bytes<h*4)return;
+        uint64_t stride=bytes/h;if(stride<w*4 || (stride&3))return;
+        volatile uint32_t *base=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
+        if(!base)return;
+        static uint32_t on;
+        uint32_t color=(on++&1)?0xffffffffU:0xffff8000U;
+        uint64_t words=stride/4;
+        for(uint32_t y=0;y<16 && y<h;++y) {
+            volatile uint32_t *row=base+(uint64_t)y*words;
+            for(uint32_t x=40;x<56 && x<w;++x)row[x]=color;
+        }
+        __asm__ volatile("dsb oshst" ::: "memory");
+    }
     bool startDisplay(IOService *provider) {
         IOLog("NATIVE_LEGACY: startDisplay provider=%p\n",provider);
         if(!IOMobileFramebufferLegacy::start(provider))return false;
@@ -628,5 +649,6 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 extern "C" int native_legacy_test_pattern(void) {return gTestDisplay?gTestDisplay->drawTestPattern():0;}
+extern "C" void native_legacy_heartbeat_cell(void) {if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
