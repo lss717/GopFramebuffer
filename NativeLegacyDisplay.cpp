@@ -39,6 +39,7 @@ extern "C" volatile uint32_t native_legacy_transfer_calls;
 extern "C" volatile int native_legacy_client_status;
 extern "C" char native_legacy_client_comm[64];
 extern "C" volatile uint32_t native_cpu_freq_state;
+extern "C" volatile uint32_t native_h103_slot_state;
 extern "C" volatile uint32_t native_a540_accel_state;
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
@@ -265,6 +266,12 @@ public:
         else if(native_cpu_freq_state==4)cpuColor=orange;
         else if(native_cpu_freq_state==5)cpuColor=blue;
         fill(0,0,16,16,cpuColor);
+        // H103 slot writer state: black not ready, yellow window ready but no
+        // successful write, green at least one slot+header write succeeded.
+        uint32_t slotColor=black;
+        if(native_h103_slot_state==2)slotColor=green;
+        else if(native_h103_slot_state==1)slotColor=yellow;
+        fill(60,0,16,16,slotColor);
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
     }
