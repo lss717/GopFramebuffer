@@ -352,6 +352,7 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
         }
         ++stat->calls;if(status)++stat->fails;
         if(selector<kSelectors){++stat->selector_calls[selector];if(status)++stat->selector_fails[selector];stat->selector_status[selector]=(uint32_t)status;}
+        if(stat->calls<16)IOLog("NATIVE_LEGACY: client sel pid=%d selector=%u status=%x\n",stat->pid,selector,(unsigned)status);
     }
     return status;
 }
