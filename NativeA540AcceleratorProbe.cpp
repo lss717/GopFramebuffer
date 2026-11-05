@@ -5,15 +5,14 @@
 // accelerator service before the real QcomGPU stack exists.
 #include "../NativeMetal/OriginalAcceleratorABI.h"
 #include <IOKit/IOLib.h>
-extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 
 class NativeA540AcceleratorProbe : public IOAcceleratorES {
     OSDeclareDefaultStructors(NativeA540AcceleratorProbe)
 public:
     bool start(IOService *provider) override {
         if (!IOService::start(provider)) return false;
-        setProperty("MetalPluginName", "NativeAdrenoMetal");
-        setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
+        // H103fp: keep this a bare IOAcceleratorES stub. No MetalPluginName:
+        // there is no NativeAdrenoMetal plugin behind it yet.
         setProperty("IOClass", "IOAcceleratorES");
         setProperty("A540Probe", "minimal-no-hardware");
         return true;
@@ -21,17 +20,14 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOAcceleratorES)
 
+// Called by LegacyDisplayProbe.cpp between OSMetaClass::preModLoad() and
+// postModLoad(), together with the display and presenter constructors. The
+// global constructor is aliased here so the display probe can find it.
 extern "C" void native_a540_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeA540AcceleratorProbe.cpp");
 volatile uint32_t native_a540_accel_state;
 
 extern "C" int native_a540_accelerator_probe(void) {
     native_a540_accel_state = 1;
-    if (!OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily")) {
-        IOLog("NATIVE_A540_ACCEL: IOGPUFamily load failed\n");
-        native_a540_accel_state = 2;
-        return 0;
-    }
-    native_a540_accelerator_static_init();
     IOService *platform = IOService::getResourceService();
     NativeA540AcceleratorProbe *service = new NativeA540AcceleratorProbe;
     if (!platform || !service || !service->init()) {
