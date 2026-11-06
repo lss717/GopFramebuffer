@@ -340,6 +340,10 @@ public:
         // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
         if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
+        // H140: backboardd registers an IOPropertyMatch notification on
+        // "backlight-control" and only then brings up the display path.
+        // Publish it before the service becomes visible.
+        setProperty("backlight-control",kOSBooleanTrue);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
