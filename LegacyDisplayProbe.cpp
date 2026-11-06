@@ -18,6 +18,9 @@ extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 extern "C" IOService *native_gop_presenter_create(void);
+// H116: the UFS probe exports this to force one log flush from the display event
+// path, which still runs after the UFS read path has gone quiet.
+extern "C" void native_log_flush_hook(void) __attribute__((weak_import));
 static IOService *pendingLegacyDisplay;
 static IOService *activeGOPPresenter,*activeGOPNub;
 // GPU hand-off presenter (sheng-fb-gpu=1, phase 4): lives beside the display driver, which offers it frames instead of copying them.
@@ -258,6 +261,10 @@ __attribute__((noinline)) void native_legacy_transfer_observed(IOReturn status,c
     native_legacy_transfer_calls=native_legacy_transfer_calls+1;
     if(status==kIOReturnSuccess)native_legacy_swap_stage(2);
     native_legacy_transfer_status=status;native_legacy_transfer_request=(uintptr_t)request;native_legacy_transfer_bytes=bytes;
+    // H116: the console is about to be overwritten by the client frame, so flush
+    // the first successful transfer and then one every 16 frames.
+    if(native_log_flush_hook && status==kIOReturnSuccess &&
+       (native_legacy_transfer_calls==1 || (native_legacy_transfer_calls%16)==0))native_log_flush_hook();
     if(status!=kIOReturnSuccess && boot_progress_stage) {
         char message[120];snprintf(message,sizeof(message),"DISPLAY COPY FAILED status=%08x prepare=%u tries=%u",
           (unsigned)status,native_legacy_prepare_reason,native_legacy_prepare_attempts);
@@ -313,6 +320,9 @@ void native_legacy_client_enter(task_t task,uint32_t type) {
     IOLog("NATIVE_LEGACY: client enter pid=%d comm=%s type=%u\n",pid,native_legacy_client_comm,type);
     native_legacy_client_calls=native_legacy_client_calls+1;native_legacy_client_task=(uintptr_t)task;
     native_legacy_client_type=type;native_legacy_client_pid=pid;
+    // H116: the display client is open; write the log before the console can be
+    // replaced by the first client frame.
+    if(native_log_flush_hook)native_log_flush_hook();
 }
 // Every framebuffer user client seen (object, pid), with what it does: the original client's vtable is copied and two entries (externalMethod, slot 168,
 // and registerNotificationPort(port,type,refCon), slot 175) are pointed at wrappers that count and forward to the original function. The original code
