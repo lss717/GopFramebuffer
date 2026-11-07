@@ -172,6 +172,9 @@ public:
         setter(this,&request,false);
     }
     bool start(IOService *provider) override {
+        // H143: proves the KernelConfigTable personality matched this nub
+        // and that IOKit instantiated and started the framebuffer.
+        native_boot_flags |= 0x4000000U;
         if(!startDisplay(provider))return false;
         startVsync();return true;
     }
@@ -345,6 +348,7 @@ public:
         // Publish it before the service becomes visible.
         setProperty("backlight-control",kOSBooleanTrue);
         IOService::registerService(options);native_legacy_registration_observed(this);
+        native_boot_flags |= 0x8000000U;
         // H141: the UFS probe cannot find this service by class name even though
         // it registers, so prove the local view: state, IOClass, provider and a
         // self lookup under the three names backboardd or the family may use.

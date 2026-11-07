@@ -16,6 +16,7 @@
 extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" IOService *native_legacy_display_allocate(void);
+extern "C" volatile uint32_t native_boot_flags;
 extern "C" void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 extern "C" IOService *native_gop_presenter_create(void);
 // H116: the UFS probe exports this to force one log flush from the display event
@@ -541,6 +542,7 @@ extern void sheng_buttons_probe(void);
 extern void sheng_backlight_probe(void);
 extern "C" void sheng_dpu_probe(void);
 void native_legacy_display_late_probe(void) {
+    native_boot_flags |= 0x1000000U;
     IOLog("NATIVE_LEGACY: late probe enter\n");
     native_keystore_probe();
     sheng_cpufreq_probe();
@@ -616,6 +618,7 @@ void native_legacy_display_late_probe(void) {
                     native_legacy_probe_match=(phase!=4 || dtAttached);
                     native_legacy_start_result=0;
                     nub->registerService();
+                    native_boot_flags |= 0x2000000U;
                     IOLog("NATIVE_LEGACY: phase=%u dt=%d nub-registered name=%s\n",
                           phase,dtAttached,nub->getName());
                     activeGOPNub=nub;nub=nullptr;nubAttached=false;nubStarted=false;
