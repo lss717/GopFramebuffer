@@ -54,13 +54,26 @@ bool NativeA540AcceleratorProbe::start(IOService *provider) {
     // No hardware behind this service: it only lets the renderer discovery
     // complete. Nothing here touches GPU registers, firmware or SMMU.
     setProperty("A540Probe", "minimal-no-hardware");
-    // H170: CoreAnimation reads MetalPluginName from the matched accelerator and
-    // then loads /System/Library/Extensions/<name>.bundle. An underscore-prefixed
-    // boot argument forces a string copy in PE_parse_boot_argn (max 16 chars).
+    // H170/H173: CoreAnimation reads MetalPluginName from the matched
+    // accelerator and then loads /System/Library/Extensions/<name>.bundle.
+    // The underscore-prefixed boot argument (max 16 chars) did not reach
+    // PE_parse_boot_argn on H172, so fall back to the same name and record
+    // which path was taken; also dump the tail of the real boot arguments.
     char plugin[17];
+    int pluginFromArg = 0;
     if (PE_parse_boot_argn("_offline-accelerator-plugin", plugin, sizeof plugin) && plugin[0]) {
-        setProperty("MetalPluginName", plugin);
-        IOLog("NATIVE_A540_ACCEL: MetalPluginName=%s\n", plugin);
+        pluginFromArg = 1;
+    } else {
+        strlcpy(plugin, "AGXMetalA10", sizeof plugin);
+    }
+    setProperty("MetalPluginName", plugin);
+    IOLog("NATIVE_A540_ACCEL: MetalPluginName=%s source=%s\n", plugin,
+          pluginFromArg ? "arg" : "default");
+    char *bootArgs = PE_boot_args();
+    if (bootArgs) {
+        size_t bootLen = strlen(bootArgs);
+        IOLog("NATIVE_A540_ACCEL: bootargs len=%u tail=%s\n", (unsigned)bootLen,
+              bootArgs + (bootLen > 96 ? bootLen - 96 : 0));
     }
     IOLog("NATIVE_A540_ACCEL: started provider=%p\n", provider);
     return true;
