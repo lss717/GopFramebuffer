@@ -562,15 +562,24 @@ void native_legacy_display_late_probe(void) {
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     if(!native_legacy_surface_status)native_boot_flags|=0x10000U;
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");
-    IOService *surface=matching?IOService::waitForMatchingService(matching,5000000000ULL):nullptr;
+    // H146: retry up to 20 s before giving up on the surface root.
+    IOService *surface=nullptr;
+    for(unsigned attempt=0;matching && attempt<4 && !surface;attempt++) {
+        surface=IOService::waitForMatchingService(matching,5000000000ULL);
+        if(!surface)IOLog("NATIVE_LEGACY: IOSurface wait attempt=%u\n",attempt+1);
+    }
     native_legacy_surface_found=surface!=nullptr;
     if(native_legacy_surface_found)native_boot_flags|=0x200000U;
     if(native_legacy_surface_found)native_boot_flags|=0x40000000U;
+    if(!native_legacy_surface_found)native_boot_flags|=0x800000U;
     IOLog("NATIVE_LEGACY: IOSurface status=%d found=%u\n",native_legacy_surface_status,native_legacy_surface_found);OSSafeReleaseNULL(surface);OSSafeReleaseNULL(matching);
     PE_Video video={};
     bool consoleOk=!PE_current_console(&video);
     if(consoleOk)native_boot_flags|=0x400000U;
-    if(!native_legacy_surface_status && native_legacy_surface_found && consoleOk
+    // H146: IOSurface is a swap-time dependency, not a discovery one.  Publish
+    // the display even when the surface root is late, so backboardd can see it
+    // (ios-sweet publishes AppleCLCD independently of IOSurface readiness).
+    if(consoleOk
         && video.v_baseAddr && video.v_width && video.v_height && video.v_depth==32
         && !video.v_rotate && video.v_width<=16384 && video.v_height<=16384
         && video.v_rowBytes>=video.v_width*4 && video.v_rowBytes<=UINT64_MAX/video.v_height) {
