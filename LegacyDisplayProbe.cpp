@@ -450,28 +450,42 @@ __attribute__((noinline)) bool native_legacy_gop_mapping_observed(IOService *obj
     native_legacy_unit_scale_calls=native_legacy_unit_scale_calls+1;native_legacy_unit_scale_status=1;
     unsigned phase=0;PE_parse_boot_argn("offline-legacy-phase",&phase,sizeof(phase));
     PE_Video video={};
-    // The value is the UI scale: logical points = actual scanout pixels / scale (1..3). It changes
-    // only the published display-scale; the scanout copy still moves one actual pixel per pixel.
-    if(enabled<1 || enabled>3 || phase!=4 || unitScaleChosen || PE_current_console(&video) ||
-       video.v_width!=width || video.v_height!=height || video.v_rotate ||
-       mapping->getPhysicalAddress()!=video.v_baseAddr)return false;
+    // H161: name every reason the unit-scale policy can be skipped; the policy used
+    // to return silently, so the log could not tell "not published" from "not used".
+    bool rangeOk=enabled>=1 && enabled<=3;
+    bool phaseOk=phase==4;
+    bool consoleBusy=PE_current_console(&video)!=0;
+    bool geometryOk=video.v_width==width && video.v_height==height && !video.v_rotate;
+    bool physicalOk=mapping->getPhysicalAddress()==video.v_baseAddr;
+    if(!rangeOk || !phaseOk || unitScaleChosen || consoleBusy || !geometryOk || !physicalOk) {
+        IOLog("NATIVE_LEGACY: unit-scale rejected enabled=%u phase=%u used=%u console=%u geom=%u phys=%u w=%u/%u h=%u/%u\n",
+              enabled,phase,unitScaleChosen?1:0,consoleBusy?1:0,geometryOk?1:0,physicalOk?1:0,
+              (unsigned)video.v_width,(unsigned)width,(unsigned)video.v_height,(unsigned)height);
+        return false;
+    }
     // Explicit offline UI policy: `enabled` actual GOP scanout pixels per logical
     // point in each direction (1 = native pixels). This is not physical pixel density,
     // panel timing, an Apple device identity or a synthesized mode list.
     unitScaleChosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);
     if(!unitScaleChosen || !publishOrMatchWord(unitScaleChosen,"display-scale",enabled,unitScaleAdded) ||
        !publishOrMatchWord(unitScaleChosen,"display-rotation",video.v_rotate,unitRotationAdded)) {
+        IOLog("NATIVE_LEGACY: unit-scale publish failed chosen=%p scale_added=%u rot_added=%u\n",
+              unitScaleChosen,unitScaleAdded?1:0,unitRotationAdded?1:0);
         finishUnitScalePolicy(false);return false;
     }
     OSData *scale=OSDynamicCast(OSData,unitScaleChosen->getProperty("display-scale"));
     OSData *rotation=OSDynamicCast(OSData,unitScaleChosen->getProperty("display-rotation"));
     uint32_t actualScale=0,actualRotation=0;
     if(!scale || !rotation || scale->getLength()!=4 || rotation->getLength()!=4) {
+        IOLog("NATIVE_LEGACY: unit-scale readback missing scale=%p rotation=%p\n",
+              scale,rotation);
         finishUnitScalePolicy(false);return false;
     }
     memcpy(&actualScale,scale->getBytesNoCopy(),4);memcpy(&actualRotation,rotation->getBytesNoCopy(),4);
     native_legacy_chosen_scale=actualScale;native_legacy_chosen_rotation=actualRotation;
     native_legacy_unit_scale_status=actualScale==enabled && actualRotation==video.v_rotate?0:2;
+    IOLog("NATIVE_LEGACY: unit-scale status=%d requested=%u chosen=%u rot=%u\n",
+          native_legacy_unit_scale_status,enabled,actualScale,actualRotation);
     if(native_legacy_unit_scale_status){finishUnitScalePolicy(false);return false;}
     return true;
 }
