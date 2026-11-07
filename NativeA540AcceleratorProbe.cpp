@@ -54,6 +54,14 @@ bool NativeA540AcceleratorProbe::start(IOService *provider) {
     // No hardware behind this service: it only lets the renderer discovery
     // complete. Nothing here touches GPU registers, firmware or SMMU.
     setProperty("A540Probe", "minimal-no-hardware");
+    // H170: CoreAnimation reads MetalPluginName from the matched accelerator and
+    // then loads /System/Library/Extensions/<name>.bundle. An underscore-prefixed
+    // boot argument forces a string copy in PE_parse_boot_argn (max 16 chars).
+    char plugin[17];
+    if (PE_parse_boot_argn("_offline-accelerator-plugin", plugin, sizeof plugin) && plugin[0]) {
+        setProperty("MetalPluginName", plugin);
+        IOLog("NATIVE_A540_ACCEL: MetalPluginName=%s\n", plugin);
+    }
     IOLog("NATIVE_A540_ACCEL: started provider=%p\n", provider);
     return true;
 }
