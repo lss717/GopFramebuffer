@@ -34,8 +34,8 @@ bool NativeAcceleratorClient::initWithTask(task_t owningTask,void *securityID,UI
 IOReturn NativeAcceleratorClient::clientClose() {terminate();return kIOReturnSuccess;}
 IOReturn NativeAcceleratorClient::clientDied() {return clientClose();}
 
-class NativeA540AcceleratorProbe : public IOAcceleratorES {
-    OSDeclareDefaultStructors(NativeA540AcceleratorProbe)
+class AGXAccelerator : public IOAcceleratorES {
+    OSDeclareDefaultStructors(AGXAccelerator)
     IOReturn makeClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **);
 public:
     bool start(IOService *provider) override;
@@ -47,9 +47,9 @@ public:
     OSObject *copyProperty(const OSString *key) const override;
     OSObject *copyProperty(const char *key) const override;
 };
-OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOAcceleratorES)
+OSDefineMetaClassAndStructors(AGXAccelerator, IOAcceleratorES)
 
-bool NativeA540AcceleratorProbe::start(IOService *provider) {
+bool AGXAccelerator::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
     // No hardware behind this service: it only lets the renderer discovery
     // complete. Nothing here touches GPU registers, firmware or SMMU.
@@ -73,20 +73,20 @@ static void notePropertyRead(const char *key) {
     gA540PropertyReads = seen + 1;
     IOLog("NATIVE_A540_ACCEL: read key=%s\n", key ? key : "(null)");
 }
-OSObject *NativeA540AcceleratorProbe::copyProperty(const OSSymbol *key) const {
+OSObject *AGXAccelerator::copyProperty(const OSSymbol *key) const {
     notePropertyRead(key ? key->getCStringNoCopy() : nullptr);
     return IORegistryEntry::copyProperty(key);
 }
-OSObject *NativeA540AcceleratorProbe::copyProperty(const OSString *key) const {
+OSObject *AGXAccelerator::copyProperty(const OSString *key) const {
     notePropertyRead(key ? key->getCStringNoCopy() : nullptr);
     return IORegistryEntry::copyProperty(key);
 }
-OSObject *NativeA540AcceleratorProbe::copyProperty(const char *key) const {
+OSObject *AGXAccelerator::copyProperty(const char *key) const {
     notePropertyRead(key);
     return IORegistryEntry::copyProperty(key);
 }
 
-IOReturn NativeA540AcceleratorProbe::makeClient(task_t task,void *security,UInt32 type,
+IOReturn AGXAccelerator::makeClient(task_t task,void *security,UInt32 type,
                                                OSDictionary *properties,IOUserClient **client) {
     IOLog("NATIVE_A540_ACCEL: open request type=%u\n", type);
     if (!client) return kIOReturnBadArgument;
@@ -104,10 +104,10 @@ IOReturn NativeA540AcceleratorProbe::makeClient(task_t task,void *security,UInt3
     IOLog("NATIVE_A540_ACCEL: user client type=%u granted\n", type);
     return kIOReturnSuccess;
 }
-IOReturn NativeA540AcceleratorProbe::newUserClient(task_t task,void *security,UInt32 type,IOUserClient **client) {
+IOReturn AGXAccelerator::newUserClient(task_t task,void *security,UInt32 type,IOUserClient **client) {
     return makeClient(task,security,type,nullptr,client);
 }
-IOReturn NativeA540AcceleratorProbe::newUserClient(task_t task,void *security,UInt32 type,
+IOReturn AGXAccelerator::newUserClient(task_t task,void *security,UInt32 type,
                                                    OSDictionary *properties,IOUserClient **client) {
     return makeClient(task,security,type,properties,client);
 }
@@ -115,13 +115,13 @@ IOReturn NativeA540AcceleratorProbe::newUserClient(task_t task,void *security,UI
 // Called by LegacyDisplayProbe.cpp between OSMetaClass::preModLoad() and
 // postModLoad(), together with the display and presenter constructors. The
 // global constructor is aliased here so the display probe can find it.
-extern "C" void native_a540_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeA540AcceleratorProbe.cpp");
+extern "C" void native_a540_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_AGXAccelerator.cpp");
 volatile uint32_t native_a540_accel_state;
 
 extern "C" int native_a540_accelerator_probe(void) {
     native_a540_accel_state = 1;
     IOService *platform = IOService::getResourceService();
-    NativeA540AcceleratorProbe *service = new NativeA540AcceleratorProbe;
+    AGXAccelerator *service = new AGXAccelerator;
     if (!platform || !service || !service->init()) {
         if (service) service->release();
         IOLog("NATIVE_A540_ACCEL: init/platform failed\n");
@@ -134,7 +134,7 @@ extern "C" int native_a540_accelerator_probe(void) {
         native_a540_accel_state = 4;
         return 0;
     }
-    service->setName("NativeA540Accelerator");
+    service->setName("AGXAccelerator");
     if (!service->start(platform)) {
         service->detach(platform);
         service->release();
@@ -149,7 +149,7 @@ extern "C" int native_a540_accelerator_probe(void) {
 }
 
 extern "C" unsigned native_a540_accelerator_instances(void) {
-    return NativeA540AcceleratorProbe::gMetaClass.getInstanceCount();
+    return AGXAccelerator::gMetaClass.getInstanceCount();
 }
 
 // H104e: use the real prelinked IOAcceleratorES/IOGPU class instead of a local
@@ -163,7 +163,7 @@ extern "C" unsigned native_a540_accelerator_instances(void) {
 extern "C" int native_iogpu_accel_probe(void) {
     native_a540_accel_state = 1;
     static const char *names[] = {
-        "IOGPU", "IOGPUDevice", "AGXAccelerator", "IOAcceleratorES", "IOGPUFamily"
+        "IOGPU", "IOGPUDevice", "IOAcceleratorES", "IOGPUFamily"
     };
     OSObject *object = nullptr;
     IOService *service = nullptr;
