@@ -41,6 +41,11 @@ public:
     bool start(IOService *provider) override;
     IOReturn newUserClient(task_t,void *,UInt32,IOUserClient **) override;
     IOReturn newUserClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **) override;
+    // H169: registry property reads reach these virtuals, so they show exactly
+    // what the renderer asks the accelerator for (MetalPluginName, IOClass, …).
+    OSObject *copyProperty(const OSSymbol *key) const override;
+    OSObject *copyProperty(const OSString *key) const override;
+    OSObject *copyProperty(const char *key) const override;
 };
 OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOAcceleratorES)
 
@@ -53,8 +58,29 @@ bool NativeA540AcceleratorProbe::start(IOService *provider) {
     return true;
 }
 
+static volatile unsigned gA540PropertyReads;
+static void notePropertyRead(const char *key) {
+    unsigned seen = gA540PropertyReads;
+    if (seen >= 40) return;
+    gA540PropertyReads = seen + 1;
+    IOLog("NATIVE_A540_ACCEL: read key=%s\n", key ? key : "(null)");
+}
+OSObject *NativeA540AcceleratorProbe::copyProperty(const OSSymbol *key) const {
+    notePropertyRead(key ? key->getCStringNoCopy() : nullptr);
+    return IORegistryEntry::copyProperty(key);
+}
+OSObject *NativeA540AcceleratorProbe::copyProperty(const OSString *key) const {
+    notePropertyRead(key ? key->getCStringNoCopy() : nullptr);
+    return IORegistryEntry::copyProperty(key);
+}
+OSObject *NativeA540AcceleratorProbe::copyProperty(const char *key) const {
+    notePropertyRead(key);
+    return IORegistryEntry::copyProperty(key);
+}
+
 IOReturn NativeA540AcceleratorProbe::makeClient(task_t task,void *security,UInt32 type,
                                                OSDictionary *properties,IOUserClient **client) {
+    IOLog("NATIVE_A540_ACCEL: open request type=%u\n", type);
     if (!client) return kIOReturnBadArgument;
     *client = nullptr;
     NativeAcceleratorClient *created = new NativeAcceleratorClient;
