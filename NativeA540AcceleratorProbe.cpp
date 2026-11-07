@@ -4,26 +4,79 @@
 // only purpose is to answer whether backboardd/Metal discovers and queries an
 // accelerator service before the real QcomGPU stack exists.
 #include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
+#include "../NativeMetal/OriginalAcceleratorABI.h"
 
-class NativeA540AcceleratorProbe : public IOService {
-    OSDeclareDefaultStructors(NativeA540AcceleratorProbe)
+// H168: a registry-visible accelerator. CoreAnimation looks the renderer up
+// with IOServiceMatching("IOAcceleratorES"), which matches on the IOProviderClass
+// class hierarchy, so a property named "IOClass" is invisible; the service must
+// really derive from the (audited) original IOAcceleratorES. The class is
+// registered only when the original IOGPUFamily kext is already loaded, because
+// its parent metaclass lives there.
+class NativeAcceleratorClient : public IOUserClient {
+    OSDeclareDefaultStructors(NativeAcceleratorClient)
 public:
-    bool start(IOService *provider) override {
-        if (!IOService::start(provider)) return false;
-        // H103fs: property-only stub. Do not derive from the prelinked
-        // IOAcceleratorES: the absolute base-class bindings corrupt early
-        // OSMetaClass bookkeeping. Publish the class name as a property so
-        // discovery can be tested without the accelerator ABI.
-        setProperty("IOClass", "IOAcceleratorES");
-        setProperty("A540Probe", "minimal-no-hardware");
-        return true;
-    }
+    bool initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) override;
+    IOReturn clientClose() override;
+    IOReturn clientDied() override;
 };
-OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOService)
+OSDefineMetaClassAndStructors(NativeAcceleratorClient,IOUserClient)
+
+bool NativeAcceleratorClient::initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) {
+    if(!IOUserClient::initWithTask(owningTask,securityID,type,properties))return false;
+    if(!owningTask)return false;
+    return true;
+}
+IOReturn NativeAcceleratorClient::clientClose() {terminate();return kIOReturnSuccess;}
+IOReturn NativeAcceleratorClient::clientDied() {return clientClose();}
+
+class NativeA540AcceleratorProbe : public IOAcceleratorES {
+    OSDeclareDefaultStructors(NativeA540AcceleratorProbe)
+    IOReturn makeClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **);
+public:
+    bool start(IOService *provider) override;
+    IOReturn newUserClient(task_t,void *,UInt32,IOUserClient **) override;
+    IOReturn newUserClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **) override;
+};
+OSDefineMetaClassAndStructors(NativeA540AcceleratorProbe, IOAcceleratorES)
+
+bool NativeA540AcceleratorProbe::start(IOService *provider) {
+    if (!IOService::start(provider)) return false;
+    // No hardware behind this service: it only lets the renderer discovery
+    // complete. Nothing here touches GPU registers, firmware or SMMU.
+    setProperty("A540Probe", "minimal-no-hardware");
+    IOLog("NATIVE_A540_ACCEL: started provider=%p\n", provider);
+    return true;
+}
+
+IOReturn NativeA540AcceleratorProbe::makeClient(task_t task,void *security,UInt32 type,
+                                               OSDictionary *properties,IOUserClient **client) {
+    if (!client) return kIOReturnBadArgument;
+    *client = nullptr;
+    NativeAcceleratorClient *created = new NativeAcceleratorClient;
+    if (!created) return kIOReturnNoMemory;
+    if (!created->initWithTask(task,security,type,properties) || !created->attach(this) ||
+        !created->start(this)) {
+        created->detach(this);
+        created->release();
+        IOLog("NATIVE_A540_ACCEL: user client type=%u setup failed\n", type);
+        return kIOReturnError;
+    }
+    *client = created;
+    IOLog("NATIVE_A540_ACCEL: user client type=%u granted\n", type);
+    return kIOReturnSuccess;
+}
+IOReturn NativeA540AcceleratorProbe::newUserClient(task_t task,void *security,UInt32 type,IOUserClient **client) {
+    return makeClient(task,security,type,nullptr,client);
+}
+IOReturn NativeA540AcceleratorProbe::newUserClient(task_t task,void *security,UInt32 type,
+                                                   OSDictionary *properties,IOUserClient **client) {
+    return makeClient(task,security,type,properties,client);
+}
 
 // Called by LegacyDisplayProbe.cpp between OSMetaClass::preModLoad() and
 // postModLoad(), together with the display and presenter constructors. The

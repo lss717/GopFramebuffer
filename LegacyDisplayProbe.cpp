@@ -19,6 +19,10 @@ extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" volatile uint32_t native_boot_flags;
 extern "C" void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
 extern "C" IOService *native_gop_presenter_create(void);
+// H168: the accelerator class derives from the original IOAcceleratorES, so its
+// parent metaclass must exist before this kmod registers its classes.
+extern "C" void native_a540_accelerator_static_init(void) __asm__("__GLOBAL__sub_I_NativeA540AcceleratorProbe.cpp");
+extern "C" int native_a540_accelerator_probe(void);
 // H116: the UFS probe exports this to force one log flush from the display event
 // path, which still runs after the UFS read path has gone quiet.
 extern "C" void native_log_flush_hook(void) __attribute__((weak_import));
@@ -563,12 +567,26 @@ void native_legacy_display_probe(void) {
     // the same prerequisite explicitly.
     kern_return_t familyStatus=OSKextLoadKextWithIdentifier("com.apple.iokit.IOMobileGraphicsFamily");
     if(familyStatus){native_legacy_meta_status=familyStatus;IOLog("NATIVE_LEGACY: family load status=%d\n",familyStatus);native_legacy_display_checkpoint();return;}
+    // H168: only when asked. IOGPUFamily must be loaded first; its metaclasses
+    // are the parent of the accelerator class this kmod also registers.
+    unsigned accelerator=0;PE_parse_boot_argn("offline-accelerator",&accelerator,sizeof(accelerator));
+    kern_return_t iogpuStatus=-1;
+    if(accelerator==1) {
+        iogpuStatus=OSKextLoadKextWithIdentifier("com.apple.iokit.IOGPUFamily");
+        IOLog("NATIVE_LEGACY: iogpu load status=%d accelerator=%u\n",iogpuStatus,accelerator);
+    }
     void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     IOLog("NATIVE_LEGACY: preModLoad handle=%p\n",handle);
     if(!handle){native_legacy_display_checkpoint();return;}
-    native_legacy_display_static_init();native_gop_presenter_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
+    native_legacy_display_static_init();native_gop_presenter_static_init();
+    if(accelerator==1 && iogpuStatus==0)native_a540_accelerator_static_init();
+    native_legacy_meta_status=OSMetaClass::postModLoad(handle);
     IOLog("NATIVE_LEGACY: postModLoad status=%d\n",native_legacy_meta_status);
     if(native_legacy_meta_status){native_legacy_display_checkpoint();return;}
+    if(accelerator==1 && iogpuStatus==0) {
+        int accel=native_a540_accelerator_probe();
+        IOLog("NATIVE_LEGACY: accelerator publish=%d\n",accel);
+    }
     PE_Video video={};native_legacy_stage=2;
     IOLog("NATIVE_LEGACY: before PE_current_console\n");
     if(PE_current_console(&video) || !video.v_baseAddr || !video.v_width || !video.v_height || video.v_depth!=32
