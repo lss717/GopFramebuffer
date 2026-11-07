@@ -345,6 +345,18 @@ static ClientStat *statFor(IOUserClient *client) {
     for(unsigned i=0;i<seenClientCount;++i)if(seenClients[i].object==(uintptr_t)client)return &seenClients[i];
     return nullptr;
 }
+// H163: the geometry handshake happens through these selectors. The old trace
+// printed only the status and stopped after 16 calls per client, so the log
+// could not say what backboardd received (display size, display area, frame
+// info) or whether it ever asked for a swap. Keep the whole trajectory:
+// mode/geometry selectors are traced for their first five calls each.
+static bool tracedSelector(uint32_t selector) {
+    switch(selector) {
+        case 3:case 4:case 5:case 6:case 7:case 8:case 28:case 29:
+        case 57:case 72:case 74:case 79:case 83:return true;
+        default:return false;
+    }
+}
 static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExternalMethodArguments *args,IOExternalMethodDispatch *dispatch,OSObject *target,void *ref) {
     ClientStat *stat=statFor(client);
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,args,dispatch,target,ref):kIOReturnNotAttached;
@@ -365,7 +377,28 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
         }
         ++stat->calls;if(status)++stat->fails;
         if(selector<kSelectors){++stat->selector_calls[selector];if(status)++stat->selector_fails[selector];stat->selector_status[selector]=(uint32_t)status;}
-        if(stat->calls<16)IOLog("NATIVE_LEGACY: client sel pid=%d selector=%u status=%x\n",stat->pid,selector,(unsigned)status);
+        uint32_t seen=selector<kSelectors?stat->selector_calls[selector]:0;
+        if(tracedSelector(selector) && seen<=4) {
+            uint64_t in0=0,in1=0,in2=0,out0=0,out1=0,out2=0;
+            uint32_t inc=args?args->scalarInputCount:0,outc=args?args->scalarOutputCount:0;
+            if(args && args->scalarInput) {
+                in0=args->scalarInput[0];
+                if(inc>1)in1=args->scalarInput[1];
+                if(inc>2)in2=args->scalarInput[2];
+            }
+            if(args && args->scalarOutput) {
+                out0=args->scalarOutput[0];
+                if(outc>1)out1=args->scalarOutput[1];
+                if(outc>2)out2=args->scalarOutput[2];
+            }
+            IOLog("NATIVE_LEGACY: client io pid=%d selector=%u status=%x in=%llx,%llx,%llx ni=%u out=%llx,%llx,%llx no=%u struct=%llu\n",
+                  stat->pid,selector,(unsigned)status,
+                  (unsigned long long)in0,(unsigned long long)in1,(unsigned long long)in2,(unsigned)inc,
+                  (unsigned long long)out0,(unsigned long long)out1,(unsigned long long)out2,(unsigned)outc,
+                  args?(unsigned long long)args->structureOutputSize:0ULL);
+        } else if(stat->calls<16) {
+            IOLog("NATIVE_LEGACY: client sel pid=%d selector=%u status=%x\n",stat->pid,selector,(unsigned)status);
+        }
     }
     return status;
 }

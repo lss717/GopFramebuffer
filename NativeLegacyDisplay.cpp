@@ -664,6 +664,23 @@ public:
         if(valid) {
             installBootDimensions((uint32_t)video.v_width,(uint32_t)video.v_height);
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+            // H163: what the framework can actually read from this provider.
+            // The display list / mode build reads canvas-width/canvas-height
+            // from the IODeviceTree parent, and MobileGestaltHelper asks for
+            // the dot pitch (selector 28); print whether either exists.
+            auto providerWord=[&](const char *key,uint32_t &value)->bool {
+                OSObject *property=provider->getProperty(key);
+                OSData *data=OSDynamicCast(OSData,property);
+                if(!data || data->getLength()!=sizeof(value))return false;
+                memcpy(&value,data->getBytesNoCopy(),sizeof(value));return true;
+            };
+            uint32_t canvasW=0,canvasH=0,pitch=0;
+            bool hasCanvasW=providerWord("canvas-width",canvasW);
+            bool hasCanvasH=providerWord("canvas-height",canvasH);
+            bool hasPitch=providerWord("dot-pitch",pitch);
+            IOLog("NATIVE_LEGACY: dims %ux%u canvas=%u:%u,%u:%u dotpitch=%u:%u\n",
+                  width,height,hasCanvasW?1:0,canvasW,hasCanvasH?1:0,canvasH,
+                  hasPitch?1:0,pitch);
             valid=width==video.v_width && height==video.v_height;
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
