@@ -345,6 +345,26 @@ public:
         // Publish it before the service becomes visible.
         setProperty("backlight-control",kOSBooleanTrue);
         IOService::registerService(options);native_legacy_registration_observed(this);
+        // H141: the UFS probe cannot find this service by class name even though
+        // it registers, so prove the local view: state, IOClass, provider and a
+        // self lookup under the three names backboardd or the family may use.
+        {
+            IOService *prov=getProvider();
+            OSString *ioClass=OSDynamicCast(OSString,getProperty("IOClass"));
+            IOLog("NATIVE_LEGACY: self inactive=%d ioclass=%s provider=%s\n",
+                  isInactive()?1:0,
+                  ioClass?ioClass->getCStringNoCopy():"-",
+                  prov?prov->getMetaClass()->getClassName():"-");
+            const char *probeNames[3]={"IOMobileFramebuffer","IOMobileFramebufferLegacy",
+                                       "NativeLegacyDisplay"};
+            for(unsigned i=0;i<3;i++){
+                OSDictionary *m=IOService::serviceMatching(probeNames[i]);
+                IOService *s=m?IOService::copyMatchingService(m):nullptr;
+                IOLog("NATIVE_LEGACY: self-match name=%s -> %p same=%d\n",
+                      probeNames[i],s,s==this?1:0);
+                OSSafeReleaseNULL(s);OSSafeReleaseNULL(m);
+            }
+        }
     }
     bool isMainDisplay() override {return primary;}
     // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh (int-209: no vsync client ever
