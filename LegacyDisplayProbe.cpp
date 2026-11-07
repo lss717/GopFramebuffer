@@ -29,8 +29,9 @@ static IOService *gpuHandoffPresenter;
 extern "C" bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 volatile uint32_t native_legacy_gpu_fallbacks,native_legacy_gpu_last_status;
-// H142: the framebuffer is now instantiated by the personality, so the probe
-// no longer keeps a hand-started instance alive here.
+// H158: the hand-started instance is retained again; the personality path is
+// disabled because it made IOKit match every IOPlatformDevice personality.
+static IOService *activeLegacyDisplay;
 // Keep one diagnostic mapping alive until reboot, even after backend stop.
 // The pulse is permanently closed before any system-frame copy.
 static IOMemoryMap *diagnosticAnchorMapping;
@@ -623,26 +624,29 @@ void native_legacy_display_late_probe(void) {
                         activeGOPPresenter=presenter;activeGOPNub=nub;nub=nullptr;nubAttached=false;nubStarted=false;
                     } else {if(presenterAttached)presenter->detach(nub);OSSafeReleaseNULL(presenter);}
                 } else {
-                    // H142: publish the nub and let IOKit drive the framebuffer.
-                    // The KernelConfigTable personality (NativeLegacyDisplay on
-                    // IOPlatformDevice / IONameMatch 'NativeGOPFramebuffer')
-                    // instantiates and starts it.  That is the only path that
-                    // sets kIOServiceMatchedState, and IOServiceGetMatchingServices
-                    // (userland, backboardd) only returns matched services.
-                    // Prior art: ios-sweet publishes AppleCLCD this way, sagit
-                    // publishes QcomDisplay this way, and XNU's createNubs()
-                    // ends with nub->registerService().
-                    native_legacy_probe_match=(phase!=4 || dtAttached);
-                    native_legacy_start_result=0;
-                    nub->registerService();
-                    native_boot_flags |= 0x2000000U;
-                    IOLog("NATIVE_LEGACY: phase=%u dt=%d nub-registered name=%s\n",
-                          phase,dtAttached,nub->getName());
-                    activeGOPNub=nub;nub=nullptr;nubAttached=false;nubStarted=false;
-                    native_legacy_stage=10;
-                    OSSafeReleaseNULL(displayTreeParent);
-                    OSSafeReleaseNULL(display);
-                    native_legacy_display_checkpoint();return;
+                    SInt32 score=0;native_legacy_probe_match=(phase!=4 || dtAttached) && display->probe(nub,&score)==display;
+                    if(native_legacy_probe_match)attached=display->attach(nub);
+                    if(attached){display->setProperty("IOClass","IOMobileFramebufferLegacy");native_legacy_stage=5;started=display->start(nub);native_legacy_start_result=started;}
+                    IOLog("NATIVE_LEGACY: phase=%u dt=%d probe=%u attach=%d start=%d reg=%u\n",phase,dtAttached,native_legacy_probe_match,attached,started,native_legacy_registration_calls);
+                    if(started && phase==4) {
+                        activeLegacyDisplay=display;activeGOPNub=nub;native_legacy_stage=10;
+                        {
+                            unsigned gpu=0;PE_parse_boot_argn("sheng-fb-gpu",&gpu,sizeof gpu);
+                            if(gpu==1) {
+                                IOService *handoff=native_gop_presenter_create();
+                                // Not a child of the display subsystem's node: the original display code enumerates that node's children (int-075/077:
+                                // SpringBoard found no display and crashed with the presenter attached there, registered or not).
+                                IOService *home=IOService::getResourceService();
+                                bool handoffAttached=false;
+                                if(handoff && home)native_gop_presenter_set_source(handoff,nub);
+                                if(handoff && home && handoff->init() && (handoffAttached=handoff->attach(home)) && handoff->start(home))gpuHandoffPresenter=handoff;
+                                else {if(handoffAttached)handoff->detach(home);OSSafeReleaseNULL(handoff);}
+                            }
+                        }
+                        finishUnitScalePolicy(true);
+                        OSSafeReleaseNULL(displayTreeParent);
+                        native_legacy_display_checkpoint();return;
+                    }
                 }
             }
         }
