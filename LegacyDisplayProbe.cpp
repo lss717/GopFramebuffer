@@ -523,6 +523,7 @@ void native_legacy_display_probe(void) {
     if(native_legacy_init_result && (phase==2 || phase==3 || phase==4)) {
         // IOSurface matches the real IOBSD resource, published by bsd_autoconf.
         // Retain this actual object until that normal lifecycle boundary.
+        native_boot_flags |= 0x10000000U;
         pendingLegacyDisplay=display;return;
     }
     native_legacy_stage=7;display->release();native_legacy_released=1;native_legacy_stage=8;
@@ -557,16 +558,19 @@ void native_legacy_display_late_probe(void) {
     sheng_dpu_probe();
     native_hid_input_probe();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
+    native_boot_flags |= 0x20000000U;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");
     IOService *surface=matching?IOService::waitForMatchingService(matching,5000000000ULL):nullptr;
     native_legacy_surface_found=surface!=nullptr;
+    if(native_legacy_surface_found)native_boot_flags|=0x40000000U;
     IOLog("NATIVE_LEGACY: IOSurface status=%d found=%u\n",native_legacy_surface_status,native_legacy_surface_found);OSSafeReleaseNULL(surface);OSSafeReleaseNULL(matching);
     PE_Video video={};
     if(!native_legacy_surface_status && native_legacy_surface_found && !PE_current_console(&video)
         && video.v_baseAddr && video.v_width && video.v_height && video.v_depth==32
         && !video.v_rotate && video.v_width<=16384 && video.v_height<=16384
         && video.v_rowBytes>=video.v_width*4 && video.v_rowBytes<=UINT64_MAX/video.v_height) {
+        native_boot_flags|=0x80000000U;
         native_legacy_video_base=video.v_baseAddr;native_legacy_video_bytes=video.v_rowBytes*video.v_height;
         // A real firmware framebuffer resource, with addresses and extent
         // obtained from the actual GOP handoff. It has no invented compatible,
