@@ -332,7 +332,7 @@ void native_legacy_client_enter(task_t task,uint32_t type) {
 // is not touched; only this object's vptr names the copy. XNU's ARM64 vptr points at slot 0 (the original code dispatches with ldr x8,[vptr,#slot*8]).
 enum {kSeenClients=8,kSelectors=96,kRegEvents=8,kVtableSlots=256};
 struct ClientStat {
-    uintptr_t object;int pid;uint32_t calls,fails;uint32_t selector_calls[kSelectors],selector_fails[kSelectors],selector_status[kSelectors];
+    uintptr_t object;int pid;uint32_t calls,fails,fixups;uint32_t selector_calls[kSelectors],selector_fails[kSelectors],selector_status[kSelectors];
     unsigned regs;struct {uint32_t type;uint64_t port;uint32_t ref,status;} reg[kRegEvents];
     uint64_t sel6_first[3],sel6_last[3];uint32_t sel6_distinct;uint64_t sel6_seen[8][3];uint32_t sel6_calls[8],sel6_fails[8],sel6_status[8];
     uint32_t seq_count;struct {uint32_t a,b,c,status,done,presented;} seq[24];
@@ -360,6 +360,26 @@ static bool tracedSelector(uint32_t selector) {
 static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExternalMethodArguments *args,IOExternalMethodDispatch *dispatch,OSObject *target,void *ref) {
     ClientStat *stat=statFor(client);
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,args,dispatch,target,ref):kIOReturnNotAttached;
+    // H164: the reference port's display client (ios-sweet 0046) answers every
+    // selector it does not implement with success and zeroed outputs; a bare
+    // kIOReturnUnsupported from this family left backboardd without a display.
+    // Mirror that policy here, in front of the unchanged original method.
+    if(status==kIOReturnUnsupported) {
+        if(args) {
+            if(args->scalarOutput) {
+                for(uint32_t i=0;i<args->scalarOutputCount;++i)args->scalarOutput[i]=0;
+            }
+            if(args->structureOutput && !args->structureOutputDescriptor && args->structureOutputSize)
+                bzero(args->structureOutput,args->structureOutputSize);
+        }
+        status=kIOReturnSuccess;
+        if(stat) {
+            if(stat->fixups<24)
+                IOLog("NATIVE_LEGACY: client fixup pid=%d selector=%u unsupported->0\n",
+                      stat->pid,selector);
+            ++stat->fixups;
+        }
+    }
     if(stat) {
         if(selector==6 && args && args->scalarInput && args->scalarInputCount>=3) {
             const uint64_t *in=args->scalarInput;
@@ -648,6 +668,14 @@ void native_legacy_display_late_probe(void) {
             // dependent-display identity words an Apple display node carries.
             publishRegistryWord64(nub,"IOFBDependentID",1);
             publishRegistryWord32(nub,"IOFBDependentIndex",0);
+            // H164: the framework and MobileGestalt read the canvas geometry
+            // from the display node, and the original getDotPitch answers from
+            // the provider's "dot-pitch" word. Both are the real GOP panel
+            // geometry; the pitch is the 5.5" 1080x1920 panel spec
+            // (sqrt(1080^2+1920^2)/5.5 = 401 ppi).
+            publishRegistryWord32(nub,"canvas-width",(uint32_t)video.v_width);
+            publishRegistryWord32(nub,"canvas-height",(uint32_t)video.v_height);
+            publishRegistryWord32(nub,"dot-pitch",401);
             nubAttached=nub->attach(parent);if(nubAttached)nubStarted=nub->start(parent);
             IOLog("NATIVE_LEGACY: nub attach=%d start=%d\n",nubAttached,nubStarted);
             if(nubStarted) {
