@@ -366,6 +366,14 @@ public:
             }
         }
     }
+    // H142: the KernelConfigTable personality asks the driver whether it
+    // takes this nub.  Accept only a provider that carries our GOP device
+    // memory, so the inherited Apple checks cannot veto the service.
+    IOService *probe(IOService *provider, SInt32 *score) override {
+        if(!provider || !provider->getDeviceMemoryCount())return nullptr;
+        if(score)*score=1000;
+        return this;
+    }
     bool isMainDisplay() override {return primary;}
     // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh (int-209: no vsync client ever
     // registered, frames came every 16.7 ms), and the generic slot 301 fixes it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's
