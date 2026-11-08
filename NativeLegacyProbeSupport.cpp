@@ -129,7 +129,38 @@ void sheng_cpufreq_tick(void) {
     if (gOsm)
         native_cpu_freq_state = osmSample(0);
 }
-void sheng_gpu_power_probe(void) {}
+// C1 baseline: read-only GPU clock controller survey.
+// sagit's record proves GPUCC stays readable while the GPU itself is off (gfx3d_clk_src
+// at 9.6 MHz, both power domains off), so this touches no register that needs GX power:
+// it maps 0x5065000 (GPUCC, 0x9000) and prints the non-zero registers, which is enough to
+// identify the branch clocks and domain status before any write is attempted.
+void sheng_gpu_power_probe(void) {
+    IODeviceMemory *memory = IODeviceMemory::withRange(0x5065000ULL, 0x9000);
+    IOMemoryMap *map = memory ?
+        memory->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+    OSSafeReleaseNULL(memory);
+    if (!map) {
+        IOLog("NATIVE_GPUCC: map failed\n");
+        return;
+    }
+    volatile uint32_t *base = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+    if (!base) {
+        IOLog("NATIVE_GPUCC: virtual map null\n");
+        OSSafeReleaseNULL(map);
+        return;
+    }
+    unsigned shown = 0, tested = 0;
+    for (unsigned off = 0; off < 0x1000 && shown < 48; off += 4) {
+        uint32_t value = osmRead(base, off);
+        ++tested;
+        if (!value)
+            continue;
+        IOLog("NATIVE_GPUCC: [%04x]=%08x\n", off, value);
+        ++shown;
+    }
+    IOLog("NATIVE_GPUCC: survey tested=%u shown=%u\n", tested, shown);
+    OSSafeReleaseNULL(map);
+}
 void sheng_wifi_probe(void) {}
 void sheng_adsp_probe(void) {}
 void sheng_battery_probe(void) {}
