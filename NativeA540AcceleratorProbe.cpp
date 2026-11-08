@@ -10,6 +10,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 #include "../NativeMetal/OriginalAcceleratorABI.h"
+#include "../NativeAdreno/NativeAdrenoABI.h"
 
 // H168: a registry-visible accelerator. CoreAnimation looks the renderer up
 // with IOServiceMatching("IOAcceleratorES"), which matches on the IOProviderClass
@@ -17,12 +18,19 @@
 // really derive from the (audited) original IOAcceleratorES. The class is
 // registered only when the original IOGPUFamily kext is already loaded, because
 // its parent metaclass lives there.
+// H192 (A540 milestone 1): a client that answers the native-Adreno tunnel handshake and the
+// small subset of the ABI the userspace GPU test needs to report where it stops: Query,
+// GetDeviceInfo, GetStatus, GetTimestamp and SetMetadata. Nothing here touches GPU registers,
+// firmware, SMMU or command submission; BoAlloc and later steps answer kIOReturnUnsupported on
+// purpose so the test reports "reached the driver" instead of failing at the open.
 class NativeAcceleratorClient : public IOUserClient {
     OSDeclareDefaultStructors(NativeAcceleratorClient)
 public:
     bool initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) override;
     IOReturn clientClose() override;
     IOReturn clientDied() override;
+    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+                            IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
 };
 OSDefineMetaClassAndStructors(NativeAcceleratorClient,IOUserClient)
 
@@ -33,6 +41,67 @@ bool NativeAcceleratorClient::initWithTask(task_t owningTask,void *securityID,UI
 }
 IOReturn NativeAcceleratorClient::clientClose() {terminate();return kIOReturnSuccess;}
 IOReturn NativeAcceleratorClient::clientDied() {return clientClose();}
+
+namespace {
+constexpr uint32_t kAccelTunnelMagic = 0x4e544e4c;   /* 'NTNL', native-Adreno tunnel */
+constexpr uint32_t kAccelProbe = 0xffffffffu;
+
+IOReturn accelCopyOut(IOExternalMethodArguments *arguments, const void *data, size_t bytes) {
+    if (!arguments->structureOutput || arguments->structureOutputSize < bytes) return kIOReturnBadArgument;
+    memcpy(arguments->structureOutput, data, bytes);
+    arguments->structureOutputSize = (IOByteCount) bytes;
+    return kIOReturnSuccess;
+}
+}  // namespace
+
+IOReturn NativeAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+                                                 IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
+    (void) selector; (void) dispatch; (void) target; (void) reference;
+    if (!arguments || !arguments->structureInput || arguments->structureInputSize < 8) return kIOReturnUnsupported;
+    const uint32_t *input = static_cast<const uint32_t *>(arguments->structureInput);
+    if (input[0] != kAccelTunnelMagic) return kIOReturnUnsupported;
+    const uint32_t method = input[1];
+    // The userspace test probes selectors with {magic, kProbe}; admitting them all picks selector 0.
+    if (method == kAccelProbe) return kIOReturnSuccess;
+    switch (method) {
+        case NativeAdrenoMethodQuery: {
+            NativeAdrenoAbiParams params = {};
+            params.abi_version = NativeAdrenoAbiVersion;
+            params.input_bits = 32;
+            params.output_bits = 40;
+            params.flags = 0;
+            params.max_bo_bytes = 256ull << 20;
+            return accelCopyOut(arguments, &params, sizeof params);
+        }
+        case NativeAdrenoMethodGetDeviceInfo: {
+            NativeAdrenoAbiDeviceInfo info = {};
+            info.chip_id = 0x05040000;   /* Adreno 540 family (a5xx) */
+            info.va_start = 0x10000000;
+            info.va_size = 0x10000000;
+            return accelCopyOut(arguments, &info, sizeof info);
+        }
+        case NativeAdrenoMethodGetStatus: {
+            NativeAdrenoAbiStatus status = {};
+            return accelCopyOut(arguments, &status, sizeof status);
+        }
+        case NativeAdrenoMethodGetTimestamp: {
+            NativeAdrenoAbiTimestamp stamp = { mach_absolute_time() };
+            return accelCopyOut(arguments, &stamp, sizeof stamp);
+        }
+        case NativeAdrenoMethodSetMetadata: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiMetadata)) return kIOReturnBadArgument;
+            const NativeAdrenoAbiMetadata *meta =
+                reinterpret_cast<const NativeAdrenoAbiMetadata *>(input + 2);
+            char text[NativeAdrenoAbiMetadataBytes + 1] = {};
+            const uint32_t bytes = meta->bytes < NativeAdrenoAbiMetadataBytes ? meta->bytes : NativeAdrenoAbiMetadataBytes;
+            memcpy(text, meta->text, bytes);
+            IOLog("NATIVE_A540_ABI: report %s\n", text);
+            return kIOReturnSuccess;
+        }
+        default:
+            return kIOReturnUnsupported;
+    }
+}
 
 class AGXAccelerator : public IOAcceleratorES {
     OSDeclareDefaultStructors(AGXAccelerator)
