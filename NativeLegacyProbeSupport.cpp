@@ -35,6 +35,7 @@ static unsigned sheng_mem_moved;
 static unsigned sheng_vm_moved;
 static unsigned sheng_fb_moved;
 static unsigned sheng_scan_moved;
+static unsigned sheng_spmi_moved;
 // H228: the three RBBM identity words once the power-up step read them.
 static volatile uint32_t gRbbmValues[3];
 static volatile int gRbbmValid;
@@ -55,6 +56,9 @@ static volatile uint32_t gScanBase[4];
 static volatile uint32_t gScanValue[4];
 static volatile int gScanHits;
 static volatile int gScanDone;
+// C1e-1: SPMI PMIC arbiter read-only identity words (gc=70..77).
+static volatile uint32_t gSpmiWords[8];
+static volatile int gSpmiDone;
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -259,6 +263,12 @@ int sheng_gpucc_next(unsigned *index, uint32_t *value) {
         if (value) *value = gMemWords[k];
         return 1;
     }
+    if (gSpmiDone && sheng_gpucc_done >= total && sheng_spmi_moved < 8) {
+        unsigned k = sheng_spmi_moved++;
+        if (index) *index = 70 + k;
+        if (value) *value = gSpmiWords[k];
+        return 1;
+    }
     if (gScanDone && sheng_gpucc_done >= total && sheng_scan_moved == 0) {
         sheng_scan_moved = 1;
         if (index) *index = 60;
@@ -420,6 +430,29 @@ static void sheng_smem_scan(void) {
     gScanHits = hits;
     gScanDone = 1;
 }
+// C1e-1: the SPMI PMIC arbiter (qcom,spmi@800f000) is the only remaining route to the GX rail
+// (PM8005 S1, slave 5). Before writing anything, read two register windows: core at 0x800f000
+// and cnfg at 0x800a000. A non-zero version/EE field proves the controller is present.
+static void sheng_spmi_survey(void) {
+    static const struct { uint64_t base; uint64_t bytes; unsigned slot; } regions[] = {
+        { 0x0800f000ULL, 0x1000, 0 },
+        { 0x0800a000ULL, 0x3000, 4 },
+    };
+    for (unsigned r = 0; r < 2; ++r) {
+        IODeviceMemory *mem = IODeviceMemory::withRange(regions[r].base, regions[r].bytes);
+        IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(mem);
+        if (!map)
+            continue;
+        volatile uint32_t *base = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+        if (base) {
+            for (unsigned k = 0; k < 4; ++k)
+                gSpmiWords[regions[r].slot + k] = osmRead(base, k * 4);
+        }
+        OSSafeReleaseNULL(map);
+    }
+    gSpmiDone = 1;
+}
 static int gpuGdscOn(const char *name, uint32_t gdscr, uint32_t statusReg) {
     uint32_t before = gpuccRd(gdscr);
     uint32_t value = before;
@@ -553,6 +586,7 @@ int sheng_gpu_power_step(void) {
         }
         sheng_rpm_survey();
         sheng_smem_scan();
+        sheng_spmi_survey();
         IOLog("NATIVE_GPU_PWR: done\n");
         ++step;
         return 0;
