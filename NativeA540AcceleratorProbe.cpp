@@ -123,6 +123,7 @@ class AGXAccelerator : public IOAcceleratorES {
     OSDeclareDefaultStructors(AGXAccelerator)
     IOReturn makeClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **);
 public:
+    bool init() override;
     bool start(IOService *provider) override;
     IOReturn newUserClient(task_t,void *,UInt32,IOUserClient **) override;
     IOReturn newUserClient(task_t,void *,UInt32,OSDictionary *,IOUserClient **) override;
@@ -133,6 +134,13 @@ public:
     OSObject *copyProperty(const char *key) const override;
 };
 OSDefineMetaClassAndStructors(AGXAccelerator, IOAcceleratorES)
+
+bool AGXAccelerator::init() {
+    if (!IOService::init()) return false;
+    // H199: the grant must exist before the first open, on every instance, whatever path published it.
+    setProperty("NativeSandboxGrantProcess", "backboardd");
+    return true;
+}
 
 bool AGXAccelerator::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
@@ -178,7 +186,11 @@ OSObject *AGXAccelerator::copyProperty(const char *key) const {
 
 IOReturn AGXAccelerator::makeClient(task_t task,void *security,UInt32 type,
                                                OSDictionary *properties,IOUserClient **client) {
-    IOLog("NATIVE_A540_ACCEL: open request type=%u comm=%s\n", type, accelRequester());
+    {
+        OSString *grant = OSDynamicCast(OSString, getProperty("NativeSandboxGrantProcess"));
+        IOLog("NATIVE_A540_ACCEL: open request type=%u comm=%s self=%p grant=%s\n", type,
+              accelRequester(), this, grant ? grant->getCStringNoCopy() : "-");
+    }
     if (!client) return kIOReturnBadArgument;
     *client = nullptr;
     AGXDeviceUserClient *created = new AGXDeviceUserClient;
