@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 
 volatile uint32_t native_cpu_freq_state;
 
@@ -24,6 +25,10 @@ static uint32_t osmRead(volatile uint32_t *base, uint32_t offset) {
 // safe from the timer callback.
 static IOMemoryMap *gOsmMap;
 static volatile uint32_t *gOsm;
+// H223: GPUCC survey state (see sheng_gpucc_report).
+static IOMemoryMap *sheng_gpucc_map;
+static volatile uint32_t *sheng_gpucc_base;
+static unsigned sheng_gpucc_done;
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -134,38 +139,222 @@ void sheng_cpufreq_tick(void) {
 // msm8998 GPUCC driver actually programs (mainline drivers/clk/qcom/gpucc-msm8998.c):
 // fabia PLL gpupll0 at 0x0, the GX clamp at 0x130, and the CX/GX GDSC + branch clocks at
 // 0x1000..0x1124. Those must stay accessible or nothing could ever power the domain up.
-void sheng_gpu_power_probe(void) {
-    static const struct { uint32_t off; const char *name; } regs[] = {
-        {0x0000, "gpupll0_lval"},   {0x0004, "gpupll0_config"},
-        {0x0008, "gpupll0_config_ctl"}, {0x000c, "gpupll0_user_ctl"},
-        {0x0010, "gpupll0_user_ctl_u"}, {0x0014, "gpupll0_state"},
-        {0x0020, "gpupll0_status"},
-        {0x0130, "gx_clamp_io"},
-        {0x1000, "cx_bcr"},        {0x1004, "cx_gdscr"},      {0x1008, "cx_gds_hw_ctrl"},
-        {0x1020, "cxo_branch"},
-        {0x1030, "rbcpr_rcg"},     {0x1050, "rbcpr_bcr"},     {0x1054, "rbcpr_branch"},
-        {0x1070, "gfx3d_rcg"},     {0x1090, "gx_bcr"},        {0x1094, "gx_gdscr"},
-        {0x1098, "gfx3d_branch"},  {0x10b0, "rbbmtimer_rcg"}, {0x10d0, "rbbmtimer_branch"},
-        {0x1100, "isense_rcg"},    {0x1120, "isense_bcr"},    {0x1124, "isense_branch"},
-    };
-    IODeviceMemory *memory = IODeviceMemory::withRange(0x5065000ULL, 0x9000);
-    IOMemoryMap *map = memory ?
-        memory->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
-    OSSafeReleaseNULL(memory);
-    if (!map) {
-        IOLog("NATIVE_GPUCC: map failed\n");
-        return;
+// H225: neither a burst of lines (H223: dropped by the writer's snapshot) nor a slow stream
+// (H224: the writer reset the window at ~371 s and the middle was lost) reaches the pulled log
+// reliably. The heartbeat line is the one thing that always survives, so the survey hands two
+// register values per call to the caller, which prints them inside NATIVE_ACCEL_HB.
+static const struct { uint32_t off; const char *name; } kGpuccRegs[] = {
+    {0x0000, "gpupll0_lval"},   {0x0004, "gpupll0_config"},
+    {0x0008, "gpupll0_config_ctl"}, {0x000c, "gpupll0_user_ctl"},
+    {0x0010, "gpupll0_user_ctl_u"}, {0x0014, "gpupll0_state"},
+    {0x0020, "gpupll0_status"},
+    {0x0130, "gx_clamp_io"},
+    {0x1000, "cx_bcr"},        {0x1004, "cx_gdscr"},      {0x1008, "cx_gds_hw_ctrl"},
+    {0x1020, "cxo_branch"},
+    {0x1030, "rbcpr_rcg"},     {0x1050, "rbcpr_bcr"},     {0x1054, "rbcpr_branch"},
+    {0x1070, "gfx3d_rcg"},     {0x1090, "gx_bcr"},        {0x1094, "gx_gdscr"},
+    {0x1098, "gfx3d_branch"},  {0x10b0, "rbbmtimer_rcg"}, {0x10d0, "rbbmtimer_branch"},
+    {0x1100, "isense_rcg"},    {0x1120, "isense_bcr"},    {0x1124, "isense_branch"},
+};
+// The late probe can no longer print the survey: it runs before the log ring starts capturing
+// and a burst is dropped. The heartbeat prints sheng_gpucc_pair() instead.
+void sheng_gpu_power_probe(void) {}
+// The late probe can no longer print the survey: it runs before the log ring starts capturing
+// and a burst is dropped. The heartbeat prints one indexed value per beat instead.
+int sheng_gpucc_count(void) {
+    return (int)(sizeof(kGpuccRegs) / sizeof(kGpuccRegs[0]));
+}
+static int sheng_gpucc_step(unsigned *index, uint32_t *value) {
+    unsigned total = sizeof(kGpuccRegs) / sizeof(kGpuccRegs[0]);
+    if (sheng_gpucc_done >= total)
+        return 0;
+    if (!sheng_gpucc_map) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(0x5065000ULL, 0x9000);
+        IOMemoryMap *map = memory ?
+            memory->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(memory);
+        volatile uint32_t *base = map ?
+            reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()) : nullptr;
+        if (!base) {
+            IOLog("NATIVE_GPUCC: map failed\n");
+            sheng_gpucc_done = total;
+            if (map) OSSafeReleaseNULL(map);
+            return 0;
+        }
+        sheng_gpucc_map = map;
+        sheng_gpucc_base = base;
     }
-    volatile uint32_t *base = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
-    if (!base) {
-        IOLog("NATIVE_GPUCC: virtual map null\n");
-        OSSafeReleaseNULL(map);
-        return;
+    unsigned at = sheng_gpucc_done;
+    uint32_t v = osmRead(sheng_gpucc_base, kGpuccRegs[at].off);
+    sheng_gpucc_done = at + 1;
+    if (index) *index = at;
+    if (value) *value = v;
+    if (sheng_gpucc_done >= total) {
+        IOLog("NATIVE_GPUCC: survey complete\n");
+        OSSafeReleaseNULL(sheng_gpucc_map);
+        sheng_gpucc_base = nullptr;
     }
-    for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i)
-        IOLog("NATIVE_GPUCC: %s[%04x]=%08x\n", regs[i].name, regs[i].off, osmRead(base, regs[i].off));
-    IOLog("NATIVE_GPUCC: state done\n");
-    OSSafeReleaseNULL(map);
+    return 1;
+}
+int sheng_gpucc_pair(uint32_t *first, uint32_t *second) {
+    unsigned index = 0;
+    uint32_t value = 0;
+    int got = 0;
+    if (sheng_gpucc_step(&index, &value)) {
+        if (first) *first = value;
+        got = 1;
+    }
+    if (sheng_gpucc_step(&index, &value)) {
+        if (second) *second = value;
+        got = got ? 2 : 1;
+    }
+    return got;
+}
+int sheng_gpucc_next(unsigned *index, uint32_t *value) {
+    unsigned at = 0;
+    uint32_t v = 0;
+    if (!sheng_gpucc_step(&at, &v))
+        return 0;
+    if (index) *index = at;
+    if (value) *value = v;
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// C1b: first GPU power-up attempt, gated by sheng-gpu-power=1.
+//
+// Order (each step logs before it writes, so a bus hang shows where it stopped):
+//   1. release the GX clamp            GPUCC 0x0130
+//   2. un-collapse the CX GDSC         GPUCC 0x1004 (clear SW_COLLAPSE, bit 0)
+//   3. gfx3d_clk_src <- XO (19.2 MHz)  GPUCC 0x1074 cfg = 0, 0x1070 update
+//   4. enable the gfx3d branch clock   GPUCC 0x1098 (bit 0, plus bit 13 per the msm8998 probe)
+//   5. un-collapse the GX GDSC         GPUCC 0x1094
+//   6. pulse the GX reset              GPUCC 0x1090
+//   7. read RBBM (GPU id)              0x5000000
+//
+// Steps 5 and 7 touch the GX domain, which has no RPM/CX-GX rail vote in this port yet; if the
+// box hangs there the log shows the last step reached.
+// ---------------------------------------------------------------------------
+static volatile uint32_t *gGpuccBase;
+static volatile uint32_t *gRbbmBase;
+
+static uint32_t gpuccRd(uint32_t off) { return gGpuccBase ? osmRead(gGpuccBase, off) : 0xffffffffu; }
+static void gpuccWr(uint32_t off, uint32_t value) {
+    if (!gGpuccBase) return;
+    gGpuccBase[off / 4] = value;
+    __asm__ volatile ("dmb oshst" ::: "memory");
+}
+static void gpuDelay(unsigned rounds) {
+    for (unsigned i = 0; i < rounds; ++i)
+        __asm__ volatile ("yield" ::: "memory");
+}
+static int gpuWaitBit(uint32_t off, uint32_t bit, int wantSet, unsigned rounds) {
+    for (unsigned i = 0; i < rounds; ++i) {
+        uint32_t v = gpuccRd(off);
+        if (((v & bit) != 0) == (wantSet != 0))
+            return 1;
+        gpuDelay(64);
+    }
+    return 0;
+}
+
+// One step per call so each log line is separated by a heartbeat beat (a burst is dropped by
+// the log writer's snapshot window, see the H223/H224 notes above).
+int sheng_gpu_power_step(void) {
+    static unsigned step;
+    static int enabled = -1;
+    if (enabled < 0) {
+        uint32_t value = 0;
+        enabled = PE_parse_boot_argn("sheng-gpu-power", &value, sizeof value) && value == 1;
+    }
+    if (!enabled || step > 6)
+        return 0;
+    if (step == 0) {
+        IODeviceMemory *cc = IODeviceMemory::withRange(0x5065000ULL, 0x9000);
+        IOMemoryMap *ccMap = cc ? cc->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+        OSSafeReleaseNULL(cc);
+        if (!ccMap) {
+            IOLog("NATIVE_GPU_PWR: GPUCC map failed\n");
+            step = 99;
+            return 0;
+        }
+        gGpuccBase = reinterpret_cast<volatile uint32_t *>(ccMap->getVirtualAddress());
+        IOLog("NATIVE_GPU_PWR: start clamp=%08x cx=%08x gx=%08x gfx3d_rcg=%08x\n",
+              gpuccRd(0x0130), gpuccRd(0x1004), gpuccRd(0x1094), gpuccRd(0x1070));
+        ++step;
+        return 1;
+    }
+    if (step == 1) {
+        IOLog("NATIVE_GPU_PWR: step1 release gx clamp\n");
+        gpuccWr(0x0130, 0x0);
+        gpuDelay(256);
+        IOLog("NATIVE_GPU_PWR: clamp now=%08x\n", gpuccRd(0x0130));
+        ++step;
+        return 1;
+    }
+    if (step == 2) {
+        IOLog("NATIVE_GPU_PWR: step2 cx gdsc on\n");
+        gpuccWr(0x1004, gpuccRd(0x1004) & ~1u);
+        int cx = gpuWaitBit(0x1004, 1u, 0, 2000);
+        IOLog("NATIVE_GPU_PWR: cx=%08x collapsed=%d\n", gpuccRd(0x1004), cx ? 0 : 1);
+        ++step;
+        return 1;
+    }
+    if (step == 3) {
+        IOLog("NATIVE_GPU_PWR: step3 gfx3d_clk_src <- xo\n");
+        gpuccWr(0x1074, 0x00000000u);          /* src = XO, div = 0 */
+        gpuccWr(0x1070, gpuccRd(0x1070) | 1u); /* RCG_UPDATE */
+        gpuDelay(256);
+        IOLog("NATIVE_GPU_PWR: gfx3d_rcg=%08x cfg=%08x\n", gpuccRd(0x1070), gpuccRd(0x1074));
+        ++step;
+        return 1;
+    }
+    if (step == 4) {
+        IOLog("NATIVE_GPU_PWR: step4 gfx3d branch on\n");
+        uint32_t branch = gpuccRd(0x1098);
+        gpuccWr(0x1098, (branch | (1u << 13)) & ~(1u << 31));
+        gpuccWr(0x1098, (branch | (1u << 13) | 1u) & ~(1u << 31));
+        gpuDelay(256);
+        IOLog("NATIVE_GPU_PWR: gfx3d_branch=%08x\n", gpuccRd(0x1098));
+        ++step;
+        return 1;
+    }
+    if (step == 5) {
+        IOLog("NATIVE_GPU_PWR: step5 gx gdsc on\n");
+        gpuccWr(0x1094, gpuccRd(0x1094) & ~1u);
+        int gx = gpuWaitBit(0x1094, 1u, 0, 2000);
+        IOLog("NATIVE_GPU_PWR: gx=%08x collapsed=%d\n", gpuccRd(0x1094), gx ? 0 : 1);
+        ++step;
+        return 1;
+    }
+    if (step == 6) {
+        IOLog("NATIVE_GPU_PWR: step6 gx reset pulse\n");
+        gpuccWr(0x1090, 0x1);
+        gpuDelay(256);
+        gpuccWr(0x1090, 0x0);
+        gpuDelay(256);
+        IOLog("NATIVE_GPU_PWR: gx_bcr=%08x\n", gpuccRd(0x1090));
+
+        IOLog("NATIVE_GPU_PWR: step7 rbbm read\n");
+        IODeviceMemory *rm = IODeviceMemory::withRange(0x5000000ULL, 0x40000);
+        IOMemoryMap *rmMap = rm ? rm->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(rm);
+        if (!rmMap) {
+            IOLog("NATIVE_GPU_PWR: RBBM map failed\n");
+        } else {
+            gRbbmBase = reinterpret_cast<volatile uint32_t *>(rmMap->getVirtualAddress());
+            if (gRbbmBase) {
+                IOLog("NATIVE_GPU_PWR: rbbm_hw_version=%08x hw_release=%08x status=%08x\n",
+                      osmRead(gRbbmBase, 0x0000), osmRead(gRbbmBase, 0x0004), osmRead(gRbbmBase, 0x0210));
+            }
+            OSSafeReleaseNULL(rmMap);
+            gRbbmBase = nullptr;
+        }
+        IOLog("NATIVE_GPU_PWR: done\n");
+        ++step;
+        return 0;
+    }
+    return 0;
 }
 void sheng_wifi_probe(void) {}
 void sheng_adsp_probe(void) {}
