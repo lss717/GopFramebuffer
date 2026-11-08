@@ -75,7 +75,33 @@ IOReturn accelCopyOut(IOExternalMethodArguments *arguments, const void *data, si
 
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                                  IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
-    (void) selector; (void) dispatch; (void) target; (void) reference;
+    (void) dispatch; (void) target; (void) reference;
+    /* H218: record every distinct selector the real accelerator ABI uses, so the port can
+     * implement what CoreAnimation asks for instead of guessing. The tunnel protocol below is
+     * this port's own test ABI and is unaffected. */
+    if (arguments) {
+        static uint32_t seen[32];
+        static unsigned seenCount;
+        bool fresh = true;
+        for (unsigned i = 0; i < seenCount; ++i) {
+            if (seen[i] == selector) { fresh = false; break; }
+        }
+        if (fresh && seenCount < 32) {
+            seen[seenCount++] = selector;
+            IOLog("NATIVE_A540_ABI: sel=%u in=%u/%u out=%u/%u comm=%s\n", selector,
+                  (unsigned)arguments->scalarInputCount, (unsigned)arguments->structureInputSize,
+                  (unsigned)arguments->scalarOutputCount, (unsigned)arguments->structureOutputSize,
+                  accelRequester());
+            for (uint32_t k = 0; k < arguments->scalarInputCount && k < 4; ++k) {
+                IOLog("NATIVE_A540_ABI: sel=%u s%u=%llx\n", selector, k,
+                      (unsigned long long)arguments->scalarInput[k]);
+            }
+            if (arguments->structureInput && arguments->structureInputSize >= 8) {
+                const uint32_t *words = static_cast<const uint32_t *>(arguments->structureInput);
+                IOLog("NATIVE_A540_ABI: sel=%u w=%08x %08x\n", selector, words[0], words[1]);
+            }
+        }
+    }
     if (!arguments || !arguments->structureInput || arguments->structureInputSize < 8) return kIOReturnUnsupported;
     const uint32_t *input = static_cast<const uint32_t *>(arguments->structureInput);
     if (input[0] != kAccelTunnelMagic) return kIOReturnUnsupported;
@@ -184,11 +210,13 @@ bool AGXAccelerator::start(IOService *provider) {
 }
 
 static volatile unsigned gA540PropertyReads;
+// H218: no IOLog here. A matching pass holds the IOKit registry lock while it reads
+// properties, and logging from under that lock deadlocked the render server: H217's log
+// ended at "op=match IOAcceleratorES" with no open request afterwards (the same call
+// worked before H202 added the pre-emptive lookup). Only the count is kept now.
 static void notePropertyRead(const char *key) {
-    unsigned seen = gA540PropertyReads;
-    if (seen >= 40) return;
-    gA540PropertyReads = seen + 1;
-    IOLog("NATIVE_A540_ACCEL: read key=%s\n", key ? key : "(null)");
+    (void) key;
+    if (gA540PropertyReads < 40) gA540PropertyReads = gA540PropertyReads + 1;
 }
 OSObject *AGXAccelerator::copyProperty(const OSSymbol *key) const {
     notePropertyRead(key ? key->getCStringNoCopy() : nullptr);
