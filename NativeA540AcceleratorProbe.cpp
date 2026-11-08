@@ -48,6 +48,13 @@ IOReturn AGXDeviceUserClient::clientDied() {return clientClose();}
 namespace {
 constexpr uint32_t kAccelTunnelMagic = 0x4e544e4c;   /* 'NTNL', native-Adreno tunnel */
 constexpr uint32_t kAccelProbe = 0xffffffffu;
+extern "C" void proc_selfname(char *, int);
+const char *accelRequester() {
+    static char name[32];
+    name[0] = 0;
+    proc_selfname(name, sizeof name);
+    return name;
+}
 
 IOReturn accelCopyOut(IOExternalMethodArguments *arguments, const void *data, size_t bytes) {
     if (!arguments->structureOutput || arguments->structureOutputSize < bytes) return kIOReturnBadArgument;
@@ -64,6 +71,12 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
     const uint32_t *input = static_cast<const uint32_t *>(arguments->structureInput);
     if (input[0] != kAccelTunnelMagic) return kIOReturnUnsupported;
     const uint32_t method = input[1];
+    static unsigned noted;
+    if (noted < 24) {
+        ++noted;
+        IOLog("NATIVE_A540_ABI: method=%u selector=%u in=%u comm=%s\n", method, selector,
+              (unsigned) arguments->structureInputSize, accelRequester());
+    }
     // The userspace test probes selectors with {magic, kProbe}; admitting them all picks selector 0.
     if (method == kAccelProbe) return kIOReturnSuccess;
     switch (method) {
@@ -160,7 +173,7 @@ OSObject *AGXAccelerator::copyProperty(const char *key) const {
 
 IOReturn AGXAccelerator::makeClient(task_t task,void *security,UInt32 type,
                                                OSDictionary *properties,IOUserClient **client) {
-    IOLog("NATIVE_A540_ACCEL: open request type=%u\n", type);
+    IOLog("NATIVE_A540_ACCEL: open request type=%u comm=%s\n", type, accelRequester());
     if (!client) return kIOReturnBadArgument;
     *client = nullptr;
     AGXDeviceUserClient *created = new AGXDeviceUserClient;
