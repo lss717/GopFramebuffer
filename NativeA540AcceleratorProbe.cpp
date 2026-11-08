@@ -23,8 +23,11 @@
 // GetDeviceInfo, GetStatus, GetTimestamp and SetMetadata. Nothing here touches GPU registers,
 // firmware, SMMU or command submission; BoAlloc and later steps answer kIOReturnUnsupported on
 // purpose so the test reports "reached the driver" instead of failing at the open.
-class NativeAcceleratorClient : public IOUserClient {
-    OSDeclareDefaultStructors(NativeAcceleratorClient)
+// H195: the class name is the sandbox key: the target's MACF profile admits IOServiceOpen only for
+// the user-client class AGXDeviceUserClient (the same reason NativeAdrenoPublish.cpp uses it), and
+// H194's kernel-side grant was followed by "IOUC NativeAcceleratorClient failed MACF".
+class AGXDeviceUserClient : public IOUserClient {
+    OSDeclareDefaultStructors(AGXDeviceUserClient)
 public:
     bool initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) override;
     IOReturn clientClose() override;
@@ -32,15 +35,15 @@ public:
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                             IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
 };
-OSDefineMetaClassAndStructors(NativeAcceleratorClient,IOUserClient)
+OSDefineMetaClassAndStructors(AGXDeviceUserClient,IOUserClient)
 
-bool NativeAcceleratorClient::initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) {
+bool AGXDeviceUserClient::initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) {
     if(!IOUserClient::initWithTask(owningTask,securityID,type,properties))return false;
     if(!owningTask)return false;
     return true;
 }
-IOReturn NativeAcceleratorClient::clientClose() {terminate();return kIOReturnSuccess;}
-IOReturn NativeAcceleratorClient::clientDied() {return clientClose();}
+IOReturn AGXDeviceUserClient::clientClose() {terminate();return kIOReturnSuccess;}
+IOReturn AGXDeviceUserClient::clientDied() {return clientClose();}
 
 namespace {
 constexpr uint32_t kAccelTunnelMagic = 0x4e544e4c;   /* 'NTNL', native-Adreno tunnel */
@@ -54,7 +57,7 @@ IOReturn accelCopyOut(IOExternalMethodArguments *arguments, const void *data, si
 }
 }  // namespace
 
-IOReturn NativeAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                                  IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
     (void) selector; (void) dispatch; (void) target; (void) reference;
     if (!arguments || !arguments->structureInput || arguments->structureInputSize < 8) return kIOReturnUnsupported;
@@ -160,7 +163,7 @@ IOReturn AGXAccelerator::makeClient(task_t task,void *security,UInt32 type,
     IOLog("NATIVE_A540_ACCEL: open request type=%u\n", type);
     if (!client) return kIOReturnBadArgument;
     *client = nullptr;
-    NativeAcceleratorClient *created = new NativeAcceleratorClient;
+    AGXDeviceUserClient *created = new AGXDeviceUserClient;
     if (!created) return kIOReturnNoMemory;
     if (!created->initWithTask(task,security,type,properties) || !created->attach(this) ||
         !created->start(this)) {
