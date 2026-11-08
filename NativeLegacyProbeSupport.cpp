@@ -51,7 +51,10 @@ static uint32_t osmSample(int log) {
                 low = true;
         }
     }
-    return low ? 1U : (any ? 2U : 1U);
+    /* H213: no cluster reports enabled means the OSM state is not readable here at all
+     * (H211 read enable=0, desired=0, raw=0 for both clusters), not that the CPU runs
+     * slowly. Report it as unknown so the cell does not sit on a misleading red. */
+    return any ? (low ? 1U : 2U) : 6U;
 }
 }
 
@@ -81,6 +84,29 @@ void sheng_cpufreq_probe(void) {
         gOsm = base;
     }
     native_cpu_freq_state = osmSample(1);
+    /* H213: one-shot register map, to find where this SoC keeps the current CPU state.
+     * The OSM window reads all zero, so the APCS PLL/divider is printed as well. */
+    IOLog("NATIVE_CPUFREQ_OSM: c0 0x0=%08x 0x4=%08x 0x1000=%08x 0x1004=%08x 0x1f10=%08x 0x1f14=%08x\n",
+          osmRead(gOsm, 0x0), osmRead(gOsm, 0x4), osmRead(gOsm, 0x1000), osmRead(gOsm, 0x1004),
+          osmRead(gOsm, 0x1f10), osmRead(gOsm, 0x1f14));
+    IOLog("NATIVE_CPUFREQ_OSM: c1 0x0=%08x 0x4=%08x 0x1000=%08x 0x1004=%08x 0x1f10=%08x 0x1f14=%08x\n",
+          osmRead(gOsm, 0x2000), osmRead(gOsm, 0x2004), osmRead(gOsm, 0x3000), osmRead(gOsm, 0x3004),
+          osmRead(gOsm, 0x3f10), osmRead(gOsm, 0x3f14));
+    for (unsigned cluster = 0; cluster < 2; ++cluster) {
+        IODeviceMemory *apcsMemory = IODeviceMemory::withRange(cluster ? 0x17810000ULL : 0x17910000ULL, 0x10000);
+        IOMemoryMap *apcsMap = apcsMemory ?
+            apcsMemory->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(apcsMemory);
+        if (!apcsMap) {
+            IOLog("NATIVE_CPUFREQ_APCS: cluster=%u map failed\n", cluster);
+            continue;
+        }
+        volatile uint32_t *apcs = reinterpret_cast<volatile uint32_t *>(apcsMap->getVirtualAddress());
+        if (apcs)
+            IOLog("NATIVE_CPUFREQ_APCS: cluster=%u pll_l=%08x rcgr=%08x\n", cluster,
+                  osmRead(apcs, 0x6004), osmRead(apcs, 0x1054));
+        OSSafeReleaseNULL(apcsMap);
+    }
     for (unsigned cluster = 0; cluster < 2; ++cluster) {
         IODeviceMemory *clockMemory = IODeviceMemory::withRange(kCpuClockBases[cluster], 0x8000);
         IOMemoryMap *clockMap = clockMemory ?

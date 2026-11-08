@@ -270,6 +270,7 @@ public:
         else if(native_cpu_freq_state==3)cpuColor=purple;
         else if(native_cpu_freq_state==4)cpuColor=orange;
         else if(native_cpu_freq_state==5)cpuColor=blue;
+        else if(native_cpu_freq_state==6)cpuColor=0xff808080U;   // H213: OSM not readable
         fill(0,0,16,16,cpuColor);
         // H103 slot writer state: red = thread never entered, blue = thread
         // entered but window not ready, yellow = ready but write failed,
@@ -310,6 +311,8 @@ public:
         else if(native_cpu_freq_state==3)cpuColor=0xff8000ffU;
         else if(native_cpu_freq_state==4)cpuColor=0xffff8000U;
         else if(native_cpu_freq_state==5)cpuColor=0xff0000ffU;
+        // H213: OSM not readable/uninitialised (no enabled cluster) is unknown, not slow.
+        else if(native_cpu_freq_state==6)cpuColor=0xff808080U;
         for(uint32_t y=0;y<16 && y<h;++y) {
             volatile uint32_t *row=base+(uint64_t)y*words;
             for(uint32_t x=0;x<16 && x<w;++x)row[x]=cpuColor;
