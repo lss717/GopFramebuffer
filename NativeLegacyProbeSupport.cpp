@@ -129,12 +129,25 @@ void sheng_cpufreq_tick(void) {
     if (gOsm)
         native_cpu_freq_state = osmSample(0);
 }
-// C1 baseline: read-only GPU clock controller survey.
-// sagit's record proves GPUCC stays readable while the GPU itself is off (gfx3d_clk_src
-// at 9.6 MHz, both power domains off), so this touches no register that needs GX power:
-// it maps 0x5065000 (GPUCC, 0x9000) and prints the non-zero registers, which is enough to
-// identify the branch clocks and domain status before any write is attempted.
+// C1 baseline: targeted GPUCC state read (msm8998 GPUCC, same block as the A540 vendor DT).
+// H221 scanned 0x0000.. and the bus hung after 0x0078, so this reads only the registers the
+// msm8998 GPUCC driver actually programs (mainline drivers/clk/qcom/gpucc-msm8998.c):
+// fabia PLL gpupll0 at 0x0, the GX clamp at 0x130, and the CX/GX GDSC + branch clocks at
+// 0x1000..0x1124. Those must stay accessible or nothing could ever power the domain up.
 void sheng_gpu_power_probe(void) {
+    static const struct { uint32_t off; const char *name; } regs[] = {
+        {0x0000, "gpupll0_lval"},   {0x0004, "gpupll0_config"},
+        {0x0008, "gpupll0_config_ctl"}, {0x000c, "gpupll0_user_ctl"},
+        {0x0010, "gpupll0_user_ctl_u"}, {0x0014, "gpupll0_state"},
+        {0x0020, "gpupll0_status"},
+        {0x0130, "gx_clamp_io"},
+        {0x1000, "cx_bcr"},        {0x1004, "cx_gdscr"},      {0x1008, "cx_gds_hw_ctrl"},
+        {0x1020, "cxo_branch"},
+        {0x1030, "rbcpr_rcg"},     {0x1050, "rbcpr_bcr"},     {0x1054, "rbcpr_branch"},
+        {0x1070, "gfx3d_rcg"},     {0x1090, "gx_bcr"},        {0x1094, "gx_gdscr"},
+        {0x1098, "gfx3d_branch"},  {0x10b0, "rbbmtimer_rcg"}, {0x10d0, "rbbmtimer_branch"},
+        {0x1100, "isense_rcg"},    {0x1120, "isense_bcr"},    {0x1124, "isense_branch"},
+    };
     IODeviceMemory *memory = IODeviceMemory::withRange(0x5065000ULL, 0x9000);
     IOMemoryMap *map = memory ?
         memory->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
@@ -149,16 +162,9 @@ void sheng_gpu_power_probe(void) {
         OSSafeReleaseNULL(map);
         return;
     }
-    unsigned shown = 0, tested = 0;
-    for (unsigned off = 0; off < 0x1000 && shown < 48; off += 4) {
-        uint32_t value = osmRead(base, off);
-        ++tested;
-        if (!value)
-            continue;
-        IOLog("NATIVE_GPUCC: [%04x]=%08x\n", off, value);
-        ++shown;
-    }
-    IOLog("NATIVE_GPUCC: survey tested=%u shown=%u\n", tested, shown);
+    for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i)
+        IOLog("NATIVE_GPUCC: %s[%04x]=%08x\n", regs[i].name, regs[i].off, osmRead(base, regs[i].off));
+    IOLog("NATIVE_GPUCC: state done\n");
     OSSafeReleaseNULL(map);
 }
 void sheng_wifi_probe(void) {}
