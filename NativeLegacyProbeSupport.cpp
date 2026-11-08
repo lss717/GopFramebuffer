@@ -30,9 +30,12 @@ static IOMemoryMap *sheng_gpucc_map;
 static volatile uint32_t *sheng_gpucc_base;
 static unsigned sheng_gpucc_done;
 static unsigned sheng_rbbm_moved;
+static unsigned sheng_rpm_moved;
 // H228: the three RBBM identity words once the power-up step read them.
 static volatile uint32_t gRbbmValues[3];
 static volatile int gRbbmValid;
+// C1d: read-only SMEM/GLINK survey words, reported through the gc= channel (30..35).
+static volatile uint32_t gRpmWords[6];
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -225,6 +228,12 @@ int sheng_gpucc_next(unsigned *index, uint32_t *value) {
         if (value) *value = gRbbmValues[k];
         return 1;
     }
+    if (gRbbmValid && sheng_gpucc_done >= total && sheng_rpm_moved < 6) {
+        unsigned k = sheng_rpm_moved++;
+        if (index) *index = 30 + k;
+        if (value) *value = gRpmWords[k];
+        return 1;
+    }
     if (!sheng_gpucc_step(&at, &v))
         return 0;
     if (index) *index = at;
@@ -264,6 +273,41 @@ static void gpuDelay(unsigned rounds) {
 // (gpu_cx_gdsc: 0x1008), otherwise from the GDSCR itself (gpu_gx_gdsc: 0x1094). SW_COLLAPSE
 // is BIT(0); HW_CONTROL is BIT(1); SW_OVERRIDE is BIT(2); the wait fields are 23:20, 19:16,
 // 15:12 (2, 8, 2 at reset).
+// C1d: the RPM on msm8998 speaks GLINK over SMEM (qcom,smem@86000000, 2 MiB;
+// qcom,rpm-glink / rpm_requests). Before writing any request, prove SMEM is readable and
+// find the partition table: magic "COMM" (0x434f4d4d) in the first 4 KiB.
+static void sheng_rpm_survey(void) {
+    IODeviceMemory *mem = IODeviceMemory::withRange(0x86000000ULL, 0x200000);
+    IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+    OSSafeReleaseNULL(mem);
+    if (!map) {
+        gRpmWords[0] = 0xffffffffu;
+        return;
+    }
+    volatile uint32_t *base = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+    if (!base) {
+        OSSafeReleaseNULL(map);
+        gRpmWords[0] = 0xfffffffeu;
+        return;
+    }
+    const uint32_t *w = const_cast<const uint32_t *>(base);
+    gRpmWords[0] = w[0];
+    gRpmWords[1] = w[1];
+    gRpmWords[2] = w[2];
+    unsigned magicAt = 0;
+    for (unsigned off = 0; off < 0x1000; off += 4) {
+        if (w[off / 4] == 0x434f4d4du) {
+            magicAt = off;
+            break;
+        }
+    }
+    gRpmWords[3] = magicAt;
+    if (magicAt) {
+        gRpmWords[4] = w[magicAt / 4 + 1];   /* version */
+        gRpmWords[5] = w[magicAt / 4 + 2];   /* num_entries */
+    }
+    OSSafeReleaseNULL(map);
+}
 static int gpuGdscOn(const char *name, uint32_t gdscr, uint32_t statusReg) {
     uint32_t before = gpuccRd(gdscr);
     uint32_t value = before;
@@ -395,6 +439,7 @@ int sheng_gpu_power_step(void) {
             OSSafeReleaseNULL(rmMap);
             gRbbmBase = nullptr;
         }
+        sheng_rpm_survey();
         IOLog("NATIVE_GPU_PWR: done\n");
         ++step;
         return 0;
