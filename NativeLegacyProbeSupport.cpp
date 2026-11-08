@@ -31,11 +31,19 @@ static volatile uint32_t *sheng_gpucc_base;
 static unsigned sheng_gpucc_done;
 static unsigned sheng_rbbm_moved;
 static unsigned sheng_rpm_moved;
+static unsigned sheng_mem_moved;
+static unsigned sheng_vm_moved;
 // H228: the three RBBM identity words once the power-up step read them.
 static volatile uint32_t gRbbmValues[3];
 static volatile int gRbbmValid;
 // C1d: read-only SMEM/GLINK survey words, reported through the gc= channel (30..35).
 static volatile uint32_t gRpmWords[6];
+// C1d-2: the same probe applied to memory with known content (GPU addon magic) to prove the
+// mapping path works before concluding that SMEM itself is empty.
+static volatile uint32_t gMemWords[3];
+// C1d-3: [gPhysBase, mem_size, avail_start, avail_end] from arm_vm_init.
+extern "C" uint64_t native_vm_range[4];
+static volatile int gMemValid;
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -234,6 +242,20 @@ int sheng_gpucc_next(unsigned *index, uint32_t *value) {
         if (value) *value = gRpmWords[k];
         return 1;
     }
+    if (gMemValid && sheng_gpucc_done >= total && sheng_mem_moved < 3) {
+        unsigned k = sheng_mem_moved++;
+        if (index) *index = 36 + k;
+        if (value) *value = gMemWords[k];
+        return 1;
+    }
+    // C1d-3: indices 40..47 are the 64-bit VM range numbers, two 32-bit halves each.
+    if (gMemValid && sheng_gpucc_done >= total && sheng_vm_moved < 8) {
+        unsigned k = sheng_vm_moved++;
+        uint64_t v = native_vm_range[k >> 1];
+        if (index) *index = 40 + k;
+        if (value) *value = (k & 1) ? (uint32_t)(v >> 32) : (uint32_t)v;
+        return 1;
+    }
     if (!sheng_gpucc_step(&at, &v))
         return 0;
     if (index) *index = at;
@@ -291,6 +313,22 @@ static void sheng_rpm_survey(void) {
         return;
     }
     const uint32_t *w = const_cast<const uint32_t *>(base);
+    /* same mechanism on RAM whose first bytes are known: "NGPUADD2" -> 0x5550474e, 0x32444441 */
+    {
+        IODeviceMemory *known = IODeviceMemory::withRange(0x185f58000ULL, 0x1000);
+        IOMemoryMap *knownMap = known ? known->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(known);
+        if (knownMap) {
+            volatile uint32_t *kw = reinterpret_cast<volatile uint32_t *>(knownMap->getVirtualAddress());
+            if (kw) {
+                gMemWords[0] = kw[0];
+                gMemWords[1] = kw[1];
+                gMemWords[2] = kw[2];
+                gMemValid = 1;
+            }
+            OSSafeReleaseNULL(knownMap);
+        }
+    }
     gRpmWords[0] = w[0];
     gRpmWords[1] = w[1];
     gRpmWords[2] = w[2];
