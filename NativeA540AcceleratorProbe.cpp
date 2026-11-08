@@ -23,6 +23,15 @@
 // GetDeviceInfo, GetStatus, GetTimestamp and SetMetadata. Nothing here touches GPU registers,
 // firmware, SMMU or command submission; BoAlloc and later steps answer kIOReturnUnsupported on
 // purpose so the test reports "reached the driver" instead of failing at the open.
+// H203: persistent ABI state for the UFS heartbeat; the boot log window is unreliable, so the counters
+// and the last SetMetadata text must survive in the kernel and be printed every heartbeat instead.
+extern "C" volatile int native_a540_abi_calls;
+extern "C" volatile int native_a540_abi_last_method;
+extern "C" volatile int native_a540_abi_reports;
+extern "C" char native_a540_abi_report[64];
+extern "C" { volatile int native_a540_abi_calls = 0; volatile int native_a540_abi_last_method = 0;
+             volatile int native_a540_abi_reports = 0; char native_a540_abi_report[64] = {}; }
+
 // H195: the class name is the sandbox key: the target's MACF profile admits IOServiceOpen only for
 // the user-client class AGXDeviceUserClient (the same reason NativeAdrenoPublish.cpp uses it), and
 // H194's kernel-side grant was followed by "IOUC NativeAcceleratorClient failed MACF".
@@ -71,6 +80,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
     const uint32_t *input = static_cast<const uint32_t *>(arguments->structureInput);
     if (input[0] != kAccelTunnelMagic) return kIOReturnUnsupported;
     const uint32_t method = input[1];
+    native_a540_abi_calls = native_a540_abi_calls + 1;
+    native_a540_abi_last_method = (int) method;
     static unsigned noted;
     if (method != kAccelProbe && noted < 32) {
         ++noted;
@@ -115,6 +126,11 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
             const uint32_t bytes = meta->bytes < NativeAdrenoAbiMetadataBytes ? meta->bytes : NativeAdrenoAbiMetadataBytes;
             memcpy(text, meta->text, bytes);
             IOLog("NATIVE_A540_ABI: report %s\n", text);
+            for (unsigned i = 0; i < sizeof(native_a540_abi_report) - 1; ++i) {
+                native_a540_abi_report[i] = text[i];
+                if (!text[i]) break;
+            }
+            native_a540_abi_reports = native_a540_abi_reports + 1;
             return kIOReturnSuccess;
         }
         default:
