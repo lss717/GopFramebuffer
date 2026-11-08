@@ -72,10 +72,13 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
     if (input[0] != kAccelTunnelMagic) return kIOReturnUnsupported;
     const uint32_t method = input[1];
     static unsigned noted;
-    if (noted < 24) {
+    if (method != kAccelProbe && noted < 32) {
         ++noted;
         IOLog("NATIVE_A540_ABI: method=%u selector=%u in=%u comm=%s\n", method, selector,
               (unsigned) arguments->structureInputSize, accelRequester());
+    } else if (method == kAccelProbe && noted == 0) {
+        noted = 1;   /* the selector probe is one line, not 24 */
+        IOLog("NATIVE_A540_ABI: probe selector=%u comm=%s\n", selector, accelRequester());
     }
     // The userspace test probes selectors with {magic, kProbe}; admitting them all picks selector 0.
     if (method == kAccelProbe) return kIOReturnSuccess;
