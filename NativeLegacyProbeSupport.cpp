@@ -29,6 +29,10 @@ static volatile uint32_t *gOsm;
 static IOMemoryMap *sheng_gpucc_map;
 static volatile uint32_t *sheng_gpucc_base;
 static unsigned sheng_gpucc_done;
+static unsigned sheng_rbbm_moved;
+// H228: the three RBBM identity words once the power-up step read them.
+static volatile uint32_t gRbbmValues[3];
+static volatile int gRbbmValid;
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -210,9 +214,17 @@ int sheng_gpucc_pair(uint32_t *first, uint32_t *second) {
     }
     return got;
 }
+// H228: indices 24..26 are the three RBBM words, available once the power-up read them.
 int sheng_gpucc_next(unsigned *index, uint32_t *value) {
     unsigned at = 0;
     uint32_t v = 0;
+    unsigned total = sizeof(kGpuccRegs) / sizeof(kGpuccRegs[0]);
+    if (gRbbmValid && sheng_gpucc_done >= total && sheng_rbbm_moved < 3) {
+        unsigned k = sheng_rbbm_moved++;
+        if (index) *index = total + k;
+        if (value) *value = gRbbmValues[k];
+        return 1;
+    }
     if (!sheng_gpucc_step(&at, &v))
         return 0;
     if (index) *index = at;
@@ -302,8 +314,8 @@ int sheng_gpu_power_step(void) {
     }
     if (step == 3) {
         IOLog("NATIVE_GPU_PWR: step3 gfx3d_clk_src <- xo\n");
-        gpuccWr(0x1074, 0x00000000u);          /* src = XO, div = 0 */
-        gpuccWr(0x1070, gpuccRd(0x1070) | 1u); /* RCG_UPDATE */
+        gpuccWr(0x1074, 0x00000000u);                    /* src = XO, div = 0 */
+        gpuccWr(0x1070, (gpuccRd(0x1070) & ~(1u << 31)) | 1u); /* clear ROOT_OFF, RCG_UPDATE */
         gpuDelay(256);
         IOLog("NATIVE_GPU_PWR: gfx3d_rcg=%08x cfg=%08x\n", gpuccRd(0x1070), gpuccRd(0x1074));
         ++step;
@@ -314,8 +326,14 @@ int sheng_gpu_power_step(void) {
         uint32_t branch = gpuccRd(0x1098);
         gpuccWr(0x1098, (branch | (1u << 13)) & ~(1u << 31));
         gpuccWr(0x1098, (branch | (1u << 13) | 1u) & ~(1u << 31));
-        gpuDelay(256);
-        IOLog("NATIVE_GPU_PWR: gfx3d_branch=%08x\n", gpuccRd(0x1098));
+        int running = 0;
+        for (unsigned i = 0; i < 2000 && !running; ++i) {
+            if (!(gpuccRd(0x1098) & (1u << 31)))
+                running = 1;
+            else
+                gpuDelay(64);
+        }
+        IOLog("NATIVE_GPU_PWR: gfx3d_branch=%08x running=%d\n", gpuccRd(0x1098), running);
         ++step;
         return 1;
     }
@@ -344,8 +362,12 @@ int sheng_gpu_power_step(void) {
         } else {
             gRbbmBase = reinterpret_cast<volatile uint32_t *>(rmMap->getVirtualAddress());
             if (gRbbmBase) {
+                gRbbmValues[0] = osmRead(gRbbmBase, 0x0000);
+                gRbbmValues[1] = osmRead(gRbbmBase, 0x0004);
+                gRbbmValues[2] = osmRead(gRbbmBase, 0x0210);
+                gRbbmValid = 1;
                 IOLog("NATIVE_GPU_PWR: rbbm_hw_version=%08x hw_release=%08x status=%08x\n",
-                      osmRead(gRbbmBase, 0x0000), osmRead(gRbbmBase, 0x0004), osmRead(gRbbmBase, 0x0210));
+                      gRbbmValues[0], gRbbmValues[1], gRbbmValues[2]);
             }
             OSSafeReleaseNULL(rmMap);
             gRbbmBase = nullptr;
