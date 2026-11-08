@@ -34,6 +34,7 @@ static unsigned sheng_rpm_moved;
 static unsigned sheng_mem_moved;
 static unsigned sheng_vm_moved;
 static unsigned sheng_fb_moved;
+static unsigned sheng_scan_moved;
 // H228: the three RBBM identity words once the power-up step read them.
 static volatile uint32_t gRbbmValues[3];
 static volatile int gRbbmValid;
@@ -49,6 +50,11 @@ static volatile int gMemValid;
 // splash, so it proves whether low physical memory is readable in this kernel at all.
 static volatile uint32_t gFbWords[3];
 static volatile int gFbValid;
+// C1d-4b: bounded SMEM scan over 0x80000000..0xa0000000 in 2 MiB steps.
+static volatile uint32_t gScanBase[4];
+static volatile uint32_t gScanValue[4];
+static volatile int gScanHits;
+static volatile int gScanDone;
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -253,6 +259,20 @@ int sheng_gpucc_next(unsigned *index, uint32_t *value) {
         if (value) *value = gMemWords[k];
         return 1;
     }
+    if (gScanDone && sheng_gpucc_done >= total && sheng_scan_moved == 0) {
+        sheng_scan_moved = 1;
+        if (index) *index = 60;
+        if (value) *value = (uint32_t)gScanHits;
+        return 1;
+    }
+    if (gScanDone && sheng_gpucc_done >= total && sheng_scan_moved >= 1 && sheng_scan_moved <= 8) {
+        unsigned k = (sheng_scan_moved - 1) / 2;
+        unsigned half = (sheng_scan_moved - 1) % 2;
+        sheng_scan_moved++;
+        if (index) *index = 61 + (k * 2) + half;
+        if (value) *value = half ? gScanValue[k] : gScanBase[k];
+        return 1;
+    }
     if (gFbValid && sheng_gpucc_done >= total && sheng_fb_moved < 3) {
         unsigned k = sheng_fb_moved++;
         if (index) *index = 48 + k;
@@ -372,6 +392,33 @@ static void sheng_rpm_survey(void) {
         gRpmWords[5] = w[magicAt / 4 + 2];   /* num_entries */
     }
     OSSafeReleaseNULL(map);
+}
+// C1d-4b: the vendor DT puts SMEM at 0x86000000, but that region reads zero on this boot path.
+// Scan the plausible low-DRAM window in 2 MiB steps and remember the first four non-zero heads:
+// the SMEM header (or anything else that lives there) shows up as base/value pairs.
+static void sheng_smem_scan(void) {
+    int hits = 0;
+    for (uint64_t window = 0x80000000ULL; window < 0xA0000000ULL && hits < 4; window += 0x2000000ULL) {
+        IODeviceMemory *mem = IODeviceMemory::withRange(window, 0x2000000);
+        IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(mem);
+        if (!map)
+            continue;
+        volatile uint32_t *base = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+        if (base) {
+            for (uint64_t off = 0; off < 0x2000000ULL && hits < 4; off += 0x200000ULL) {
+                uint32_t value = osmRead(base, (uint32_t)off);
+                if (value) {
+                    gScanBase[hits] = (uint32_t)(window + off);
+                    gScanValue[hits] = value;
+                    ++hits;
+                }
+            }
+        }
+        OSSafeReleaseNULL(map);
+    }
+    gScanHits = hits;
+    gScanDone = 1;
 }
 static int gpuGdscOn(const char *name, uint32_t gdscr, uint32_t statusReg) {
     uint32_t before = gpuccRd(gdscr);
@@ -505,6 +552,7 @@ int sheng_gpu_power_step(void) {
             gRbbmBase = nullptr;
         }
         sheng_rpm_survey();
+        sheng_smem_scan();
         IOLog("NATIVE_GPU_PWR: done\n");
         ++step;
         return 0;
