@@ -917,27 +917,62 @@ static int sheng_spmi_power_step(int mode) {
         return 1;
     }
     if (step == 20) {
-        gpuccWr(0x1074, 0x00000000u);
-        gpuccWr(0x1070, (gpuccRd(0x1070) & ~(1u << 31)) | 1u);
+        // Fabia PLL (gpupll0): 1028 MHz VCO, even post-div /2 -> 514 MHz,
+        // gfx3d RCG /2 -> 257 MHz. L = 1028/19.2 = 53, alpha = 0x8aab.
+        // USER_CTL_LO already selects the even /2 output and main output (0x107).
+        gpuccWr(0x04, 53u);                 /* L_VAL */
+        gpuccWr(0x08, 53u);                 /* CAL_L_VAL */
+        gpuccWr(0x38, 0x8aabu);             /* ALPHA (16-bit) */
+        __asm__ volatile ("dmb oshst" ::: "memory");
+        uint32_t mode = gpuccRd(0x00);
+        gpuccWr(0x00, mode & ~1u);          /* OUTCTRL off */
+        gpuccWr(0x2c, 0u);                  /* OPMODE = STANDBY */
+        gpuDelay(64);
+        gpuccWr(0x00, (mode & ~1u) | (1u << 2));  /* RESET_N */
+        gpuccWr(0x2c, 1u);                  /* OPMODE = RUN */
+        int lock = 0;
+        for (unsigned i = 0; i < 2000; ++i) {
+            if (gpuccRd(0x00) & (1u << 31)) { lock = 1; break; }
+            gpuDelay(64);
+        }
+        gpuccWr(0x0c, gpuccRd(0x0c) | 7u);  /* main PLL output */
+        gpuccWr(0x00, gpuccRd(0x00) | 1u);  /* OUTCTRL */
         gpuDelay(256);
-        sheng_spmi2_record(gpuccRd(0x1070));
-        sheng_spmi2_record(gpuccRd(0x1074));
-        IOLog("NATIVE_GPU_PWR: c1e2 gfx3d_rcg=%08x cfg=%08x\n",
-              gpuccRd(0x1070), gpuccRd(0x1074));
+        sheng_spmi2_record(gpuccRd(0x00));
+        sheng_spmi2_record(gpuccRd(0x04));
+        IOLog("NATIVE_GPU_PWR: c1e2 pll mode=%08x l=%08x lock=%d\n",
+              gpuccRd(0x00), gpuccRd(0x04), lock);
         ++step;
         return 1;
     }
     if (step == 21) {
-        uint32_t branch = gpuccRd(0x1098);
-        gpuccWr(0x1098, (branch | (1u << 13)) & ~(1u << 31));
-        gpuccWr(0x1098, (branch | (1u << 13) | 1u) & ~(1u << 31));
-        gpuDelay(256);
-        sheng_spmi2_record(gpuccRd(0x1098));
-        IOLog("NATIVE_GPU_PWR: c1e2 gfx3d_branch=%08x\n", gpuccRd(0x1098));
+        // RCG: source 1 (even PLL output), div field 1. CMD bit0 = update,
+        // bit1 = ROOT_ENABLE; bit31 is ROOT_STATUS (read-only).
+        gpuccWr(0x1074, 0x101u);
+        uint32_t cmd = gpuccRd(0x1070) & ~(1u << 31);
+        gpuccWr(0x1070, cmd | 1u);
+        for (unsigned i = 0; i < 2000 && (gpuccRd(0x1070) & 1u); ++i)
+            gpuDelay(16);
+        cmd = gpuccRd(0x1070) & ~(1u << 31);
+        gpuccWr(0x1070, cmd | 2u);
+        int on = 0;
+        for (unsigned i = 0; i < 2000; ++i) {
+            if (!(gpuccRd(0x1070) & (1u << 31))) { on = 1; break; }
+            gpuDelay(16);
+        }
+        sheng_spmi2_record(gpuccRd(0x1070));
+        sheng_spmi2_record(gpuccRd(0x1074));
+        IOLog("NATIVE_GPU_PWR: c1e2 rcg=%08x cfg=%08x on=%d\n",
+              gpuccRd(0x1070), gpuccRd(0x1074), on);
         ++step;
         return 1;
     }
     if (step == 22) {
+        uint32_t branch = gpuccRd(0x1098);
+        gpuccWr(0x1098, (branch | (1u << 13) | 1u) & ~(1u << 31));
+        gpuDelay(256);
+        sheng_spmi2_record(gpuccRd(0x1098));
+        IOLog("NATIVE_GPU_PWR: c1e2 gfx3d_branch=%08x\n", gpuccRd(0x1098));
         gpuccWr(0x1090, 0x1);
         gpuDelay(256);
         gpuccWr(0x1090, 0x0);
