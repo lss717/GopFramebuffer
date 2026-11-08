@@ -33,6 +33,7 @@ static unsigned sheng_rbbm_moved;
 static unsigned sheng_rpm_moved;
 static unsigned sheng_mem_moved;
 static unsigned sheng_vm_moved;
+static unsigned sheng_fb_moved;
 // H228: the three RBBM identity words once the power-up step read them.
 static volatile uint32_t gRbbmValues[3];
 static volatile int gRbbmValid;
@@ -44,6 +45,10 @@ static volatile uint32_t gMemWords[3];
 // C1d-3: [gPhysBase, mem_size, avail_start, avail_end] from arm_vm_init.
 extern "C" uint64_t native_vm_range[4];
 static volatile int gMemValid;
+// C1d-4: low-memory control read. The GOP framebuffer at 0x9d400000 always holds the boot
+// splash, so it proves whether low physical memory is readable in this kernel at all.
+static volatile uint32_t gFbWords[3];
+static volatile int gFbValid;
 
 // 1 = an enabled cluster is below 1 GHz, 2 = enabled and at least 1 GHz,
 // 3 = OSM not readable. log != 0 prints the per-cluster decode once.
@@ -248,6 +253,12 @@ int sheng_gpucc_next(unsigned *index, uint32_t *value) {
         if (value) *value = gMemWords[k];
         return 1;
     }
+    if (gFbValid && sheng_gpucc_done >= total && sheng_fb_moved < 3) {
+        unsigned k = sheng_fb_moved++;
+        if (index) *index = 48 + k;
+        if (value) *value = gFbWords[k];
+        return 1;
+    }
     // C1d-3: indices 40..47 are the 64-bit VM range numbers, two 32-bit halves each.
     if (gMemValid && sheng_gpucc_done >= total && sheng_vm_moved < 8) {
         unsigned k = sheng_vm_moved++;
@@ -327,6 +338,22 @@ static void sheng_rpm_survey(void) {
                 gMemValid = 1;
             }
             OSSafeReleaseNULL(knownMap);
+        }
+    }
+    /* low-memory control: the framebuffer the display backend already maps and uses */
+    {
+        IODeviceMemory *fb = IODeviceMemory::withRange(0x9d400000ULL, 0x1000);
+        IOMemoryMap *fbMap = fb ? fb->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(fb);
+        if (fbMap) {
+            volatile uint32_t *fw = reinterpret_cast<volatile uint32_t *>(fbMap->getVirtualAddress());
+            if (fw) {
+                gFbWords[0] = fw[0];
+                gFbWords[1] = fw[1];
+                gFbWords[2] = fw[2];
+                gFbValid = 1;
+            }
+            OSSafeReleaseNULL(fbMap);
         }
     }
     gRpmWords[0] = w[0];
