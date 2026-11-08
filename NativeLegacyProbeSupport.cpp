@@ -613,8 +613,11 @@ static int sheng_spmi_write(uint16_t addr, uint32_t data, unsigned len) {
     return sheng_spmi_wait(gSpmiChnls);
 }
 static void sheng_spmi2_record(uint32_t value) {
-    if (gSpmi2Count < (int)(sizeof(gSpmi2Words) / sizeof(gSpmi2Words[0])))
-        gSpmi2Words[gSpmi2Count++] = value;
+    int count = gSpmi2Count;
+    if (count < (int)(sizeof(gSpmi2Words) / sizeof(gSpmi2Words[0]))) {
+        gSpmi2Words[count] = value;
+        gSpmi2Count = count + 1;
+    }
 }
 // Failure marker for the gc= channel: distinguishable from any real register byte.
 static uint32_t sheng_spmi_err(int rc) {
