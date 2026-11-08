@@ -63,7 +63,7 @@ static volatile int gSpmiDone;
 // C1e-2: PM8005 S1 survey/sequence results, emitted through the gc= channel as soon as
 // each one is produced (index 80 and up). Keeping them ahead of the one-per-beat GPUCC
 // survey means a failed write at boot still reaches the pulled log in this boot.
-static volatile uint32_t gSpmi2Words[40];
+static volatile uint32_t gSpmi2Words[64];
 static volatile int gSpmi2Count;
 // C1e-2: SPMI PMIC-arbiter transport state (see the C1e-2 block below).
 static IOMemoryMap *gSpmiCoreMap, *gSpmiCnfgMap, *gSpmiChnlsMap, *gSpmiObsrvrMap;
@@ -648,6 +648,46 @@ static int pm8005Voltage(uint32_t type, uint32_t low, uint32_t high) {
         return (int)((((high & 0xffu) << 8) | (low & 0xffu)) * 1000u);
     return pm8005Uv(low, high);
 }
+// C3: the A5xx GPU register window (0x5000000) is mapped once for the RBBM
+// identity and the CP/GPMU survey. Offsets in a5xx_reg.h are dword indices, so
+// the byte offset below is (index << 2).
+static IOMemoryMap *gGpuRegsMap;
+static volatile uint32_t *gGpuRegs;
+static volatile uint32_t *sheng_gpu_regs(void) {
+    if (!gGpuRegs) {
+        IODeviceMemory *mem = IODeviceMemory::withRange(0x5000000ULL, 0x40000);
+        IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache |
+                                          kIOMapReadOnly) : nullptr;
+        OSSafeReleaseNULL(mem);
+        if (!map)
+            return nullptr;
+        volatile uint32_t *p = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+        if (!p) {
+            OSSafeReleaseNULL(map);
+            return nullptr;
+        }
+        gGpuRegsMap = map;
+        gGpuRegs = p;
+    }
+    return gGpuRegs;
+}
+// First C3 step: read-only A5xx CP/GPMU/RBBM survey. Values are dword offsets
+// from a5xx_reg.h multiplied by four. No block is reset or clocked here.
+static const struct { uint32_t off; const char *name; } kA5xxRegs[] = {
+    { 0x2000, "cp_rb_base" },
+    { 0x2008, "cp_rb_cntl" },
+    { 0x2018, "cp_rb_rptr" },
+    { 0x201c, "cp_rb_wptr" },
+    { 0x20c8, "cp_me_cntl" },
+    { 0x20d4, "cp_pfp_instr_base" },
+    { 0x1384, "rbbm_int0_status" },
+    { 0x13d4, "rbbm_status" },
+    { 0x14c0, "rbbm_status3" },
+    { 0x2a360, "gpmu_cm3_sysreset" },
+    { 0x2a380, "gpmu_general0" },
+    { 0x2a384, "gpmu_general1" },
+    { 0x22000, "gpmu_inst_ram0" },
+};
 static int gpuGdscOn(const char *name, uint32_t gdscr, uint32_t statusReg) {
     uint32_t before = gpuccRd(gdscr);
     uint32_t value = before;
@@ -706,7 +746,7 @@ static int gS1Uv = -1;
 
 static int sheng_spmi_power_step(int mode) {
     static unsigned step;
-    if (mode < 2 || step > 24)
+    if (mode < 2 || step > 40)
         return 0;
     if (step == 0) {
         if (!gGpuccBase) {
@@ -978,27 +1018,33 @@ static int sheng_spmi_power_step(int mode) {
         gpuccWr(0x1090, 0x0);
         gpuDelay(256);
         sheng_spmi2_record(gpuccRd(0x1090));
-        IODeviceMemory *rm = IODeviceMemory::withRange(0x5000000ULL, 0x40000);
-        IOMemoryMap *rmMap = rm ? rm->map(kIOMapAnywhere | kIOMapInhibitCache |
-                                          kIOMapReadOnly) : nullptr;
-        OSSafeReleaseNULL(rm);
-        if (!rmMap) {
+        volatile uint32_t *base = sheng_gpu_regs();
+        if (!base) {
             sheng_spmi2_record(0xdea00006u);
         } else {
-            volatile uint32_t *base = reinterpret_cast<volatile uint32_t *>(rmMap->getVirtualAddress());
-            if (base) {
-                sheng_spmi2_record(osmRead(base, 0x0000));
-                sheng_spmi2_record(osmRead(base, 0x0004));
-                sheng_spmi2_record(osmRead(base, 0x0210));
-                IOLog("NATIVE_GPU_PWR: c1e2 rbbm=%08x/%08x/%08x\n",
-                      osmRead(base, 0x0000), osmRead(base, 0x0004), osmRead(base, 0x0210));
-            } else {
-                sheng_spmi2_record(0xdea00007u);
-            }
-            OSSafeReleaseNULL(rmMap);
+            sheng_spmi2_record(osmRead(base, 0x0000));
+            sheng_spmi2_record(osmRead(base, 0x0004));
+            sheng_spmi2_record(osmRead(base, 0x0210));
+            IOLog("NATIVE_GPU_PWR: c1e2 rbbm=%08x/%08x/%08x\n",
+                  osmRead(base, 0x0000), osmRead(base, 0x0004), osmRead(base, 0x0210));
         }
         ++step;
         return 1;
+    }
+    if (step >= 23 && mode >= 5) {
+        unsigned k = step - 23;
+        if (k < sizeof(kA5xxRegs) / sizeof(kA5xxRegs[0])) {
+            volatile uint32_t *base = sheng_gpu_regs();
+            uint32_t v = base ? osmRead(base, kA5xxRegs[k].off) : 0xfffffffeu;
+            sheng_spmi2_record(v);
+            IOLog("NATIVE_GPU_PWR: c1e2 c3 %-18s @%05x = %08x\n",
+                  kA5xxRegs[k].name, kA5xxRegs[k].off, v);
+            ++step;
+            return 1;
+        }
+        IOLog("NATIVE_GPU_PWR: c1e2 c3 survey done\n");
+        step = 99;
+        return 0;
     }
     IOLog("NATIVE_GPU_PWR: c1e2 sequence done\n");
     step = 99;
