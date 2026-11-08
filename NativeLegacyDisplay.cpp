@@ -39,6 +39,8 @@ extern "C" volatile uint32_t native_legacy_transfer_calls;
 extern "C" volatile int native_legacy_client_status;
 extern "C" char native_legacy_client_comm[64];
 extern "C" volatile uint32_t native_cpu_freq_state;
+// H210: resample the OSM state from the 1 Hz heartbeat before repainting.
+extern "C" void sheng_cpufreq_tick(void);
 extern "C" volatile uint32_t native_h103_slot_state;
 extern "C" volatile uint32_t native_a540_accel_state;
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
@@ -298,6 +300,19 @@ public:
         for(uint32_t y=0;y<16 && y<h;++y) {
             volatile uint32_t *row=base+(uint64_t)y*words;
             for(uint32_t x=40;x<56 && x<w;++x)row[x]=color;
+        }
+        // H210: repaint the CPU frequency cell from the state sheng_cpufreq_tick()
+        // just refreshed. Same palette as drawStatusCells(): red below 1 GHz or
+        // no enabled cluster, green at or above 1 GHz.
+        uint32_t cpuColor=0xff404040U;
+        if(native_cpu_freq_state==2)cpuColor=0xff00ff00U;
+        else if(native_cpu_freq_state==1)cpuColor=0xffff0000U;
+        else if(native_cpu_freq_state==3)cpuColor=0xff8000ffU;
+        else if(native_cpu_freq_state==4)cpuColor=0xffff8000U;
+        else if(native_cpu_freq_state==5)cpuColor=0xff0000ffU;
+        for(uint32_t y=0;y<16 && y<h;++y) {
+            volatile uint32_t *row=base+(uint64_t)y*words;
+            for(uint32_t x=0;x<16 && x<w;++x)row[x]=cpuColor;
         }
         __asm__ volatile("dsb oshst" ::: "memory");
     }
@@ -702,6 +717,6 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 extern "C" int native_legacy_test_pattern(void) {return gTestDisplay?gTestDisplay->drawTestPattern():0;}
-extern "C" void native_legacy_heartbeat_cell(void) {if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
+extern "C" void native_legacy_heartbeat_cell(void) {sheng_cpufreq_tick();if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
