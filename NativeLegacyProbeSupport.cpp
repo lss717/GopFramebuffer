@@ -494,19 +494,21 @@ static constexpr uint32_t kSpmiEe = 0;
 static constexpr uint32_t kSpmiMaxApid = 0x200;   /* (core_size 0x1000 - 0x800) / 4 */
 static constexpr uint8_t  kPm8005Sid = 5;
 static constexpr uint16_t kPm8005S1Base = 0x1400;
-// PM8005 S1 common QPNP regulator layout (vendor drivers/regulator/qpnp-regulator.c).
+// PM8005 S1 QPNP regulator registers. The identity read on this board is type 0x1c /
+// subtype 0x0a (FTS426, common2 layout: 0x40/0x41 = 16-bit mV), so the older 8-bit
+// RANGE/VSET pair is kept only as a fallback for a GP_CTL buck.
 enum {
     kPm8005Rev     = 0x01,
     kPm8005Type    = 0x04,
     kPm8005Subtype = 0x05,
-    kPm8005Range   = 0x40,   /* smps_ranges[0]: 375000 uV + 12500 * VSET */
-    kPm8005Vset    = 0x41,
-    kPm8005Mode    = 0x45,   /* bit7 = HPM */
+    kPm8005Range   = 0x40,   /* common2: voltage LSB (mV); common: RANGE */
+    kPm8005Vset    = 0x41,   /* common2: voltage MSB (mV); common: VSET */
+    kPm8005Mode    = 0x45,   /* common2: 3..7, 7 = HPM; common: bit7 = HPM */
     kPm8005Enable  = 0x46,   /* bit7 = enabled */
     kPm8005Step    = 0x61,
 };
-// 524000 uV is the board minimum; the 12.5 mV grid makes 525000 (VSET 12) the first
-// settable point at or above it.
+// The board minimum is 524000 uV. On the FTS426 4 mV grid, 524000 is itself a valid
+// setpoint; on the older 12.5 mV GP_CTL grid the first point is 525000 (VSET 12).
 static constexpr uint32_t kGfxTargetUv = 525000;
 static constexpr uint32_t kGfxTargetVset = (kGfxTargetUv - 375000) / 12500;
 
@@ -629,6 +631,15 @@ static int pm8005Uv(uint32_t range, uint32_t vset) {
     if (range == 1)
         return 1550000 + (int)(vset * 25000u);
     return -1;
+}
+// PM8005 S1 on this board is not the legacy GP_CTL SMPS: the identity registers read
+// type 0x1c / subtype 0x0a, i.e. the FTS426 (FTSMPS2) block. It uses the "common2"
+// layout: 0x40/0x41 are a 16-bit little-endian voltage in mV, MODE 0x45 is a 3-bit
+// AUTO/HPM selector, and there is no 8-bit RANGE/VSET pair.
+static int pm8005Voltage(uint32_t type, uint32_t low, uint32_t high) {
+    if (type == 0x1cu)
+        return (int)((((high & 0xffu) << 8) | (low & 0xffu)) * 1000u);
+    return pm8005Uv(low, high);
 }
 static int gpuGdscOn(const char *name, uint32_t gdscr, uint32_t statusReg) {
     uint32_t before = gpuccRd(gdscr);
@@ -757,10 +768,10 @@ static int sheng_spmi_power_step(int mode) {
         return 1;
     }
     if (step == 11) {
-        gS1Uv = (gS1Ok & 0xffu) == 0xffu ? pm8005Uv(gS1[3], gS1[4]) : -1;
+        gS1Uv = (gS1Ok & 0xffu) == 0xffu ? pm8005Voltage(gS1[1], gS1[3], gS1[4]) : -1;
         sheng_spmi2_record(gS1Uv < 0 ? 0xffffffffu : (uint32_t)gS1Uv);
-        IOLog("NATIVE_GPU_PWR: c1e2 s1 range=%u vset=%u -> %d uV enable=%02x ok=%02x\n",
-              gS1[3], gS1[4], gS1Uv, gS1[6], gS1Ok);
+        IOLog("NATIVE_GPU_PWR: c1e2 s1 type=%02x a=%u b=%u -> %d uV enable=%02x ok=%02x\n",
+              gS1[1], gS1[3], gS1[4], gS1Uv, gS1[6], gS1Ok);
         if (mode == 2) {
             IOLog("NATIVE_GPU_PWR: c1e2 survey done (read-only)\n");
             step = 99;
@@ -798,47 +809,59 @@ static int sheng_spmi_power_step(int mode) {
         return 1;
     }
     if (step == 14) {
-        if (gS1[1] != 3 || (gS1[2] != 0x08 && gS1[2] != 0x09) ||
-            (gpuccRd(0x1094) & 1u) == 0) {
+        bool fts = gS1[1] == 0x1cu;
+        bool smps = fts || (gS1[1] == 0x03u && (gS1[2] == 0x08u || gS1[2] == 0x09u));
+        if (!smps || (gpuccRd(0x1094) & 1u) == 0) {
             sheng_spmi2_record(sheng_spmi_err(-6));
             IOLog("NATIVE_GPU_PWR: c1e2 voltage write skipped type=%02x subtype=%02x gx=%08x\n",
                   gS1[1], gS1[2], gpuccRd(0x1094));
             step = 99;
             return 0;
         }
-        // A rail the bootloader already left on keeps its voltage: lowering a live VDD_GFX
-        // is the one write that could destabilise the SoC before the first GDSC retry.
-        if ((gS1[6] & 0x80u) && gS1Uv >= 500000 && gS1Uv <= 1100000) {
+        // The register already holds a sane VDD_GFX setpoint (752 mV on this board) and
+        // the rail is off. Keep it: there is no reason to introduce a new voltage before
+        // the first GDSC retry. Lowering a live rail is likewise avoided.
+        if (gS1Uv >= 500000 && gS1Uv <= 1100000) {
             sheng_spmi2_record(0x600d0002u);
-            IOLog("NATIVE_GPU_PWR: c1e2 rail already on at %d uV, keep\n", gS1Uv);
+            IOLog("NATIVE_GPU_PWR: c1e2 keep %d uV (type %02x)\n", gS1Uv, gS1[1]);
             ++step;
             return 1;
         }
-        uint32_t both = (kGfxTargetVset << 8) | 0u;   /* range 0, VSET -> 525000 uV */
+        uint32_t both;
+        if (fts) {
+            uint32_t mv = 524u;                      /* 524000 uV, first FTS426 grid point >= board min */
+            both = mv & 0xffffu;                     /* 0x40 = LSB, 0x41 = MSB, mV */
+        } else {
+            both = (kGfxTargetVset << 8) | 0u;       /* range 0, VSET -> 525000 uV */
+        }
         int rc = sheng_spmi_write((uint16_t)(kPm8005S1Base + kPm8005Range), both, 2);
         sheng_spmi2_record(rc ? sheng_spmi_err(rc) : 0x600d0001u);
-        IOLog("NATIVE_GPU_PWR: c1e2 set %u uV (range 0 vset %u) rc=%d status=%08x\n",
-              kGfxTargetUv, kGfxTargetVset, rc, gSpmiLastStatus);
+        IOLog("NATIVE_GPU_PWR: c1e2 set type %02x data %04x rc=%d status=%08x\n",
+              gS1[1], both, rc, gSpmiLastStatus);
         ++step;
         return 1;
     }
     if (step == 15) {
-        uint32_t range = 0, vset = 0;
-        int r1 = sheng_spmi_read8((uint16_t)(kPm8005S1Base + kPm8005Range), &range);
-        int r2 = sheng_spmi_read8((uint16_t)(kPm8005S1Base + kPm8005Vset), &vset);
-        if (!r1) gS1[3] = range;
-        if (!r2) gS1[4] = vset;
+        uint32_t low = 0, high = 0;
+        int r1 = sheng_spmi_read8((uint16_t)(kPm8005S1Base + kPm8005Range), &low);
+        int r2 = sheng_spmi_read8((uint16_t)(kPm8005S1Base + kPm8005Vset), &high);
+        if (!r1) gS1[3] = low;
+        if (!r2) gS1[4] = high;
         if (!r1 && !r2)
-            gS1Uv = pm8005Uv(gS1[3], gS1[4]);
+            gS1Uv = pm8005Voltage(gS1[1], gS1[3], gS1[4]);
         sheng_spmi2_record((r1 || r2) ? sheng_spmi_err(r1 ? r1 : r2)
-                                      : ((range & 0xffu) | ((vset & 0xffu) << 8)));
-        IOLog("NATIVE_GPU_PWR: c1e2 voltage readback range=%u vset=%u rc=%d/%d\n",
-              range, vset, r1, r2);
+                                      : ((low & 0xffu) | ((high & 0xffu) << 8)));
+        IOLog("NATIVE_GPU_PWR: c1e2 voltage readback %02x/%02x -> %d uV rc=%d/%d\n",
+              low, high, gS1Uv, r1, r2);
         ++step;
         return 1;
     }
     if (step == 16) {
-        uint32_t next = gS1[5] | 0x80u;
+        uint32_t next;
+        if (gS1[1] == 0x1cu)
+            next = (gS1[5] & ~0x07u) | 0x07u;        /* common2: 7 = HPM */
+        else
+            next = gS1[5] | 0x80u;                   /* common: bit7 = HPM */
         int rc = sheng_spmi_write((uint16_t)(kPm8005S1Base + kPm8005Mode), next, 1);
         sheng_spmi2_record(rc ? sheng_spmi_err(rc) : next);
         IOLog("NATIVE_GPU_PWR: c1e2 mode hpm %02x->%02x rc=%d status=%08x\n",
@@ -863,8 +886,8 @@ static int sheng_spmi_power_step(int mode) {
         int r3 = sheng_spmi_read8((uint16_t)(kPm8005S1Base + kPm8005Mode), &m);
         if (!r1) gS1[6] = enable;
         if (!r2) gS1[4] = vset;
-        if (!r2)
-            gS1Uv = pm8005Uv(gS1[3], gS1[4]);
+        if (!r1 || !r2)
+            gS1Uv = pm8005Voltage(gS1[1], gS1[3], gS1[4]);
         sheng_spmi2_record(r1 ? sheng_spmi_err(r1) : enable);
         sheng_spmi2_record(r2 ? sheng_spmi_err(r2) : vset);
         sheng_spmi2_record(r3 ? sheng_spmi_err(r3) : m);
