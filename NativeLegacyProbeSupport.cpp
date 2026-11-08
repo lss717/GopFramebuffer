@@ -260,7 +260,34 @@ static void gpuDelay(unsigned rounds) {
     for (unsigned i = 0; i < rounds; ++i)
         __asm__ volatile ("yield" ::: "memory");
 }
-static int gpuWaitBit(uint32_t off, uint32_t bit, int wantSet, unsigned rounds) {
+// Mainline gdsc.c: status is PWR_ON = BIT(31) read from gds_hw_ctrl when the GDSC has one
+// (gpu_cx_gdsc: 0x1008), otherwise from the GDSCR itself (gpu_gx_gdsc: 0x1094). SW_COLLAPSE
+// is BIT(0); HW_CONTROL is BIT(1); SW_OVERRIDE is BIT(2); the wait fields are 23:20, 19:16,
+// 15:12 (2, 8, 2 at reset).
+static int gpuGdscOn(const char *name, uint32_t gdscr, uint32_t statusReg) {
+    uint32_t before = gpuccRd(gdscr);
+    uint32_t value = before;
+    value &= ~(1u << 1);                 /* HW_CONTROL off: software drives the sequencer */
+    value &= ~(1u << 2);                 /* SW_OVERRIDE off */
+    value &= ~(0xfu << 20); value |= (2u << 20);
+    value &= ~(0xfu << 16); value |= (8u << 16);
+    value &= ~(0xfu << 12); value |= (2u << 12);
+    value &= ~1u;                        /* SW_COLLAPSE = 0 -> power on */
+    gpuccWr(gdscr, value);
+    gpuDelay(64);                        /* gdsc.c waits 1 us before polling */
+    int on = 0;
+    for (unsigned i = 0; i < 200; ++i) {
+        if (gpuccRd(statusReg) & (1u << 31)) {
+            on = 1;
+            break;
+        }
+        gpuDelay(64);
+    }
+    IOLog("NATIVE_GPU_PWR: %s gdscr %08x->%08x status[%03x]=%08x on=%d\n", name, before,
+          gpuccRd(gdscr), statusReg, gpuccRd(statusReg), on);
+    return on;
+}
+static __attribute__((unused)) int gpuWaitBit(uint32_t off, uint32_t bit, int wantSet, unsigned rounds) {
     for (unsigned i = 0; i < rounds; ++i) {
         uint32_t v = gpuccRd(off);
         if (((v & bit) != 0) == (wantSet != 0))
@@ -306,9 +333,7 @@ int sheng_gpu_power_step(void) {
     }
     if (step == 2) {
         IOLog("NATIVE_GPU_PWR: step2 cx gdsc on\n");
-        gpuccWr(0x1004, gpuccRd(0x1004) & ~1u);
-        int cx = gpuWaitBit(0x1004, 1u, 0, 2000);
-        IOLog("NATIVE_GPU_PWR: cx=%08x collapsed=%d\n", gpuccRd(0x1004), cx ? 0 : 1);
+        gpuGdscOn("cx", 0x1004, 0x1008);
         ++step;
         return 1;
     }
@@ -339,9 +364,7 @@ int sheng_gpu_power_step(void) {
     }
     if (step == 5) {
         IOLog("NATIVE_GPU_PWR: step5 gx gdsc on\n");
-        gpuccWr(0x1094, gpuccRd(0x1094) & ~1u);
-        int gx = gpuWaitBit(0x1094, 1u, 0, 2000);
-        IOLog("NATIVE_GPU_PWR: gx=%08x collapsed=%d\n", gpuccRd(0x1094), gx ? 0 : 1);
+        gpuGdscOn("gx", 0x1094, 0x1094);
         ++step;
         return 1;
     }
