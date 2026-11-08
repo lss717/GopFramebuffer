@@ -31,6 +31,10 @@ extern "C" volatile int native_a540_abi_reports;
 extern "C" char native_a540_abi_report[64];
 extern "C" { volatile int native_a540_abi_calls = 0; volatile int native_a540_abi_last_method = 0;
              volatile int native_a540_abi_reports = 0; char native_a540_abi_report[64] = {}; }
+// H219: the persistent log window can hold slots from earlier boots, so the open and selector
+// counts also go to the heartbeat, which is written from this boot's state only.
+extern "C" { volatile uint32_t native_a540_open_count = 0; volatile uint32_t native_a540_open_type = 0;
+             volatile uint32_t native_a540_sel_count = 0; volatile uint32_t native_a540_sel_last = 0; }
 
 // H195: the class name is the sandbox key: the target's MACF profile admits IOServiceOpen only for
 // the user-client class AGXDeviceUserClient (the same reason NativeAdrenoPublish.cpp uses it), and
@@ -80,6 +84,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
      * implement what CoreAnimation asks for instead of guessing. The tunnel protocol below is
      * this port's own test ABI and is unaffected. */
     if (arguments) {
+        native_a540_sel_count = native_a540_sel_count + 1;
+        native_a540_sel_last = selector;
         static uint32_t seen[32];
         static unsigned seenCount;
         bool fresh = true;
@@ -235,6 +241,8 @@ IOReturn AGXAccelerator::makeClient(task_t task,void *security,UInt32 type,
                                                OSDictionary *properties,IOUserClient **client) {
     {
         OSString *grant = OSDynamicCast(OSString, getProperty("NativeSandboxGrantProcess"));
+        native_a540_open_count = native_a540_open_count + 1;
+        native_a540_open_type = type;
         IOLog("NATIVE_A540_ACCEL: open request type=%u comm=%s self=%p grant=%s\n", type,
               accelRequester(), this, grant ? grant->getCStringNoCopy() : "-");
     }
