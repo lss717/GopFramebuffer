@@ -483,7 +483,9 @@ static void sheng_spmi_survey(void) {
 //   PPID  = (sid << 8) | (addr >> 8)          e.g. sid=5, addr=0x1441 -> 0x514
 //   page  = 0x8000 * apid                     (EE 0; EE n adds 0x1000 * n)
 //   CMD   = (opcode << 27) | ((addr & 0xff) << 4) | (byte_count - 1)
-//           opcode 14 = write, 15 = read      (PMIC_ARB_OP_WRITE / _READ)
+//           opcode 15 = read (PMIC_ARB_OP_READ)
+//           opcode  0 = extended write long (PMIC_ARB_OP_EXT_WRITEL) for the
+//           QPNP 16-bit register space; 14 and 2 complete but do not update it.
 //
 // Reads go through the "obsrvr" window (CMD/STATUS/RDATA0 at 0x00/0x08/0x18), writes
 // through "chnls" (WDATA0 at 0x10 before CMD). STATUS bit 0 is DONE; bits 1..3 are
@@ -609,7 +611,12 @@ static int sheng_spmi_write(uint16_t addr, uint32_t data, unsigned len) {
         return -3;
     gSpmiChnls[4] = data;                                    /* WDATA0 */
     __asm__ volatile ("dmb oshst" ::: "memory");
-    gSpmiChnls[0] = (14u << 27) | ((uint32_t)(addr & 0xffu) << 4) |
+    // QPNP peripheral registers are addressed by the full 16-bit register number
+    // (base + offset). The vendor regmap therefore uses SPMI_CMD_EXT_WRITEL
+    // (opcode 0x30), which the arbiter maps to PMIC_ARB_OP_EXT_WRITEL (0). The
+    // 8-bit EXT_WRITE (2) and the standard write (14) both complete with STATUS
+    // DONE but do not update these registers.
+    gSpmiChnls[0] = (0u << 27) | ((uint32_t)(addr & 0xffu) << 4) |
                     (uint32_t)((len - 1) & 7u);
     __asm__ volatile ("dmb oshst" ::: "memory");
     return sheng_spmi_wait(gSpmiChnls);
