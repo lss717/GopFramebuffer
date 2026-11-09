@@ -582,16 +582,20 @@ static bool cp_init(Ctx &c) {
     cleanDcache(ring, n * 4);
     wr(CP_RB_WPTR, n);
 
-    /* H236ap: the vendor's adreno_ringbuffer_submit_spin waits 2000 ms for
-     * ME_INIT. The previous 64-yield loop expired in ~10-20 ms while the CP
-     * had already fetched all 9 dwords (rptr=9); it was still busy. Wait the
-     * same 2 s, one millisecond at a time. */
+    /* H236aq: the vendor's adreno_ringbuffer_submit_spin waits 2000 ms and
+     * only treats a GPU fault as fatal; it does not abort on the first
+     * interrupt-status read. H236ap broke after ~61 ms, before the ME had a
+     * chance to settle, so keep waiting for the full window while recording
+     * the first status that looked like an error. */
     bool idle = false;
+    uint32_t firstInts = 0, firstCpints = 0, firstStatus = 0;
+    unsigned firstMs = ~0u;
     for (unsigned ms = 0; ms < 2000; ++ms) {
         uint32_t ints = rd(RBBM_INT_STATUS), cpints = rd(CP_INT_STATUS);
         uint32_t status = rd(RBBM_STATUS_REG);
-        if ((ints & 0x7e) || (cpints & 0x3f))
-            break;
+        if (((ints & 0x7e) || (cpints & 0x3f)) && firstMs == ~0u) {
+            firstInts = ints; firstCpints = cpints; firstStatus = status; firstMs = ms;
+        }
         if (rd(CP_RB_READ) == n && !(status & ~1u) && !(rd(RBBM_STATUS3_REG) & (1u << 24))) {
             idle = true;
             break;
@@ -602,16 +606,23 @@ static bool cp_init(Ctx &c) {
     c.io.read32(c.io.cookie, 0x48, &gfsr);
     c.io.read32(c.io.cookie, 0x8058, &fsr);
     c.io.read32(c.io.cookie, 0x8060, &far);
+    const uint32_t hwFault = rd(0x0b1a * R), protect = rd(0x0b1c * R);
+    const uint32_t meStat = rd(0x0b14 * R), cpInt = rd(0x0b18 * R);
     c.put(rd(CP_RB_READ));
     c.put(rd(RBBM_STATUS_REG));
     c.put(rd(CP_ME_CNTL_REG));
     c.put(rd(RBBM_INT_STATUS));
     c.put(rd(CP_INT_STATUS));
     c.put(gfsr); c.put(fsr); c.put(far);
+    c.put(hwFault); c.put(protect); c.put(meStat); c.put(cpInt);
     IOLog("NATIVE_GPU_C3: cp rptr=%08x rbbm=%08x me=%08x wptr=%08x ints=%08x cpints=%08x "
           "gfsr=%08x fsr=%08x far=%08x idle=%u\n",
           rd(CP_RB_READ), rd(RBBM_STATUS_REG), rd(CP_ME_CNTL_REG), rd(CP_RB_WRITE),
           rd(RBBM_INT_STATUS), rd(CP_INT_STATUS), gfsr, fsr, far, idle ? 1u : 0u);
+    IOLog("NATIVE_GPU_C3: cp diag first_ms=%u first_ints=%08x first_cpints=%08x "
+          "first_rbbm=%08x hwfault=%08x protect=%08x mestat=%08x cpint=%08x status3=%08x\n",
+          firstMs, firstInts, firstCpints, firstStatus, hwFault, protect, meStat, cpInt,
+          rd(RBBM_STATUS3_REG));
     if (!idle || rd(CP_RB_READ) != n)
         return c.fail(11, "cp me init");
     return true;
