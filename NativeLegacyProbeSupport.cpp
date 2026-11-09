@@ -65,6 +65,24 @@ static volatile int gSpmiDone;
 // survey means a failed write at boot still reaches the pulled log in this boot.
 static volatile uint32_t gSpmi2Words[96];
 static volatile int gSpmi2Count;
+static IOMemoryMap *gSmmuSurveyMap;
+static volatile uint32_t *gSmmuSurveyBase;
+static uint32_t gSmmuId0, gSmmuId1, gSmmuId2, gSmmuCb0, gSmmuSmr0, gSmmuS2cr0, gSmmuMicro;
+// H236w: the C2 steps already own 36 gc= slots, so the old survey appended
+// behind them and needed ~70 beats before gc=107 appeared. The boot may not
+// live that long (the H236t root-auth panic fires at ~371 s). Print the survey
+// through its own queue, ahead of the C2 backlog, so each value reaches the
+// next heartbeat as soon as it is read.
+static volatile uint32_t gSmmuSurveyWords[64];
+static volatile int gSmmuSurveyCount;
+static unsigned gSmmuSurveyMoved;
+static void smmu_survey_record(uint32_t value) {
+    int count = gSmmuSurveyCount;
+    if (count < (int)(sizeof(gSmmuSurveyWords) / sizeof(gSmmuSurveyWords[0]))) {
+        gSmmuSurveyWords[count] = value;
+        gSmmuSurveyCount = count + 1;
+    }
+}
 // C1e-2: SPMI PMIC-arbiter transport state (see the C1e-2 block below).
 static IOMemoryMap *gSpmiCoreMap, *gSpmiCnfgMap, *gSpmiChnlsMap, *gSpmiObsrvrMap;
 static volatile uint32_t *gSpmiCore, *gSpmiCnfg, *gSpmiChnls, *gSpmiObsrvr;
@@ -258,6 +276,14 @@ int sheng_gpucc_next(unsigned *index, uint32_t *value) {
     unsigned at = 0;
     uint32_t v = 0;
     unsigned total = sizeof(kGpuccRegs) / sizeof(kGpuccRegs[0]);
+    // H236w: the mode-8 SMMU survey goes first; it is the value the boot is
+    // looking for and the C2 backlog must not delay it.
+    if (gSmmuSurveyMoved < (unsigned)gSmmuSurveyCount) {
+        unsigned k = gSmmuSurveyMoved++;
+        if (index) *index = 200 + k;
+        if (value) *value = gSmmuSurveyWords[k];
+        return 1;
+    }
     // C1e-2: emit each PM8005 result on the very next beat, before the slower GPUCC survey.
     if (sheng_spmi2_moved < (unsigned)gSpmi2Count) {
         unsigned k = sheng_spmi2_moved++;
@@ -769,18 +795,18 @@ static int gS1Uv = -1;
 //   plus CB1 and the secure CB2 SCTLR.
 // Values go through the gc= heartbeat channel (one per beat), so every reading
 // before a blocking register survives the log window.
-static IOMemoryMap *gSmmuSurveyMap;
-static volatile uint32_t *gSmmuSurveyBase;
-static uint32_t gSmmuId0, gSmmuId1, gSmmuId2, gSmmuCb0, gSmmuSmr0, gSmmuS2cr0, gSmmuMicro;
 static const struct { uint32_t off; const char *name; } kSmmuSurvey[] = {
+    // H236x: only registers inside implemented pages. H236w hung right after
+    // ID2 because the next read (0x02c, ID3) is not implemented on this
+    // 3-context-bank, 8-page qcom,smmu-v2; the +0x400 alias and the
+    // implementation pages are likewise unverified and are not read here.
     { 0x0000, "scr0" },
-    { 0x0020, "id0" }, { 0x0024, "id1" }, { 0x0028, "id2" }, { 0x002c, "id3" },
+    { 0x0020, "id0" }, { 0x0024, "id1" }, { 0x0028, "id2" },
     { 0x0048, "sgfsr" },
-    { 0x0400, "ns_scr0" }, { 0x0420, "ns_id0" }, { 0x0424, "ns_id1" }, { 0x0428, "ns_id2" },
     { 0x0800, "smr0" }, { 0x0804, "smr1" }, { 0x0808, "smr2" },
     { 0x0c00, "s2cr0" }, { 0x0c04, "s2cr1" }, { 0x0c08, "s2cr2" },
-    { 0x1000, "cbar0" }, { 0x1800, "cba2r0" },
-    { 0x2000, "impl_def0" }, { 0x6000, "micro_mmu_ctrl" },
+    { 0x1000, "cbar0" }, { 0x1004, "cbar1" }, { 0x1008, "cbar2" },
+    { 0x1800, "cba2r0" }, { 0x1804, "cba2r1" }, { 0x1808, "cba2r2" },
     { 0x8000, "cb0_sctlr" }, { 0x8004, "cb0_actlr" }, { 0x8010, "cb0_ttbcr2" },
     { 0x8020, "cb0_ttbr0_lo" }, { 0x8024, "cb0_ttbr0_hi" }, { 0x8030, "cb0_ttbcr" },
     { 0x8034, "cb0_contextidr" }, { 0x8058, "cb0_fsr" },
@@ -1195,13 +1221,13 @@ static int sheng_spmi_power_step(int mode) {
             gSmmuSurveyBase = map ?
                 reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()) : nullptr;
             if (!gSmmuSurveyBase) {
-                sheng_spmi2_record(0xdea00041u);
+                smmu_survey_record(0xdea00041u);
                 IOLog("NATIVE_GPU_PWR: c1e2 smmu survey map failed\n");
                 step = 99;
                 return 0;
             }
             gSmmuSurveyMap = map;
-            sheng_spmi2_record(0x600d0058u);
+            smmu_survey_record(0x600d0058u);
             IOLog("NATIVE_GPU_PWR: c1e2 smmu survey start\n");
             ++step;
             return 1;
@@ -1209,7 +1235,7 @@ static int sheng_spmi_power_step(int mode) {
         if (k <= kSmmuSurveyCount) {
             unsigned at = k - 1;
             uint32_t value = osmRead(gSmmuSurveyBase, kSmmuSurvey[at].off);
-            sheng_spmi2_record(value);
+            smmu_survey_record(value);
             if (!__builtin_strcmp(kSmmuSurvey[at].name, "id0")) gSmmuId0 = value;
             else if (!__builtin_strcmp(kSmmuSurvey[at].name, "id1")) gSmmuId1 = value;
             else if (!__builtin_strcmp(kSmmuSurvey[at].name, "id2")) gSmmuId2 = value;
@@ -1220,7 +1246,7 @@ static int sheng_spmi_power_step(int mode) {
             IOLog("NATIVE_GPU_PWR: c1e2 smmu %-15s @%05x = %08x\n",
                   kSmmuSurvey[at].name, kSmmuSurvey[at].off, value);
             if (k == kSmmuSurveyCount) {
-                sheng_spmi2_record(0x600d0059u);
+                smmu_survey_record(0x600d0059u);
                 IOLog("NATIVE_GPU_PWR: c1e2 smmu id0=%08x id1=%08x id2=%08x cb0=%08x "
                       "smr0=%08x s2cr0=%08x micro=%08x\n",
                       gSmmuId0, gSmmuId1, gSmmuId2, gSmmuCb0,

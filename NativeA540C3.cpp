@@ -253,7 +253,9 @@ static bool smmu_setup(Ctx &c) {
     c.put(id0); c.put(id1); c.put(id2);
 
     c.cfg.input_bits = 32;
-    c.cfg.output_bits = 40;
+    // H236x survey: ID2=0x00007511 gives IAS=36, OAS=36. The kit refuses an
+    // output_bits above the hardware OAS, and the tables are 4K.
+    c.cfg.output_bits = 36;
     c.cfg.table_physical = c.tables.phys;
     c.cfg.leaf_budget = 0x80000000ULL / 4096;
 
@@ -295,6 +297,17 @@ static bool smmu_setup(Ctx &c) {
     c.put(c.prog.readback.sctlr);
     c.put(c.prog.readback.ttbr0 >> 32);
 
+    // H236y: the firmware leaves every S2CR at 0x000200ff (FAULT with cbndx
+    // 0xff). The kit requires the target slot to be exactly FAULT before it
+    // publishes SMR, so clean the owned slot first.
+    if (c.io.write32(c.io.cookie, 0xc00, 0x00020000u) || c.io.barrier(c.io.cookie))
+        return c.fail(6, "smmu s2cr preclean");
+    // arm-smmu.c writes ACTLR=0x70000000 for SMMU_MODEL_QCOM_V2 (OSH/ISH/NSH);
+    // the kit's image does not include ACTLR.
+    if (c.io.write32(c.io.cookie, 0x8004, 0x70000000u) || c.io.barrier(c.io.cookie))
+        return c.fail(6, "smmu actlr");
+
+    /* GPU SID 0 -> CB0 (DT: iommus = <&kgsl_smmu 0>). */
     ArmSmmu4KStream route = { 0, 0 };
     if (ArmSmmu4KAttachStreams(&c.io, &c.stream_state, &route, 1, 0, &c.ccfg,
                                &c.stream_result) != ArmSmmu4KSuccess)
