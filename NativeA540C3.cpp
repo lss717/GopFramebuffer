@@ -14,6 +14,7 @@
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
+#include <pexpert/pexpert.h>
 
 extern "C" void native_log_flush_hook(void);
 
@@ -221,6 +222,7 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
 struct Ctx {
     void (*record)(uint32_t);
     Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage;
+    GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
     ArmSmmu4KConfig cfg;
@@ -989,21 +991,32 @@ static void c3_thread(void *, wait_result_t) {
     if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); gC3Done = 1; return; }
     if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
     if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
-    /* H236bg: a hard low-4G allocation may block or fail on this kernel.
-     * Try it, log the result, and fall back to the normal mask so the C3
-     * still reaches the PAS calls and reports the real addresses. */
-    IOLog("NATIVE_GPU_C3: alloc zap low4g aligned\n");
-    native_log_flush_hook();
-    bool zapHeaderLow = c->zapHeader.init(0x2000, 0xffffffffULL, 0x1000);
-    bool zapImageLow = c->zapImage.init(0x2000, 0xffffffffULL, 0x100000);
-    if (!zapHeaderLow || !zapImageLow) {
-        IOLog("NATIVE_GPU_C3: zap low4g aligned failed h=%u i=%u\n",
-              zapHeaderLow ? 1u : 0u, zapImageLow ? 1u : 0u);
+    /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
+     * window inside the kernel window and appends zap-base=<phys>. Map the
+     * metadata at +0 and the .b02 image at +1 MiB. */
+    uint64_t zapBase = 0;
+    if (!PE_parse_boot_argn("zap-base", &zapBase, sizeof(zapBase)) ||
+        !zapBase || (zapBase & 0xfffff) || zapBase + 0x200000 > 0x100000000ULL) {
+        IOLog("NATIVE_GPU_C3: zap-base missing or invalid: %llx\n", zapBase);
         native_log_flush_hook();
         c->put(0xdea00037u);
         gC3Done = 1;
         return;
     }
+    if (!mapWindow(zapBase, 0x2000, &c->zapHeaderWindow) ||
+        !mapWindow(zapBase + 0x100000, 0x2000, &c->zapImageWindow)) {
+        IOLog("NATIVE_GPU_C3: zap boot window map failed\n");
+        native_log_flush_hook();
+        c->put(0xdea00038u);
+        gC3Done = 1;
+        return;
+    }
+    c->zapHeader.phys = zapBase;
+    c->zapHeader.cpu = const_cast<uint32_t *>(c->zapHeaderWindow.base);
+    c->zapHeader.bytes = 0x2000;
+    c->zapImage.phys = zapBase + 0x100000;
+    c->zapImage.cpu = const_cast<uint32_t *>(c->zapImageWindow.base);
+    c->zapImage.bytes = 0x2000;
     IOLog("NATIVE_GPU_C3: zap alloc mdt=%llx image=%llx\n",
           c->zapHeader.phys, c->zapImage.phys);
     native_log_flush_hook();
