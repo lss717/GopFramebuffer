@@ -832,7 +832,7 @@ static bool zap_load(Ctx &c) {
      * (.b00/.b01/.b02); the complete concatenation is a540_zap.elf (17204
      * bytes). H236bb only copied .b02 at offset 0, so the ZAP code/data image
      * was incomplete even though TrustZone accepted the signature. */
-    constexpr size_t kZapImageBytes = 0x5000;
+    const size_t kZapImageBytes = a540_fw_zap_elf_size;
     memset(c.zapImage.cpu, 0, c.zapImage.bytes);
     memcpy(c.zapImage.cpu, a540_fw_zap_elf, a540_fw_zap_elf_size);
     cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
