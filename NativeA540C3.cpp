@@ -801,12 +801,15 @@ static bool gpmu_load(Ctx &c) {
  * PAS_AUTH_AND_RESET hands both to TrustZone. */
 static bool zap_load(Ctx &c) {
     if (a540_fw_zap_mdt_size > c.zapHeader.bytes ||
-        a540_fw_zap_b02_size > c.zapImage.bytes)
+        a540_fw_zap_elf_size > c.zapImage.bytes)
         return c.fail(40, "zap size");
     uint64_t answer = ~0ull;
+    IOLog("NATIVE_GPU_C3: zap shutdown call\n");
+    native_log_flush_hook();
     int32_t status = smcCall(kScm64 | kScmSip | kScmPasShutdown, kScmOneValue,
                              kPasGpu, 0, 0, &answer);
     IOLog("NATIVE_GPU_C3: zap shutdown rc=%d answer=%llx\n", status, answer);
+    native_log_flush_hook();
     if (status != 0 || answer != 0) {
         IOLog("NATIVE_GPU_C3: zap shutdown refused (continuing, may retain old ZAP)\n");
     }
@@ -814,27 +817,43 @@ static bool zap_load(Ctx &c) {
     memset(c.zapHeader.cpu, 0, c.zapHeader.bytes);
     memcpy(c.zapHeader.cpu, a540_fw_zap_mdt, a540_fw_zap_mdt_size);
     cleanDcache(c.zapHeader.cpu, c.zapHeader.bytes);
+    IOLog("NATIVE_GPU_C3: zap init call mdt=%llx/%u\n",
+          c.zapHeader.phys, a540_fw_zap_mdt_size);
+    native_log_flush_hook();
     status = smcCall(kScm64 | kScmSip | kScmPasInitImage, kScmValueAndBuffer,
                      kPasGpu, c.zapHeader.phys, 0, &answer);
     IOLog("NATIVE_GPU_C3: zap init rc=%d answer=%llx mdt=%llx/%u\n",
           status, answer, c.zapHeader.phys, a540_fw_zap_mdt_size);
+    native_log_flush_hook();
     if (status != 0 || answer != 0)
         return c.fail(41, "zap init image");
 
+    /* H236bc: the a540 ZAP is three segments at image offsets 0/0x1000/0x3000
+     * (.b00/.b01/.b02); the complete concatenation is a540_zap.elf (17204
+     * bytes). H236bb only copied .b02 at offset 0, so the ZAP code/data image
+     * was incomplete even though TrustZone accepted the signature. */
+    constexpr size_t kZapImageBytes = 0x5000;
+    memset(c.zapImage.cpu, 0, c.zapImage.bytes);
+    memcpy(c.zapImage.cpu, a540_fw_zap_elf, a540_fw_zap_elf_size);
+    cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
+    IOLog("NATIVE_GPU_C3: zap mem setup call image=%llx/%u\n",
+          c.zapImage.phys, unsigned(kZapImageBytes));
+    native_log_flush_hook();
     status = smcCall(kScm64 | kScmSip | kScmPasMemSetup, kScmThreeValues,
-                     kPasGpu, c.zapImage.phys, c.zapImage.bytes, &answer);
+                     kPasGpu, c.zapImage.phys, kZapImageBytes, &answer);
     IOLog("NATIVE_GPU_C3: zap mem setup rc=%d answer=%llx image=%llx/%u\n",
-          status, answer, c.zapImage.phys, unsigned(c.zapImage.bytes));
+          status, answer, c.zapImage.phys, unsigned(kZapImageBytes));
+    native_log_flush_hook();
     if (status != 0 || answer != 0)
         return c.fail(42, "zap mem setup");
 
-    memset(c.zapImage.cpu, 0, c.zapImage.bytes);
-    memcpy(c.zapImage.cpu, a540_fw_zap_b02, a540_fw_zap_b02_size);
-    cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
+    IOLog("NATIVE_GPU_C3: zap auth call elf=%u\n", a540_fw_zap_elf_size);
+    native_log_flush_hook();
     status = smcCall(kScm64 | kScmSip | kScmPasAuthAndReset, kScmOneValue,
                      kPasGpu, 0, 0, &answer);
-    IOLog("NATIVE_GPU_C3: zap auth rc=%d answer=%llx b02=%u\n",
-          status, answer, a540_fw_zap_b02_size);
+    IOLog("NATIVE_GPU_C3: zap auth rc=%d answer=%llx elf=%u\n",
+          status, answer, a540_fw_zap_elf_size);
+    native_log_flush_hook();
     if (status != 0 || answer != 0)
         return c.fail(43, "zap auth and reset");
     return true;
@@ -958,7 +977,7 @@ static void c3_thread(void *, wait_result_t) {
     if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
     if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
     if (!c->zapHeader.init(0x2000)) { c->put(0xdea00037u); gC3Done = 1; return; }
-    if (!c->zapImage.init(0x2000)) { c->put(0xdea00038u); gC3Done = 1; return; }
+    if (!c->zapImage.init(0x8000)) { c->put(0xdea00038u); gC3Done = 1; return; }
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
