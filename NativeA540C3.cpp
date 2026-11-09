@@ -12,6 +12,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
+#include <kern/thread.h>
 
 extern "C" {
 #include "ArmSmmu4K.h"
@@ -321,32 +322,50 @@ static bool gpmu_load(Ctx &c) {
 
 } // namespace
 
-extern "C" int sheng_a540_c3_run(void (*record)(uint32_t)) {
-    static Ctx *c;
-    if (c)
-        return -1;
-    c = new Ctx();
-    if (!c)
-        return -2;
-    c->record = record;
+static Ctx *gC3;
+static volatile int gC3Started, gC3Done;
 
-    if (!c->tables.init(0x40000)) { c->put(0xdea00031u); return -3; }
-    if (!c->ring.init(kRingBytes)) { c->put(0xdea00032u); return -3; }
-    if (!c->pm4.init((a540_fw_pm4_size + 0xfff) & ~0xfffu)) { c->put(0xdea00033u); return -3; }
-    if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); return -3; }
-    if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); return -3; }
-    if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); return -3; }
+static void c3_thread(void *, wait_result_t) {
+    Ctx *c = gC3;
+    IOLog("NATIVE_GPU_C3: thread start\n");
+    if (!c) {
+        gC3Done = 1;
+        return;
+    }
+    IOLog("NATIVE_GPU_C3: alloc tables\n");
+    if (!c->tables.init(0x40000)) { c->put(0xdea00031u); gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: alloc ring\n");
+    if (!c->ring.init(kRingBytes)) { c->put(0xdea00032u); gC3Done = 1; return; }
+    if (!c->pm4.init((a540_fw_pm4_size + 0xfff) & ~0xfffu)) { c->put(0xdea00033u); gC3Done = 1; return; }
+    if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); gC3Done = 1; return; }
+    if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
+    if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
-    if (!smmu_setup(*c))
-        return -4;
-    if (!cp_init(*c))
-        return -5;
-    if (!gpmu_load(*c))
-        return -6;
+    IOLog("NATIVE_GPU_C3: smmu setup\n");
+    if (!smmu_setup(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: cp init\n");
+    if (!cp_init(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: gpmu load\n");
+    if (!gpmu_load(*c)) { gC3Done = 1; return; }
 
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
     c->put(0x600d00c3u);
+    gC3Done = 1;
+}
+
+extern "C" int sheng_a540_c3_run(void (*record)(uint32_t)) {
+    if (gC3Started)
+        return -1;
+    gC3 = new Ctx();
+    if (!gC3)
+        return -2;
+    gC3->record = record;
+    gC3Started = 1;
+    thread_t thread = nullptr;
+    if (kernel_thread_start(c3_thread, nullptr, &thread) != KERN_SUCCESS)
+        return -4;
+    thread_deallocate(thread);
     return 0;
 }
