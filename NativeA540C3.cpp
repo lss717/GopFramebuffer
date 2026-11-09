@@ -35,11 +35,8 @@ constexpr uint64_t kSmmuBytes = 0x10000ULL;
 constexpr uint32_t CP_RB_BASE        = 0x800 * 4;
 constexpr uint32_t CP_RB_BASE_HI     = 0x801 * 4;
 constexpr uint32_t CP_RB_CNTL        = 0x802 * 4;
-constexpr uint32_t CP_RB_RPTR_ADDR_LO= 0x804 * 4;
-constexpr uint32_t CP_RB_RPTR_ADDR_HI= 0x805 * 4;
 constexpr uint32_t CP_RB_RPTR        = 0x806 * 4;
 constexpr uint32_t CP_RB_WPTR        = 0x807 * 4;
-constexpr uint32_t CP_ME_CNTL        = 0x832 * 4;
 constexpr uint32_t CP_PFP_INSTR_LO   = 0x835 * 4;
 constexpr uint32_t CP_PFP_INSTR_HI   = 0x836 * 4;
 constexpr uint32_t CP_PM4_INSTR_LO   = 0x838 * 4;
@@ -125,14 +122,6 @@ static void cleanDcache(void *p, size_t bytes) {
     uintptr_t e = (reinterpret_cast<uintptr_t>(p) + bytes + 63) & ~UINT64_C(63);
     for (; a < e; a += 64)
         __asm__ volatile("dc cvac, %0" : : "r"(a) : "memory");
-    __asm__ volatile("dsb sy" ::: "memory");
-}
-
-static void invalidateDcache(void *p, size_t bytes) {
-    uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~UINT64_C(63);
-    uintptr_t e = (reinterpret_cast<uintptr_t>(p) + bytes + 63) & ~UINT64_C(63);
-    for (; a < e; a += 64)
-        __asm__ volatile("dc ivac, %0" : : "r"(a) : "memory");
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
@@ -326,8 +315,91 @@ static bool smmu_setup(Ctx &c) {
     return true;
 }
 
+// H236ah: register facts taken from the sagit A540 register list / vendor
+// adreno_a5xx sequence. DWORD indices scaled to bytes.
+namespace {
+constexpr uint32_t R             = 4;
+constexpr uint32_t RBBM_SW_RESET_CMD_   = 0x0043 * R;
+constexpr uint32_t RBBM_INT_MASK        = 0x0038 * R;
+constexpr uint32_t RBBM_INT_CLEAR       = 0x0037 * R;
+constexpr uint32_t RBBM_INT_STATUS      = 0x04e1 * R;
+constexpr uint32_t RBBM_STATUS_REG      = 0x04f5 * R;
+constexpr uint32_t RBBM_STATUS3_REG     = 0x0530 * R;
+constexpr uint32_t CP_ME_CNTL_REG       = 0x0832 * R;
+constexpr uint32_t CP_RB_READ           = 0x0806 * R;
+constexpr uint32_t CP_RB_WRITE          = 0x0807 * R;
+constexpr uint32_t CP_CONTEXT_SWITCH    = 0x083b * R;
+constexpr uint32_t CP_INT_STATUS        = 0x0b18 * R;
+constexpr uint32_t CP_ADDR_MODE_CNTL    = 0x0860 * R;
+constexpr uint32_t CP_PROTECT_REG       = 0x0880 * R;
+constexpr uint32_t CP_PROTECT_CNTL_REG  = 0x08a0 * R;
+constexpr uint32_t VBIF_HALT            = 0x3080 * R;
+constexpr uint32_t VBIF_HALTED          = 0x3081 * R;
+constexpr uint32_t GPMU_GENERAL0        = 0xa8e0 * R;
+constexpr uint32_t GPMU_GENERAL1        = 0xa8e1 * R;
+constexpr uint32_t kCpHalt              = 0x303u;
+// 32 KiB ring, 32-byte block, RPTR shadow disabled (vendor RingControl).
+constexpr uint32_t kRingControl         = 12u | (2u << 8) | (1u << 27);
+constexpr uint32_t kOwnedIRQs           = (1u << 20) | 0x7eu | (1u << 9) |
+                                          (1u << 23) | (1u << 24) | (1u << 25) | (1u << 28);
+
+bool waitReg(uint32_t off, uint32_t mask, uint32_t want, unsigned rounds) {
+    for (unsigned i = 0; i < rounds; ++i) {
+        if ((rd(off) & mask) == want)
+            return true;
+        for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
+    }
+    return false;
+}
+}  // namespace
+
+// Real GPU reset with the CP/VBIF already in the stopped state. Must run
+// before the SMMU context (the reset clears the GPU-side CP/TSB state).
+static bool gpu_reset(Ctx &c) {
+    if (!gGpu.base && !mapWindow(kGpuBase, kGpuBytes, &gGpu))
+        return c.fail(12, "gpu map reset");
+    c.put(rd(RBBM_STATUS_REG));
+    wr(RBBM_INT_MASK, 0);
+    wr(CP_ME_CNTL_REG, kCpHalt);
+    wr(VBIF_HALT, 0xf);
+    if (!waitReg(CP_ME_CNTL_REG, kCpHalt, kCpHalt, 20000) ||
+        !waitReg(VBIF_HALTED, 0xf, 0xf, 20000)) {
+        c.put(rd(CP_ME_CNTL_REG));
+        c.put(rd(VBIF_HALTED));
+        IOLog("NATIVE_GPU_C3: reset halt me=%08x vbif=%08x\n",
+              rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
+        return c.fail(12, "gpu halt");
+    }
+    wr(RBBM_SW_RESET_CMD_, 1);
+    (void)rd(RBBM_SW_RESET_CMD_);
+    wr(RBBM_SW_RESET_CMD_, 0);
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    wr(RBBM_INT_MASK, 0);
+    wr(CP_ME_CNTL_REG, kCpHalt);
+    wr(VBIF_HALT, 0xf);
+    if (!waitReg(CP_ME_CNTL_REG, kCpHalt, kCpHalt, 20000) ||
+        !waitReg(VBIF_HALTED, 0xf, 0xf, 20000)) {
+        c.put(rd(CP_ME_CNTL_REG));
+        c.put(rd(VBIF_HALTED));
+        return c.fail(12, "gpu stop");
+    }
+    uint32_t rst = rd(RBBM_SW_RESET_CMD_), rptr = rd(CP_RB_READ), wptr = rd(CP_RB_WRITE),
+             cs = rd(CP_CONTEXT_SWITCH), trust = rd(0x3d000);
+    c.put(rst); c.put(rptr); c.put(wptr); c.put(cs); c.put(trust);
+    if (rst || rptr || wptr || cs || trust > 1)
+        return c.fail(12, "gpu reset readback");
+    // No retained BABEFACE may count as a new GPMU response.
+    wr(GPMU_CM3_SYSRESET, 1);
+    wr(GPMU_GENERAL0, 0);
+    wr(GPMU_GENERAL1, 0);
+    if (rd(GPMU_CM3_SYSRESET) != 1 || rd(GPMU_GENERAL0) || rd(GPMU_GENERAL1))
+        return c.fail(12, "gpmu reset");
+    IOLog("NATIVE_GPU_C3: gpu reset ok\n");
+    return true;
+}
+
 static bool cp_init(Ctx &c) {
-    if (!mapWindow(kGpuBase, kGpuBytes, &gGpu))
+    if (!gGpu.base && !mapWindow(kGpuBase, kGpuBytes, &gGpu))
         return c.fail(10, "gpu map");
 
     memcpy(c.pm4.cpu, a540_fw_pm4 + 4, a540_fw_pm4_size - 4);
@@ -335,83 +407,142 @@ static bool cp_init(Ctx &c) {
     cleanDcache(c.pm4.cpu, c.pm4.bytes);
     cleanDcache(c.pfp.cpu, c.pfp.bytes);
 
-    c.put(rd(0x13d4));            /* RBBM_STATUS before the CP writes */
+    // configure(): only the blocks needed by the CP path plus the A540 values.
+    static const struct { uint32_t off, val; } cfg[] = {
+        { 0xc124, 0x00000003u },  // VBIF_ROUND_ROBIN_QOS_ARB
+        { 0xc0a8, 0x00000009u },  // VBIF_GATE_OFF_WRREQ_EN
+        { 0x11bc, 0xffffffffu },  // RBBM_PERFCTR_GPU_BUSY_MASKED
+        { 0x024c, 0x00000001u },  // RBBM_AHB_CNTL0
+        { 0x00bc, 0x4000ffffu },  // RBBM_INTERFACE_HANG_INT_CNTL
+        { 0x1190, 0x00000001u },  // RBBM_PERFCTR_CNTL
+        { 0x2ec0, 0x00000000u },  // CP_PERFCTR_CP_SEL_0
+        { 0x11ac, 0x00000006u },  // RBBM_PERFCTR_RBBM_SEL_0
+        { 0x3a58, 0x00000002u },  // UCHE_CACHE_WAYS
+        { 0x3a24, 0xffff0000u },  // UCHE_TRAP_BASE_LO
+        { 0x3a28, 0x0001ffffu },  // UCHE_TRAP_BASE_HI
+        { 0x3a1c, 0xffff0000u },  // UCHE_WRITE_THRU_BASE_LO
+        { 0x3a20, 0x0001ffffu },  // UCHE_WRITE_THRU_BASE_HI
+        { 0x3a2c, 0x00100000u },  // UCHE_GMEM_RANGE_MIN_LO (1 MiB GMEM)
+        { 0x3a30, 0x00000000u },
+        { 0x3a34, 0x001fffffu },
+        { 0x3a38, 0x00000000u },
+        { 0x2094, 0x00000040u },  // CP_MEQ_THRESHOLDS
+        { 0x2098, 0x00000400u },  // CP_MERCIU_SIZE
+        { 0x2080, 0x80000060u },  // CP_ROQ_THRESHOLDS_2
+        { 0x207c, 0x40201b16u },  // CP_ROQ_THRESHOLDS_1
+        { 0x3400, (0x400u << 11) | (0x300u << 22) },  // PC_DBG_ECO_CNTL
+        { 0x3a04, 1u << 29 },     // UCHE_MODE_CNTL
+        { 0x20cc, 0x02000000u },  // CP_CHICKEN_DBG
+        { 0x0250, 0xa6ffffffu },  // RBBM_AHB_CNTL1
+        { 0x0254, 0x0000003fu },  // RBBM_AHB_CNTL2
+        { 0x3c08, 2u << 7 },      // TPL1_MODE_CNTL
+        { 0x3318, 2u << 1 },      // RB_MODE_CNTL
+        { 0x3a3c, 0x00000002u },  // UCHE_DBG_ECO_CNTL_2
+        { 0x2280, 0x00000007u },  // CP_PROTECT_CNTL
+        { 0x3e00c, 0x00000000u }, // RBBM_SECVID_TSB_CNTL
+        { 0x3e000, 0x00000000u }, // RBBM_SECVID_TSB_TRUSTED_BASE_LO
+        { 0x3e004, 0x00000000u }, // ..._HI
+        { 0x3e008, 0x00000000u }, // ..._SIZE
+    };
+    for (const auto &e : cfg)
+        wr(e.off, e.val);
+    wr(0x3980, rd(0x3980) | (1u << 10) | (1u << 23));  // VPC_DBG_ECO_CNTL
+    wr(0x3810, rd(0x3810) & ~(1u << 18));              // HLSQ_DBG_ECO_CNTL
 
-    /* H236ag: the bootloader leaves the CP in an unknown (possibly halted)
-     * state, so writing INSTR_BASE + ME_CNTL=0 may never reload the
-     * microcode. Pulse the GPU block reset (RBBM excluded, same value the
-     * vendor uses when RBBM itself cannot be reset) and re-init afterwards.
-     * The SMMU lives outside these blocks and keeps its context. */
-    wr(0x45 * 4, 0xffdffc0u);
-    wr(0x46 * 4, 0x1fffffffu);
-    __asm__ volatile("dsb sy" ::: "memory");
-    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
-    wr(0x45 * 4, 0);
-    wr(0x46 * 4, 0);
-    __asm__ volatile("dsb sy" ::: "memory");
-    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
-    c.put(rd(0x13d4));
+    // CP protect ranges: 0x60000000 | log2(length) << 24 | base << 2.
+    static const struct { uint32_t base; unsigned l2; } prot[] = {
+        { 0x4, 2 }, { 0x8, 3 }, { 0x10, 4 }, { 0x20, 5 }, { 0x40, 6 }, { 0x80, 6 },
+        { 0xf800, 4 }, { 0xf400, 1 }, { 0x800, 6 }, { 0x840, 3 }, { 0x880, 5 },
+        { 0xaa0, 0 }, { 0xcc0, 0 }, { 0xcf0, 1 }, { 0xe68, 3 }, { 0xe70, 4 },
+        { 0xe80, 4 }, { 0x10000, 15 },
+    };
+    for (unsigned i = 0; i < sizeof(prot) / sizeof(prot[0]); ++i)
+        wr(CP_PROTECT_REG + 4 * i, 0x60000000u | (prot[i].l2 << 24) | (prot[i].base << 2));
 
-    /* H236af: a5xx_start() starts VBIF before the CP. Without it the CP's
-     * memory fetch can hang and RBBM stays busy. a540_vbif = two writes. */
-    wr(0xc124, 0x00000003u);     /* A5XX_VBIF_ROUND_ROBIN_QOS_ARB */
-    wr(0xc0a8, 0x00000009u);     /* A5XX_VBIF_GATE_OFF_WRREQ_EN */
+    // 64-bit address mode for every block that has a mode register.
+    static const uint32_t addrMode[] = {
+        0x2180,  // CP
+        0x2f04,  // VSC
+        0x3204,  // GRAS
+        0x3314,  // RB
+        0x3404,  // PC
+        0x3814,  // HLSQ
+        0x3904,  // VFD
+        0x3984,  // VPC
+        0x3a00,  // UCHE
+        0x3b04,  // SP
+        0x3c04,  // TPL1
+        0x3e040, // RBBM_SECVID_TSB
+    };
+    for (uint32_t off : addrMode)
+        wr(off, 1);
 
-    /* H236ad: a5xx_start() programs the CP queue thresholds before the ring;
-     * zero-sized ME queues keep the ME from consuming ME_INIT. */
-    wr(0x2094, 0x40);            /* CP_MEQ_THRESHOLDS (A540) */
-    wr(0x2098, 0x400);           /* CP_MERCIU_SIZE */
-    wr(0x2080, 0x80000060u);     /* CP_ROQ_THRESHOLDS_2 */
-    wr(0x207c, 0x40201b16u);     /* CP_ROQ_THRESHOLDS_1 */
-
-    wr(CP_RB_RPTR_ADDR_LO, (uint32_t)kRptrIova);
-    wr(CP_RB_RPTR_ADDR_HI, (uint32_t)(kRptrIova >> 32));
-    wr(CP_RB_CNTL, (2u << 8) | 12u);            /* 32 KiB ring, 4-byte? */
-    wr(CP_RB_BASE, (uint32_t)kRingIova);
-    wr(CP_RB_BASE_HI, (uint32_t)(kRingIova >> 32));
     wr(CP_PM4_INSTR_LO, (uint32_t)kPm4Iova);
     wr(CP_PM4_INSTR_HI, (uint32_t)(kPm4Iova >> 32));
     wr(CP_PFP_INSTR_LO, (uint32_t)kPfpIova);
     wr(CP_PFP_INSTR_HI, (uint32_t)(kPfpIova >> 32));
-    wr(CP_ME_CNTL, 0);
+    wr(CP_RB_BASE, (uint32_t)kRingIova);
+    wr(CP_RB_BASE_HI, (uint32_t)(kRingIova >> 32));
+    wr(CP_CONTEXT_SWITCH, 0);
+    wr(CP_RB_CNTL, kRingControl);
+    wr(CP_RB_WPTR, 0);
+    wr(RBBM_INT_MASK, 0);
+    wr(RBBM_INT_CLEAR, kOwnedIRQs);
     __asm__ volatile("dsb sy" ::: "memory");
+
+    uint32_t back_m4 = rd(CP_PM4_INSTR_LO), back_pfp = rd(CP_PFP_INSTR_LO),
+             back_rb = rd(CP_RB_BASE), back_ctrl = rd(CP_RB_CNTL),
+             back_rptr = rd(CP_RB_READ), back_wptr = rd(CP_RB_WRITE),
+             back_cs = rd(CP_CONTEXT_SWITCH), back_am = rd(CP_ADDR_MODE_CNTL),
+             back_pr = rd(CP_PROTECT_CNTL_REG);
+    c.put(back_m4); c.put(back_pfp); c.put(back_rb); c.put(back_ctrl);
+    c.put(back_rptr); c.put(back_wptr); c.put(back_cs); c.put(back_am); c.put(back_pr);
+    if (back_m4 != (uint32_t)kPm4Iova || back_pfp != (uint32_t)kPfpIova ||
+        back_rb != (uint32_t)kRingIova || back_ctrl != kRingControl ||
+        back_rptr || back_wptr || back_cs || back_am != 1 || back_pr != 7)
+        return c.fail(13, "cp register readback");
+
+    // Publish the ring, release halt, start the ME, then submit ME_INIT.
+    __asm__ volatile("dsb sy" ::: "memory");
+    wr(VBIF_HALT, 0);
+    wr(CP_ME_CNTL_REG, 0);
 
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     memset(ring, 0, kRingBytes);
     unsigned n = 0;
     ring[n++] = type7(0x48 /*CP_ME_INIT*/, 8);
-    ring[n++] = 0x2f;            /* CP_INIT_MASK */
-    ring[n++] = 3;               /* multiple hardware contexts */
-    ring[n++] = 0x20000000;      /* error detection */
-    ring[n++] = 0;               /* header dump addr */
-    ring[n++] = 0;               /* header dump enable/size */
-    ring[n++] = 0x0a;            /* A540v1 ucode workarounds (adreno_a5xx.c) */
+    ring[n++] = 0x2f;            // CP_INIT_MASK
+    ring[n++] = 3;               // multiple hardware contexts
+    ring[n++] = 0x20000000;      // error detection
+    ring[n++] = 0;               // header dump addr
+    ring[n++] = 0;               // header dump enable/size
+    ring[n++] = 0;               // A540: no ucode workaround (sagit runs 0)
     ring[n++] = 0;
     ring[n++] = 0;
     cleanDcache(ring, n * 4);
     wr(CP_RB_WPTR, n);
 
-    for (unsigned i = 0; i < 20000; ++i) {
-        if (rd(CP_RB_RPTR) == n)
+    bool idle = false;
+    for (unsigned i = 0; i < 200000; ++i) {
+        uint32_t ints = rd(RBBM_INT_STATUS), cpints = rd(CP_INT_STATUS);
+        uint32_t status = rd(RBBM_STATUS_REG);
+        if ((ints & 0x7e) || (cpints & 0x3f))
             break;
+        if (rd(CP_RB_READ) == n && !(status & ~1u) && !(rd(RBBM_STATUS3_REG) & (1u << 24))) {
+            idle = true;
+            break;
+        }
         for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
     }
-    c.put(rd(CP_RB_RPTR));
-    c.put(rd(0x13d4));            /* RBBM_STATUS */
-    c.put(rd(CP_ME_CNTL));
-    c.put(rd(CP_RB_WPTR));
-    c.put(rd(CP_PFP_INSTR_LO));
-    invalidateDcache(c.rptr.cpu, 64);
-    c.put(reinterpret_cast<volatile uint32_t *>(c.rptr.cpu)[0]);  /* RPTR shadow */
-    c.put(rd(0x48));              /* sGFSR (unmatched/SID faults) */
-    c.put(rd(0x8058));            /* CB0 FSR */
-    c.put(rd(0x8060));            /* CB0 FAR_LO */
-    IOLog("NATIVE_GPU_C3: cp rptr=%08x rbbm=%08x me=%08x wptr=%08x shadow=%08x "
-          "gfsr=%08x fsr=%08x far=%08x\n",
-          rd(CP_RB_RPTR), rd(0x13d4), rd(CP_ME_CNTL), rd(CP_RB_WPTR),
-          reinterpret_cast<volatile uint32_t *>(c.rptr.cpu)[0],
-          rd(0x48), rd(0x8058), rd(0x8060));
-    if (rd(CP_RB_RPTR) != n)
+    c.put(rd(CP_RB_READ));
+    c.put(rd(RBBM_STATUS_REG));
+    c.put(rd(CP_ME_CNTL_REG));
+    c.put(rd(RBBM_INT_STATUS));
+    c.put(rd(CP_INT_STATUS));
+    IOLog("NATIVE_GPU_C3: cp rptr=%08x rbbm=%08x me=%08x wptr=%08x ints=%08x cpints=%08x idle=%u\n",
+          rd(CP_RB_READ), rd(RBBM_STATUS_REG), rd(CP_ME_CNTL_REG), rd(CP_RB_WRITE),
+          rd(RBBM_INT_STATUS), rd(CP_INT_STATUS), idle ? 1u : 0u);
+    if (!idle || rd(CP_RB_READ) != n)
         return c.fail(11, "cp me init");
     return true;
 }
@@ -493,6 +624,10 @@ static void c3_thread(void *, wait_result_t) {
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
+    /* Real GPU reset first: it clears the GPU-side CP/TSB state, so the
+     * SMMU context and the SID0 route are (re)built afterwards. */
+    IOLog("NATIVE_GPU_C3: gpu reset\n");
+    if (!gpu_reset(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: smmu setup\n");
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp init\n");
