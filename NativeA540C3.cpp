@@ -762,6 +762,17 @@ static bool gpmu_load(Ctx &c) {
  * read/write scratch page; CP_WAIT_MEM_WRITES makes the completion ordering
  * explicit before the CPU invalidates its cache line. */
 static bool submit_probe(Ctx &c) {
+    /* H236az: the CP still reports RBBM_SECVID_TRUST_CNTL=1, so non-secure
+     * data writes are dropped. Try the vendor's no-content-protection path
+     * first: write the trust register to 0 from the host and read it back.
+     * Log before the write so a secure-only bus fault has a persisted stop. */
+    IOLog("NATIVE_GPU_C3: trust write begin old=%08x\n", rd(0x0f400 * R));
+    native_log_flush_hook();
+    wr(0x0f400 * R, 0);
+    const uint32_t trustBack = rd(0x0f400 * R);
+    IOLog("NATIVE_GPU_C3: trust write done new=%08x\n", trustBack);
+    native_log_flush_hook();
+
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
