@@ -150,6 +150,44 @@ static void invalidateDcache(void *p, size_t bytes) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* H236ba: ZAP/PAS via the secure monitor, following the A-line redwood SCM
+ * helper and the vendor mdt_loader PAS sequence. PAS image 13 is the GPU. */
+constexpr uint64_t kScm64 = 1ull << 30, kScmSip = 2ull << 24;
+constexpr uint64_t kScmInterrupted = 1;
+constexpr uint64_t kScmPasInitImage = (2ull << 8) | 1;
+constexpr uint64_t kScmPasMemSetup = (2ull << 8) | 2;
+constexpr uint64_t kScmPasAuthAndReset = (2ull << 8) | 5;
+constexpr uint64_t kScmPasShutdown = (2ull << 8) | 6;
+constexpr uint64_t kScmOneValue = 1, kScmThreeValues = 3;
+constexpr uint64_t kScmValueAndBuffer = 2 | (2 << 6);
+constexpr uint32_t kPasGpu = 13;
+
+static int32_t smcCall(uint64_t function, uint64_t argInfo, uint64_t a1, uint64_t a2,
+                       uint64_t a3, uint64_t *answer) {
+    uint64_t session = 0;
+    for (int i = 0; i < 100; ++i) {
+        register uint64_t x0 __asm__("x0") = i == 0 ? function : kScmInterrupted;
+        register uint64_t x1 __asm__("x1") = argInfo;
+        register uint64_t x2 __asm__("x2") = a1;
+        register uint64_t x3 __asm__("x3") = a2;
+        register uint64_t x4 __asm__("x4") = a3;
+        register uint64_t x5 __asm__("x5") = 0;
+        register uint64_t x6 __asm__("x6") = session;
+        register uint64_t x7 __asm__("x7") = 0;
+        __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
+                         "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+                         :
+                         : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                           "x16", "x17", "memory");
+        session = x6;
+        if (x0 != kScmInterrupted) {
+            *answer = x1;
+            return int32_t(x0);
+        }
+    }
+    return -1;
+}
+
 /* H236as: the A5xx PM4 headers carry odd-parity bits. Omitting them made the
  * CP reject CP_ME_INIT with an opcode error (CP_INTERRUPT_STATUS bit0) even
  * though the PFP had fetched the ring. The count field is the data-word
@@ -170,7 +208,7 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
 
 struct Ctx {
     void (*record)(uint32_t);
-    Alloc tables, ring, pm4, pfp, gpmu, rptr;
+    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
     ArmSmmu4KConfig cfg;
@@ -757,22 +795,83 @@ static bool gpmu_load(Ctx &c) {
     return true;
 }
 
+/* H236ba: authenticate and start the signed ZAP shader through PAS image 13.
+ * The .mdt header goes to PAS_INIT_IMAGE, the relocatable .b02 segment goes
+ * into a physically contiguous low-4G buffer announced by PAS_MEM_SETUP, and
+ * PAS_AUTH_AND_RESET hands both to TrustZone. */
+static bool zap_load(Ctx &c) {
+    if (a540_fw_zap_mdt_size > c.zapHeader.bytes ||
+        a540_fw_zap_b02_size > c.zapImage.bytes)
+        return c.fail(40, "zap size");
+    uint64_t answer = ~0ull;
+    int32_t status = smcCall(kScm64 | kScmSip | kScmPasShutdown, kScmOneValue,
+                             kPasGpu, 0, 0, &answer);
+    IOLog("NATIVE_GPU_C3: zap shutdown rc=%d answer=%llx\n", status, answer);
+    if (status != 0 || answer != 0) {
+        IOLog("NATIVE_GPU_C3: zap shutdown refused (continuing, may retain old ZAP)\n");
+    }
+
+    memset(c.zapHeader.cpu, 0, c.zapHeader.bytes);
+    memcpy(c.zapHeader.cpu, a540_fw_zap_mdt, a540_fw_zap_mdt_size);
+    cleanDcache(c.zapHeader.cpu, c.zapHeader.bytes);
+    status = smcCall(kScm64 | kScmSip | kScmPasInitImage, kScmValueAndBuffer,
+                     kPasGpu, c.zapHeader.phys, 0, &answer);
+    IOLog("NATIVE_GPU_C3: zap init rc=%d answer=%llx mdt=%llx/%u\n",
+          status, answer, c.zapHeader.phys, a540_fw_zap_mdt_size);
+    if (status != 0 || answer != 0)
+        return c.fail(41, "zap init image");
+
+    status = smcCall(kScm64 | kScmSip | kScmPasMemSetup, kScmThreeValues,
+                     kPasGpu, c.zapImage.phys, c.zapImage.bytes, &answer);
+    IOLog("NATIVE_GPU_C3: zap mem setup rc=%d answer=%llx image=%llx/%u\n",
+          status, answer, c.zapImage.phys, unsigned(c.zapImage.bytes));
+    if (status != 0 || answer != 0)
+        return c.fail(42, "zap mem setup");
+
+    memset(c.zapImage.cpu, 0, c.zapImage.bytes);
+    memcpy(c.zapImage.cpu, a540_fw_zap_b02, a540_fw_zap_b02_size);
+    cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
+    status = smcCall(kScm64 | kScmSip | kScmPasAuthAndReset, kScmOneValue,
+                     kPasGpu, 0, 0, &answer);
+    IOLog("NATIVE_GPU_C3: zap auth rc=%d answer=%llx b02=%u\n",
+          status, answer, a540_fw_zap_b02_size);
+    if (status != 0 || answer != 0)
+        return c.fail(43, "zap auth and reset");
+    return true;
+}
+
+/* H236ba: ask the authenticated CP firmware to leave secure mode, then confirm
+ * via the timestamp/trust register that data writes are no longer dropped. */
+static bool zap_unsecure(Ctx &c) {
+    uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
+    const unsigned start = rd(CP_RB_RPTR);
+    unsigned n = start;
+    ring[n++] = type7(0x66 /*CP_SET_SECURE_MODE*/, 1);
+    ring[n++] = 0;
+    ring[n++] = type7(0x26 /*CP_WAIT_FOR_IDLE*/, 0);
+    cleanDcache(ring + start, (n - start) * 4);
+    wr(CP_RB_WPTR, n);
+    bool done = false;
+    for (unsigned ms = 0; ms < 2000; ++ms) {
+        if (rd(CP_RB_RPTR) == n) { done = true; break; }
+        spinMs(1);
+    }
+    const uint32_t trust = rd(0x0f400 * R);
+    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x\n",
+          rd(CP_RB_RPTR), n, done ? 1u : 0u, trust);
+    if (!done || trust != 0)
+        return c.fail(44, "zap unsecure");
+    return true;
+}
+
 /* H236av: minimal submission proof. CP_MEM_WRITE goes through the same
  * SID0/CB0 translation as the GPMU packets and stores a known value in the
  * read/write scratch page; CP_WAIT_MEM_WRITES makes the completion ordering
  * explicit before the CPU invalidates its cache line. */
 static bool submit_probe(Ctx &c) {
-    /* H236az: the CP still reports RBBM_SECVID_TRUST_CNTL=1, so non-secure
-     * data writes are dropped. Try the vendor's no-content-protection path
-     * first: write the trust register to 0 from the host and read it back.
-     * Log before the write so a secure-only bus fault has a persisted stop. */
-    IOLog("NATIVE_GPU_C3: trust write begin old=%08x\n", rd(0x0f400 * R));
-    native_log_flush_hook();
-    wr(0x0f400 * R, 0);
-    const uint32_t trustBack = rd(0x0f400 * R);
-    IOLog("NATIVE_GPU_C3: trust write done new=%08x\n", trustBack);
-    native_log_flush_hook();
-
+    /* H236az: writing RBBM_SECVID_TRUST_CNTL from the AP wedges the bus (the
+     * register is secure-only). The CP must be made non-secure through the
+     * ZAP/PAS path instead; do not touch the trust register here. */
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
@@ -858,6 +957,8 @@ static void c3_thread(void *, wait_result_t) {
     if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); gC3Done = 1; return; }
     if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
     if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
+    if (!c->zapHeader.init(0x2000)) { c->put(0xdea00037u); gC3Done = 1; return; }
+    if (!c->zapImage.init(0x2000)) { c->put(0xdea00038u); gC3Done = 1; return; }
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
@@ -873,6 +974,10 @@ static void c3_thread(void *, wait_result_t) {
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
 
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
+    IOLog("NATIVE_GPU_C3: zap load\n");
+    if (!zap_load(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: zap unsecure\n");
+    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
