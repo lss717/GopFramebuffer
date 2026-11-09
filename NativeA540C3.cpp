@@ -407,19 +407,26 @@ static bool gpu_reset(Ctx &c) {
     native_log_flush_hook();
     if (!meHalted || !vbifHalted)
         return c.fail(12, "gpu halt");
-    /* H236al: the reference does write-1 / dummy-read / write-0. The dummy
-     * read may be what wedges the bus while RBBM is in reset, so pulse
-     * without reading and log each write separately. */
-    IOLog("NATIVE_GPU_C3: reset w1\n");
+    /* H236an: the previous test put a UFS log flush between the two reset
+     * writes. A device write to another block that is ordered behind an
+     * unacknowledged reset write can block, which makes the pulse look like
+     * a bus hang. Keep the two writes back-to-back with only CPU work
+     * between them; the flush after the release is then the first access to
+     * another block and is a clean test of whether the bus really wedged. */
+    IOLog("NATIVE_GPU_C3: reset pulse begin\n");
     native_log_flush_hook();
     wr(RBBM_SW_RESET_CMD_, 1);
-    IOLog("NATIVE_GPU_C3: reset w1 done\n");
-    native_log_flush_hook();
     for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
     wr(RBBM_SW_RESET_CMD_, 0);
-    IOLog("NATIVE_GPU_C3: reset w0 done\n");
-    native_log_flush_hook();
     for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    IOLog("NATIVE_GPU_C3: reset writes done\n");
+    native_log_flush_hook();
+    uint32_t resetBack = rd(RBBM_SW_RESET_CMD_);
+    c.put(resetBack);
+    IOLog("NATIVE_GPU_C3: reset pulse released rst=%08x\n", resetBack);
+    native_log_flush_hook();
+    if (resetBack)
+        return c.fail(12, "gpu reset readback");
     wr(RBBM_INT_MASK, 0);
     wr(CP_ME_CNTL_REG, kCpHalt);
     wr(VBIF_HALT, 0xf);
