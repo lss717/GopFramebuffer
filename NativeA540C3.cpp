@@ -337,6 +337,11 @@ static bool cp_init(Ctx &c) {
 
     c.put(rd(0x13d4));            /* RBBM_STATUS before the CP writes */
 
+    /* H236af: a5xx_start() starts VBIF before the CP. Without it the CP's
+     * memory fetch can hang and RBBM stays busy. a540_vbif = two writes. */
+    wr(0xc124, 0x00000003u);     /* A5XX_VBIF_ROUND_ROBIN_QOS_ARB */
+    wr(0xc0a8, 0x00000009u);     /* A5XX_VBIF_GATE_OFF_WRREQ_EN */
+
     /* H236ad: a5xx_start() programs the CP queue thresholds before the ring;
      * zero-sized ME queues keep the ME from consuming ME_INIT. */
     wr(0x2094, 0x40);            /* CP_MEQ_THRESHOLDS (A540) */
@@ -386,6 +391,11 @@ static bool cp_init(Ctx &c) {
     c.put(rd(0x48));              /* sGFSR (unmatched/SID faults) */
     c.put(rd(0x8058));            /* CB0 FSR */
     c.put(rd(0x8060));            /* CB0 FAR_LO */
+    IOLog("NATIVE_GPU_C3: cp rptr=%08x rbbm=%08x me=%08x wptr=%08x shadow=%08x "
+          "gfsr=%08x fsr=%08x far=%08x\n",
+          rd(CP_RB_RPTR), rd(0x13d4), rd(CP_ME_CNTL), rd(CP_RB_WPTR),
+          reinterpret_cast<volatile uint32_t *>(c.rptr.cpu)[0],
+          rd(0x48), rd(0x8058), rd(0x8060));
     if (rd(CP_RB_RPTR) != n)
         return c.fail(11, "cp me init");
     return true;
