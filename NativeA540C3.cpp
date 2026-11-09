@@ -297,22 +297,24 @@ static bool smmu_setup(Ctx &c) {
     c.put(c.prog.readback.sctlr);
     c.put(c.prog.readback.ttbr0 >> 32);
 
-    // H236y: the firmware leaves every S2CR at 0x000200ff (FAULT with cbndx
-    // 0xff). The kit requires the target slot to be exactly FAULT before it
-    // publishes SMR, so clean the owned slot first.
-    if (c.io.write32(c.io.cookie, 0xc00, 0x00020000u) || c.io.barrier(c.io.cookie))
-        return c.fail(6, "smmu s2cr preclean");
     // arm-smmu.c writes ACTLR=0x70000000 for SMMU_MODEL_QCOM_V2 (OSH/ISH/NSH);
     // the kit's image does not include ACTLR.
     if (c.io.write32(c.io.cookie, 0x8004, 0x70000000u) || c.io.barrier(c.io.cookie))
         return c.fail(6, "smmu actlr");
-
-    /* GPU SID 0 -> CB0 (DT: iommus = <&kgsl_smmu 0>). */
-    ArmSmmu4KStream route = { 0, 0 };
-    if (ArmSmmu4KAttachStreams(&c.io, &c.stream_state, &route, 1, 0, &c.ccfg,
-                               &c.stream_result) != ArmSmmu4KSuccess)
-        return c.fail(6, "smmu stream");
-    c.put(c.stream_result.streams_verified);
+    // H236z: S2CR reads 0x000200ff for FAULT (cbndx reads as 0xff), so the
+    // kit's "target slot must be exactly FAULT" preflight returns Busy. The
+    // firmware leaves SMR invalid, so publish the SID0->CB0 route here:
+    // S2CR first (translation, CB0), then SMR0 (VALID | SID 0).
+    if (c.io.write32(c.io.cookie, 0xc00, 0) || c.io.barrier(c.io.cookie) ||
+        c.io.write32(c.io.cookie, 0x800, 0x80000000u) || c.io.barrier(c.io.cookie))
+        return c.fail(6, "smmu route write");
+    uint32_t route_s2cr = ~0u, route_smr = 0;
+    c.io.read32(c.io.cookie, 0xc00, &route_s2cr);
+    c.io.read32(c.io.cookie, 0x800, &route_smr);
+    c.put(route_s2cr);
+    c.put(route_smr);
+    if (route_s2cr != 0 || route_smr != 0x80000000u)
+        return c.fail(6, "smmu route readback");
     return true;
 }
 
@@ -324,6 +326,11 @@ static bool cp_init(Ctx &c) {
     memcpy(c.pfp.cpu, a540_fw_pfp + 4, a540_fw_pfp_size - 4);
     cleanDcache(c.pm4.cpu, c.pm4.bytes);
     cleanDcache(c.pfp.cpu, c.pfp.bytes);
+
+    /* H236ab: the GPU comes up in secured mode; clear RBBM_SECVID_TRUST_CNTL
+     * before the CP fetches the ring/microcode from non-secure memory. */
+    wr(0xf400 * 4, 0);
+    __asm__ volatile("dsb sy" ::: "memory");
 
     wr(CP_RB_RPTR_ADDR_LO, (uint32_t)kRptrIova);
     wr(CP_RB_RPTR_ADDR_HI, (uint32_t)(kRptrIova >> 32));
@@ -346,18 +353,22 @@ static bool cp_init(Ctx &c) {
     ring[n++] = 0x20000000;      /* error detection */
     ring[n++] = 0;               /* header dump addr */
     ring[n++] = 0;               /* header dump enable/size */
-    ring[n++] = 0;               /* ucode workaround mask (A540) */
+    ring[n++] = 0x0a;            /* A540v1 ucode workarounds (adreno_a5xx.c) */
     ring[n++] = 0;
     ring[n++] = 0;
     cleanDcache(ring, n * 4);
     wr(CP_RB_WPTR, n);
 
-    for (unsigned i = 0; i < 4000; ++i) {
+    for (unsigned i = 0; i < 20000; ++i) {
         if (rd(CP_RB_RPTR) == n)
             break;
         for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
     }
     c.put(rd(CP_RB_RPTR));
+    c.put(rd(0x13d4));            /* RBBM_STATUS */
+    c.put(rd(CP_ME_CNTL));
+    c.put(rd(CP_RB_WPTR));
+    c.put(rd(CP_PFP_INSTR_LO));
     if (rd(CP_RB_RPTR) != n)
         return c.fail(11, "cp me init");
     return true;
