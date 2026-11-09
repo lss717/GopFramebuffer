@@ -142,11 +142,22 @@ static void cleanDcache(void *p, size_t bytes) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* H236as: the A5xx PM4 headers carry odd-parity bits. Omitting them made the
+ * CP reject CP_ME_INIT with an opcode error (CP_INTERRUPT_STATUS bit0) even
+ * though the PFP had fetched the ring. The count field is the data-word
+ * count, not count-1. */
+static uint32_t parity(uint32_t value) {
+    value ^= value >> 16; value ^= value >> 8; value ^= value >> 4;
+    value ^= value >> 2; value ^= value >> 1;
+    return (~value) & 1u;
+}
 static uint32_t type4(uint32_t addr, uint32_t count) {
-    return 0x40000000u | ((count - 1) << 16) | (addr & 0xffffu);
+    return 0x40000000u | (count & 0x7fu) | (parity(count) << 7) |
+           ((addr & 0x3ffffu) << 8) | (parity(addr) << 27);
 }
 static uint32_t type7(uint32_t opcode, uint32_t count) {
-    return 0x70000000u | (opcode << 16) | (count - 1);
+    return 0x70000000u | (count & 0x3fffu) | (parity(count) << 15) |
+           ((opcode & 0x7fu) << 16) | (parity(opcode) << 23);
 }
 
 struct Ctx {
