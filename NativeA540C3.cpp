@@ -815,8 +815,13 @@ static bool gpmu_load(Ctx &c) {
  * PAS_AUTH_AND_RESET hands both to TrustZone. */
 static bool zap_load(Ctx &c) {
     if (a540_fw_zap_mdt_size > c.zapHeader.bytes ||
-        a540_fw_zap_elf_size > c.zapImage.bytes)
+        a540_fw_zap_b02_size > c.zapImage.bytes)
         return c.fail(40, "zap size");
+    /* The concatenated .elf (17,204 B) is a regression reference only; the
+     * runtime image is the .b02 PT_LOAD segment (4,916 B). Keep it live so the
+     * generated blob does not trip an unused-const warning. */
+    (void)a540_fw_zap_elf;
+    (void)a540_fw_zap_elf_size;
     uint64_t answer = ~0ull;
     IOLog("NATIVE_GPU_C3: zap shutdown call\n");
     native_log_flush_hook();
