@@ -582,8 +582,12 @@ static bool cp_init(Ctx &c) {
     cleanDcache(ring, n * 4);
     wr(CP_RB_WPTR, n);
 
+    /* H236ap: the vendor's adreno_ringbuffer_submit_spin waits 2000 ms for
+     * ME_INIT. The previous 64-yield loop expired in ~10-20 ms while the CP
+     * had already fetched all 9 dwords (rptr=9); it was still busy. Wait the
+     * same 2 s, one millisecond at a time. */
     bool idle = false;
-    for (unsigned i = 0; i < 200000; ++i) {
+    for (unsigned ms = 0; ms < 2000; ++ms) {
         uint32_t ints = rd(RBBM_INT_STATUS), cpints = rd(CP_INT_STATUS);
         uint32_t status = rd(RBBM_STATUS_REG);
         if ((ints & 0x7e) || (cpints & 0x3f))
@@ -592,7 +596,7 @@ static bool cp_init(Ctx &c) {
             idle = true;
             break;
         }
-        for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
+        IOSleep(1);
     }
     uint32_t gfsr = 0, fsr = 0, far = 0;
     c.io.read32(c.io.cookie, 0x48, &gfsr);
@@ -643,10 +647,12 @@ static bool gpmu_load(Ctx &c) {
     cleanDcache(ring + start, (n - start) * 4);
     wr(CP_RB_WPTR, n);
 
-    for (unsigned i = 0; i < 4000; ++i) {
+    /* H236ap: the GPMU firmware is ~11.7 KiB written through the ring; give
+     * the CP the same 2 s as ME_INIT instead of a yield-only loop. */
+    for (unsigned ms = 0; ms < 2000; ++ms) {
         if (rd(CP_RB_RPTR) == n)
             break;
-        for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
+        IOSleep(1);
     }
     c.put(rd(CP_RB_RPTR));
     if (rd(CP_RB_RPTR) != n)
@@ -654,11 +660,13 @@ static bool gpmu_load(Ctx &c) {
 
     wr(GPMU_CM3_SYSRESET, 0);
     uint32_t general = 0;
-    for (unsigned i = 0; i < 20000; ++i) {
+    /* Vendor a5xx_gpmu_init uses GPMU_FW_INIT_RETRY=5000 one-millisecond
+     * polls. Do not declare the handshake dead after a few yield loops. */
+    for (unsigned ms = 0; ms < 5000; ++ms) {
         general = rd(GPMU_GENERAL_0);
         if (general == 0xBABEFACEu)
             break;
-        for (unsigned d = 0; d < 128; ++d) __asm__ volatile("yield");
+        IOSleep(1);
     }
     c.put(general);
     c.put(rd(GPMU_GENERAL_1));
