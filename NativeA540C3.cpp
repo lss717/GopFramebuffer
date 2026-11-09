@@ -977,10 +977,23 @@ static void c3_thread(void *, wait_result_t) {
     if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); gC3Done = 1; return; }
     if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
     if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
-    /* H236bf: the SCM PAS physical-address arguments are 32-bit; the ZAP
-     * header and image must live below 4 GiB or TrustZone truncates them. */
-    if (!c->zapHeader.init(0x2000, 0x00000000fffff000ULL)) { c->put(0xdea00037u); gC3Done = 1; return; }
-    if (!c->zapImage.init(0x8000, 0x00000000fffff000ULL)) { c->put(0xdea00038u); gC3Done = 1; return; }
+    /* H236bg: a hard low-4G allocation may block or fail on this kernel.
+     * Try it, log the result, and fall back to the normal mask so the C3
+     * still reaches the PAS calls and reports the real addresses. */
+    IOLog("NATIVE_GPU_C3: alloc zap low4g\n");
+    native_log_flush_hook();
+    bool zapHeaderLow = c->zapHeader.init(0x2000, 0x00000000fffff000ULL);
+    bool zapImageLow = c->zapImage.init(0x8000, 0x00000000fffff000ULL);
+    if (!zapHeaderLow || !zapImageLow) {
+        IOLog("NATIVE_GPU_C3: zap low4g failed h=%u i=%u, retry default\n",
+              zapHeaderLow ? 1u : 0u, zapImageLow ? 1u : 0u);
+        native_log_flush_hook();
+        if (!zapHeaderLow && !c->zapHeader.init(0x2000)) { c->put(0xdea00037u); gC3Done = 1; return; }
+        if (!zapImageLow && !c->zapImage.init(0x8000)) { c->put(0xdea00038u); gC3Done = 1; return; }
+    }
+    IOLog("NATIVE_GPU_C3: zap alloc mdt=%llx image=%llx\n",
+          c->zapHeader.phys, c->zapImage.phys);
+    native_log_flush_hook();
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
@@ -989,10 +1002,12 @@ static void c3_thread(void *, wait_result_t) {
     IOLog("NATIVE_GPU_C3: gpu reset\n");
     if (!gpu_reset(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: smmu setup\n");
+    native_log_flush_hook();
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
     /* Vendor a5xx_rb_start order: ZAP is available before the CP starts,
      * CP_SET_SECURE_MODE(0) follows ME_INIT, and GPMU starts after that. */
     IOLog("NATIVE_GPU_C3: zap load\n");
+    native_log_flush_hook();
     if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp init\n");
     if (!cp_init(*c)) { gC3Done = 1; return; }
