@@ -106,6 +106,7 @@ static uint32_t osmSample(int log) {
 }
 
 extern "C" {
+extern "C" int sheng_a540_c3_run(void (*record)(uint32_t));
 void native_hid_input_probe(void) {}
 void native_keystore_probe(void) {}
 void native_touch_probe(void) {}
@@ -804,10 +805,24 @@ static int sheng_spmi_power_step(int mode) {
         return 1;
     }
     if (step == 1) {
+        // Put GX into a known off state first. A previous boot can leave the
+        // PLL/root/branch running and the GX domain powered; re-running the
+        // power-up sequence on that state is not reliable.
+        gpuccWr(0x0130, 0x1);                                   /* clamp asserted */
+        gpuccWr(0x1098, gpuccRd(0x1098) | (1u << 31));          /* branch off */
+        gpuccWr(0x1070, (gpuccRd(0x1070) & ~(1u << 31)) & ~2u);/* root off */
+        gpuccWr(0x00c, gpuccRd(0x00c) | 7u);                    /* keep even/2 config */
+        uint32_t pmode = gpuccRd(0x000);
+        gpuccWr(0x000, pmode & ~1u);                            /* PLL out off */
+        gpuccWr(0x02c, 0u);                                     /* PLL standby */
+        gpuccWr(0x1094, gpuccRd(0x1094) | 1u);                  /* GX collapse */
+        gpuDelay(512);
         gpuccWr(0x0130, 0x0);
         gpuDelay(256);
         sheng_spmi2_record(gpuccRd(0x0130));
-        IOLog("NATIVE_GPU_PWR: c1e2 clamp=%08x\n", gpuccRd(0x0130));
+        sheng_spmi2_record(gpuccRd(0x1094));
+        IOLog("NATIVE_GPU_PWR: c1e2 preclean clamp=%08x gx=%08x pll=%08x\n",
+              gpuccRd(0x0130), gpuccRd(0x1094), gpuccRd(0x000));
         ++step;
         return 1;
     }
@@ -1067,6 +1082,15 @@ static int sheng_spmi_power_step(int mode) {
         }
         ++step;
         return 1;
+    }
+    if (step == 23 && mode == 7) {
+        // C3: GPU memory + SMMUv2 + CP ring/microcode + GPMU firmware.
+        // Runs once; the callee emits its own gc= markers.
+        int rc = sheng_a540_c3_run(sheng_spmi2_record);
+        sheng_spmi2_record(0x600d00c3u | ((uint32_t)(-rc) & 0xffu));
+        IOLog("NATIVE_GPU_PWR: c1e2 c3 full run rc=%d\n", rc);
+        step = 99;
+        return 0;
     }
     if (step >= 23 && mode == 6) {
         if (step == 23) {
