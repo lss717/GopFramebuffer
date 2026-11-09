@@ -901,16 +901,35 @@ static bool zap_unsecure(Ctx &c) {
     ring[n++] = type7(0x66 /*CP_SET_SECURE_MODE*/, 1);
     ring[n++] = 0;
     ring[n++] = type7(0x26 /*CP_WAIT_FOR_IDLE*/, 0);
+    /*
+     * H236da: sagit's AdrenoSubmit::Engine::start submits a real timestamp in
+     * the same stream as CP_SET_SECURE_MODE(0) and only accepts the transition
+     * once that timestamp retires and RBBM_SECVID_TRUST_CNTL reads 0. Without
+     * the timestamp the CP can retire the secure-mode packet while the trust
+     * bit still latches the old state (H236cw/cz: rptr done, trust=1).
+     */
+    ring[n++] = type7(0x46 /*CP_EVENT_WRITE*/, 4);
+    ring[n++] = 4u | (1u << 31);                  /* CACHE_FLUSH_TS + IRQ */
+    ring[n++] = (uint32_t)kRptrIova;
+    ring[n++] = (uint32_t)(kRptrIova >> 32);
+    ring[n++] = 0xA540C3u;
     cleanDcache(ring + start, (n - start) * 4);
+    cleanDcache(c.rptr.cpu, kRptrBytes);
     wr(CP_RB_WPTR, n);
     bool done = false;
     for (unsigned ms = 0; ms < 2000; ++ms) {
         if (rd(CP_RB_RPTR) == n) { done = true; break; }
         spinMs(1);
     }
-    const uint32_t trust = rd(0x0f400 * R);
-    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x\n",
-          rd(CP_RB_RPTR), n, done ? 1u : 0u, trust);
+    uint32_t trust = rd(0x0f400 * R);
+    for (unsigned ms = 0; ms < 2000 && trust; ++ms) {
+        spinMs(1);
+        trust = rd(0x0f400 * R);
+    }
+    invalidateDcache(c.rptr.cpu, kRptrBytes);
+    const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
+    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x ts=%08x:%08x\n",
+          rd(CP_RB_RPTR), n, done ? 1u : 0u, trust, scratch[0], scratch[1]);
     if (!done || trust != 0)
         return c.fail(44, "zap unsecure");
     return true;
@@ -1055,12 +1074,15 @@ static void c3_thread(void *, wait_result_t) {
     if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp init\n");
     if (!cp_init(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: zap unsecure\n");
-    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
+    /* H236cz: sagit AdrenoSubmit::Engine::start requires GPMUReady=0xbabeface
+     * before it accepts CP_SET_SECURE_MODE(0); the secure-mode transition only
+     * takes effect with the GPMU firmware already loaded. */
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
 
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
+    IOLog("NATIVE_GPU_C3: zap unsecure\n");
+    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
