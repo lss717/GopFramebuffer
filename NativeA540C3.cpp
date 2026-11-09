@@ -321,7 +321,6 @@ static bool smmu_setup(Ctx &c) {
 // adreno_a5xx sequence. DWORD indices scaled to bytes.
 namespace {
 constexpr uint32_t R             = 4;
-constexpr uint32_t RBBM_SW_RESET_CMD_   = 0x0043 * R;
 constexpr uint32_t RBBM_INT_MASK        = 0x0038 * R;
 constexpr uint32_t RBBM_INT_CLEAR       = 0x0037 * R;
 constexpr uint32_t RBBM_INT_STATUS      = 0x04e1 * R;
@@ -375,14 +374,10 @@ static bool gpu_reset(Ctx &c) {
     native_log_flush_hook();
     if (!meHalted || !vbifHalted)
         return c.fail(12, "gpu halt");
-    IOLog("NATIVE_GPU_C3: reset pulse\n");
-    native_log_flush_hook();
-    wr(RBBM_SW_RESET_CMD_, 1);
-    (void)rd(RBBM_SW_RESET_CMD_);
-    wr(RBBM_SW_RESET_CMD_, 0);
-    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
-    IOLog("NATIVE_GPU_C3: reset pulse done rst=%08x\n", rd(RBBM_SW_RESET_CMD_));
-    native_log_flush_hook();
+    /* H236aj: the RBBM_SW_RESET_CMD pulse itself hangs the AP bus on this
+     * board even with the CP and VBIF halted, so it cannot be used from the
+     * kernel. Keep the halted state and let the ME reload from INSTR_BASE. */
+    IOLog("NATIVE_GPU_C3: reset pulse skipped\n");
     wr(RBBM_INT_MASK, 0);
     wr(CP_ME_CNTL_REG, kCpHalt);
     wr(VBIF_HALT, 0xf);
@@ -392,11 +387,10 @@ static bool gpu_reset(Ctx &c) {
         c.put(rd(VBIF_HALTED));
         return c.fail(12, "gpu stop");
     }
-    uint32_t rst = rd(RBBM_SW_RESET_CMD_), rptr = rd(CP_RB_READ), wptr = rd(CP_RB_WRITE),
-             cs = rd(CP_CONTEXT_SWITCH), trust = rd(0x3d000);
-    c.put(rst); c.put(rptr); c.put(wptr); c.put(cs); c.put(trust);
-    if (rst || rptr || wptr || cs || trust > 1)
-        return c.fail(12, "gpu reset readback");
+    uint32_t rptr = rd(CP_RB_READ), wptr = rd(CP_RB_WRITE), cs = rd(CP_CONTEXT_SWITCH);
+    c.put(rptr); c.put(wptr); c.put(cs);
+    if (rptr || wptr || cs)
+        return c.fail(12, "gpu halt readback");
     // No retained BABEFACE may count as a new GPMU response.
     wr(GPMU_CM3_SYSRESET, 1);
     wr(GPMU_GENERAL0, 0);
