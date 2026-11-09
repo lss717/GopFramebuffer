@@ -13,6 +13,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 
 extern "C" void native_log_flush_hook(void);
 
@@ -359,6 +360,21 @@ constexpr uint32_t kRingControl         = 12u | (2u << 8) | (1u << 27);
 constexpr uint32_t kOwnedIRQs           = (1u << 20) | 0x7eu | (1u << 9) |
                                           (1u << 23) | (1u << 24) | (1u << 25) | (1u << 28);
 
+/* H236ar: the H236aq C3 thread stopped after "cp configure done" while the
+ * rest of the system kept running; IOSleep(1) in this early kernel thread
+ * never returned. Use a bounded busy wait on the arch timer instead. */
+void spinMs(unsigned ms) {
+    const uint64_t start = mach_absolute_time();
+    const uint64_t want = uint64_t(ms) * 1000000ULL;
+    for (;;) {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+        if (ns >= want)
+            return;
+        __asm__ volatile("yield");
+    }
+}
+
 bool waitReg(uint32_t off, uint32_t mask, uint32_t want, unsigned rounds) {
     for (unsigned i = 0; i < rounds; ++i) {
         if ((rd(off) & mask) == want)
@@ -600,7 +616,7 @@ static bool cp_init(Ctx &c) {
             idle = true;
             break;
         }
-        IOSleep(1);
+        spinMs(1);
     }
     uint32_t gfsr = 0, fsr = 0, far = 0;
     c.io.read32(c.io.cookie, 0x48, &gfsr);
@@ -663,7 +679,7 @@ static bool gpmu_load(Ctx &c) {
     for (unsigned ms = 0; ms < 2000; ++ms) {
         if (rd(CP_RB_RPTR) == n)
             break;
-        IOSleep(1);
+        spinMs(1);
     }
     c.put(rd(CP_RB_RPTR));
     if (rd(CP_RB_RPTR) != n)
@@ -677,7 +693,7 @@ static bool gpmu_load(Ctx &c) {
         general = rd(GPMU_GENERAL_0);
         if (general == 0xBABEFACEu)
             break;
-        IOSleep(1);
+        spinMs(1);
     }
     c.put(general);
     c.put(rd(GPMU_GENERAL_1));
