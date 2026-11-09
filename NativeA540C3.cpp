@@ -111,6 +111,20 @@ static bool mapWindow(uint64_t base, uint64_t bytes, GpuWindow *w) {
     return true;
 }
 
+static GpuWindow gGcc;
+static bool mapGcc() {
+    if (gGcc.base)
+        return true;
+    return mapWindow(0x100000ULL, 0xb0000ULL, &gGcc);
+}
+static uint32_t gccRd(uint32_t off) { return gGcc.base ? gGcc.base[off / 4] : 0xffffffffu; }
+static void gccWr(uint32_t off, uint32_t value) {
+    if (gGcc.base) {
+        gGcc.base[off / 4] = value;
+        __asm__ volatile("dmb oshst" ::: "memory");
+    }
+}
+
 static uint32_t rd(uint32_t off) { return gGpu.base ? gGpu.base[off / 4] : 0xffffffffu; }
 static void wr(uint32_t off, uint32_t v) {
     if (gGpu.base) {
@@ -361,6 +375,24 @@ static bool gpu_reset(Ctx &c) {
     if (!gGpu.base && !mapWindow(kGpuBase, kGpuBytes, &gGpu))
         return c.fail(12, "gpu map reset");
     c.put(rd(RBBM_STATUS_REG));
+    /* H236am: the GCC GPU memory branches are left off by the bootloader.
+     * Without them the CP's fetch and the RBBM/VBIF flush cannot complete.
+     * Bits/offsets are the mainline msm8998 GCC definitions. */
+    if (!mapGcc())
+        return c.fail(12, "gcc map");
+    uint32_t gAhb = gccRd(0x71004), gBimc = gccRd(0x71010),
+             gSrc = gccRd(0x7100c), gBgfx = gccRd(0x46040);
+    c.put(gAhb); c.put(gBimc); c.put(gSrc); c.put(gBgfx);
+    gccWr(0x71004, gAhb | 1);
+    gccWr(0x7100c, gSrc | 1);
+    gccWr(0x71010, gBimc | 1);
+    gccWr(0x46040, gBgfx | 1);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    IOLog("NATIVE_GPU_C3: gcc gpu ahb=%08x->%08x bimc=%08x->%08x src=%08x->%08x bgfx=%08x->%08x\n",
+          gAhb, gccRd(0x71004), gBimc, gccRd(0x71010), gSrc, gccRd(0x7100c),
+          gBgfx, gccRd(0x46040));
+    native_log_flush_hook();
     IOLog("NATIVE_GPU_C3: reset halt write me=%08x vbif=%08x\n",
           rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
     native_log_flush_hook();
