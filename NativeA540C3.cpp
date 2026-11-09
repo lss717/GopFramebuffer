@@ -777,9 +777,17 @@ static bool submit_probe(Ctx &c) {
     ring[n++] = (uint32_t)(kRptrIova + 8);
     ring[n++] = (uint32_t)(kRptrIova >> 32);
     ring[n++] = 0xDEADBEEFu;
+    /* H236ax: the ring page is mapped read/write and the CP itself reads it.
+     * A second write there separates a dead data path from a bad rptr range. */
+    constexpr uint64_t kRingScratch = kRingIova + 0x7000;
+    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    ring[n++] = (uint32_t)kRingScratch;
+    ring[n++] = (uint32_t)(kRingScratch >> 32);
+    ring[n++] = 0xCAFEBABEu;
     ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
     cleanDcache(ring + start, (n - start) * 4);
     cleanDcache(c.rptr.cpu, kRptrBytes);
+    cleanDcache(reinterpret_cast<char *>(c.ring.cpu) + 0x7000, 0x1000);
     wr(CP_RB_WPTR, n);
 
     bool done = false;
@@ -791,18 +799,21 @@ static bool submit_probe(Ctx &c) {
         spinMs(1);
     }
     invalidateDcache(c.rptr.cpu, kRptrBytes);
+    invalidateDcache(reinterpret_cast<char *>(c.ring.cpu) + 0x7000, 0x1000);
     const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
     const uint32_t tsLo = scratch[0], tsHi = scratch[1], got = scratch[2];
+    const uint32_t ringGot =
+        *reinterpret_cast<const uint32_t *>(reinterpret_cast<const char *>(c.ring.cpu) + 0x7000);
     const uint32_t cpInt = rd(CP_INT_STATUS), hwFault = rd(0x0b1a * R);
     uint32_t fsr = 0;
     c.io.read32(c.io.cookie, 0x8058, &fsr);
     c.put(rd(CP_RB_RPTR));
     c.put(got);
-    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x done=%u\n",
-          rd(CP_RB_RPTR), n, tsHi, tsLo, got, done ? 1u : 0u);
+    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x ring=%08x done=%u\n",
+          rd(CP_RB_RPTR), n, tsHi, tsLo, got, ringGot, done ? 1u : 0u);
     IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x fsr=%08x rbbm=%08x\n",
           cpInt, hwFault, fsr, rd(RBBM_STATUS_REG));
-    if (!done || got != 0xDEADBEEFu)
+    if (!done || got != 0xDEADBEEFu || ringGot != 0xCAFEBABEu)
         return c.fail(30, "cp mem write");
     return true;
 }
