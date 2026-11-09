@@ -381,17 +381,23 @@ static bool gpu_reset(Ctx &c) {
     if (!mapGcc())
         return c.fail(12, "gcc map");
     uint32_t gAhb = gccRd(0x71004), gBimc = gccRd(0x71010),
-             gSrc = gccRd(0x7100c), gBgfx = gccRd(0x46040);
+             gSrc = gccRd(0x7100c), gBgfx = gccRd(0x46040),
+             gPll0 = gccRd(0x5200c);
     c.put(gAhb); c.put(gBimc); c.put(gSrc); c.put(gBgfx);
     gccWr(0x71004, gAhb | 1);
     gccWr(0x7100c, gSrc | 1);
     gccWr(0x71010, gBimc | 1);
     gccWr(0x46040, gBgfx | 1);
+    /* H236ao: sagit also holds gcc_gpu_gpll0_clk (0x5200c bit 4) on. The
+     * GPU AHB/source is derived from GPLL0; without it the RBBM reset
+     * handshake can stall even though simple reads still complete. */
+    gccWr(0x5200c, gPll0 | 0x10u);
     __asm__ volatile("dsb sy" ::: "memory");
     for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
-    IOLog("NATIVE_GPU_C3: gcc gpu ahb=%08x->%08x bimc=%08x->%08x src=%08x->%08x bgfx=%08x->%08x\n",
+    IOLog("NATIVE_GPU_C3: gcc gpu ahb=%08x->%08x bimc=%08x->%08x src=%08x->%08x "
+          "bgfx=%08x->%08x pll0=%08x->%08x\n",
           gAhb, gccRd(0x71004), gBimc, gccRd(0x71010), gSrc, gccRd(0x7100c),
-          gBgfx, gccRd(0x46040));
+          gBgfx, gccRd(0x46040), gPll0, gccRd(0x5200c));
     native_log_flush_hook();
     IOLog("NATIVE_GPU_C3: reset halt write me=%08x vbif=%08x\n",
           rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));

@@ -1122,6 +1122,25 @@ static int sheng_spmi_power_step(int mode) {
         return 1;
     }
     if (step == 22) {
+        /* H236ao: sagit's EFI GPUCC init also deasserts the CX/RBCPR resets
+         * and enables the CXO, RBCPR and RBBMTIMER branches. Our C2 only
+         * started the Fabia PLL and gfx3d, so the RBBM reset handshake may
+         * have had no clock and the CP could not run. Enable the same set
+         * before the gfx3d branch and log the readbacks. */
+        uint32_t cxReset = gpuccRd(0x1000), rbcprReset = gpuccRd(0x1050);
+        uint32_t cxo = gpuccRd(0x1020), rbcpr = gpuccRd(0x1054),
+                 rbtimer = gpuccRd(0x10d0);
+        gpuccWr(0x1000, 0);
+        gpuccWr(0x1050, 0);
+        gpuccWr(0x1020, cxo | 1u);
+        gpuccWr(0x1054, rbcpr | 1u);
+        gpuccWr(0x10d0, rbtimer | 1u);
+        gpuDelay(256);
+        IOLog("NATIVE_GPU_PWR: c1e2 gpucc cxrst=%08x->%08x rbcrprst=%08x->%08x "
+              "cxo=%08x->%08x rbcpr=%08x->%08x rbtimer=%08x->%08x\n",
+              cxReset, gpuccRd(0x1000), rbcprReset, gpuccRd(0x1050),
+              cxo, gpuccRd(0x1020), rbcpr, gpuccRd(0x1054),
+              rbtimer, gpuccRd(0x10d0));
         uint32_t branch = gpuccRd(0x1098);
         gpuccWr(0x1098, (branch | (1u << 13) | 1u) & ~(1u << 31));
         gpuDelay(256);
