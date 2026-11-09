@@ -68,19 +68,31 @@ struct Alloc {
     uint64_t phys;
     size_t bytes;
 
-    bool init(size_t size, uint64_t physicalMask = 0x0000000ffffff000ULL) {
+    bool init(size_t size, uint64_t physicalMask = 0x0000000ffffff000ULL,
+              uint64_t alignment = 0x1000) {
         unsigned options = (unsigned)kIODirectionInOut | (unsigned)kIOMemoryMapperNone |
                            (unsigned)kIOMemoryPhysicallyContiguous;
+        /* H236bh: sagit's stageZap over-allocates by alignment-4096 and aligns
+         * the image base inside the allocation. The a540 .b02 p_align is
+         * 1 MiB and PAS/imageInto require the physical base to honour it. */
+        if (!alignment || (alignment & (alignment - 1)) || alignment < 0x1000)
+            return false;
+        const size_t total = size + alignment - 0x1000;
         desc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, (IOOptionBits)options,
-            size, physicalMask);
+            total, physicalMask);
         if (!desc || desc->prepare() != kIOReturnSuccess)
             return false;
-        cpu = desc->getBytesNoCopy();
+        void *rawCpu = desc->getBytesNoCopy();
         IOByteCount length = 0;
-        phys = desc->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+        const uint64_t rawPhys = desc->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+        const uint64_t aligned = (rawPhys + alignment - 1) & ~(alignment - 1);
+        const uint64_t delta = aligned - rawPhys;
+        cpu = rawCpu ? static_cast<char *>(rawCpu) + delta : nullptr;
+        phys = aligned;
         bytes = size;
-        if (!cpu || (phys & 0xfff) || length < size || (phys + size) > 0x10000000000ULL)
+        if (!cpu || (phys & (alignment - 1)) || delta + size > length ||
+            (phys + size) > 0x10000000000ULL)
             return false;
         memset(cpu, 0, size);
         return true;
@@ -980,16 +992,17 @@ static void c3_thread(void *, wait_result_t) {
     /* H236bg: a hard low-4G allocation may block or fail on this kernel.
      * Try it, log the result, and fall back to the normal mask so the C3
      * still reaches the PAS calls and reports the real addresses. */
-    IOLog("NATIVE_GPU_C3: alloc zap low4g\n");
+    IOLog("NATIVE_GPU_C3: alloc zap low4g aligned\n");
     native_log_flush_hook();
-    bool zapHeaderLow = c->zapHeader.init(0x2000, 0x00000000fffff000ULL);
-    bool zapImageLow = c->zapImage.init(0x8000, 0x00000000fffff000ULL);
+    bool zapHeaderLow = c->zapHeader.init(0x2000, 0xffffffffULL, 0x1000);
+    bool zapImageLow = c->zapImage.init(0x2000, 0xffffffffULL, 0x100000);
     if (!zapHeaderLow || !zapImageLow) {
-        IOLog("NATIVE_GPU_C3: zap low4g failed h=%u i=%u, retry default\n",
+        IOLog("NATIVE_GPU_C3: zap low4g aligned failed h=%u i=%u\n",
               zapHeaderLow ? 1u : 0u, zapImageLow ? 1u : 0u);
         native_log_flush_hook();
-        if (!zapHeaderLow && !c->zapHeader.init(0x2000)) { c->put(0xdea00037u); gC3Done = 1; return; }
-        if (!zapImageLow && !c->zapImage.init(0x8000)) { c->put(0xdea00038u); gC3Done = 1; return; }
+        c->put(0xdea00037u);
+        gC3Done = 1;
+        return;
     }
     IOLog("NATIVE_GPU_C3: zap alloc mdt=%llx image=%llx\n",
           c->zapHeader.phys, c->zapImage.phys);
