@@ -142,6 +142,14 @@ static void cleanDcache(void *p, size_t bytes) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
+static void invalidateDcache(void *p, size_t bytes) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~UINT64_C(63);
+    uintptr_t e = (reinterpret_cast<uintptr_t>(p) + bytes + 63) & ~UINT64_C(63);
+    for (; a < e; a += 64)
+        __asm__ volatile("dc ivac, %0" : : "r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
 /* H236as: the A5xx PM4 headers carry odd-parity bits. Omitting them made the
  * CP reject CP_ME_INIT with an opcode error (CP_INTERRUPT_STATUS bit0) even
  * though the PFP had fetched the ring. The count field is the data-word
@@ -749,6 +757,42 @@ static bool gpmu_load(Ctx &c) {
     return true;
 }
 
+/* H236av: minimal submission proof. CP_MEM_WRITE goes through the same
+ * SID0/CB0 translation as the GPMU packets and stores a known value in the
+ * read/write scratch page; CP_WAIT_MEM_WRITES makes the completion ordering
+ * explicit before the CPU invalidates its cache line. */
+static bool submit_probe(Ctx &c) {
+    uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
+    const unsigned start = rd(CP_RB_RPTR);
+    unsigned n = start;
+    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    ring[n++] = (uint32_t)kRptrIova;
+    ring[n++] = (uint32_t)(kRptrIova >> 32);
+    ring[n++] = 0xDEADBEEFu;
+    ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
+    cleanDcache(ring + start, (n - start) * 4);
+    cleanDcache(c.rptr.cpu, kRptrBytes);
+    wr(CP_RB_WPTR, n);
+
+    bool done = false;
+    for (unsigned ms = 0; ms < 2000; ++ms) {
+        if (rd(CP_RB_RPTR) == n) {
+            done = true;
+            break;
+        }
+        spinMs(1);
+    }
+    invalidateDcache(c.rptr.cpu, kRptrBytes);
+    const uint32_t got = *reinterpret_cast<volatile uint32_t *>(c.rptr.cpu);
+    c.put(rd(CP_RB_RPTR));
+    c.put(got);
+    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u value=%08x done=%u\n",
+          rd(CP_RB_RPTR), n, got, done ? 1u : 0u);
+    if (!done || got != 0xDEADBEEFu)
+        return c.fail(30, "cp mem write");
+    return true;
+}
+
 } // namespace
 
 static Ctx *gC3;
@@ -784,6 +828,9 @@ static void c3_thread(void *, wait_result_t) {
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
 
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
+    IOLog("NATIVE_GPU_C3: submit probe\n");
+    if (!submit_probe(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: submit test ok\n");
     c->put(0x600d00c3u);
     gC3Done = 1;
 }
