@@ -68,12 +68,12 @@ struct Alloc {
     uint64_t phys;
     size_t bytes;
 
-    bool init(size_t size) {
+    bool init(size_t size, uint64_t physicalMask = 0x0000000ffffff000ULL) {
         unsigned options = (unsigned)kIODirectionInOut | (unsigned)kIOMemoryMapperNone |
                            (unsigned)kIOMemoryPhysicallyContiguous;
         desc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, (IOOptionBits)options,
-            size, 0x0000000ffffff000ULL);
+            size, physicalMask);
         if (!desc || desc->prepare() != kIOReturnSuccess)
             return false;
         cpu = desc->getBytesNoCopy();
@@ -977,8 +977,10 @@ static void c3_thread(void *, wait_result_t) {
     if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); gC3Done = 1; return; }
     if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
     if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
-    if (!c->zapHeader.init(0x2000)) { c->put(0xdea00037u); gC3Done = 1; return; }
-    if (!c->zapImage.init(0x8000)) { c->put(0xdea00038u); gC3Done = 1; return; }
+    /* H236bf: the SCM PAS physical-address arguments are 32-bit; the ZAP
+     * header and image must live below 4 GiB or TrustZone truncates them. */
+    if (!c->zapHeader.init(0x2000, 0x00000000fffff000ULL)) { c->put(0xdea00037u); gC3Done = 1; return; }
+    if (!c->zapImage.init(0x8000, 0x00000000fffff000ULL)) { c->put(0xdea00038u); gC3Done = 1; return; }
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
