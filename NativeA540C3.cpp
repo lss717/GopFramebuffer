@@ -261,9 +261,9 @@ static bool smmu_setup(Ctx &c) {
 
     ArmSmmu4KRange r[5] = {
         { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
-        { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead | ArmSmmu4KPrivileged, 0, 3 },
-        { kPfpIova, c.pfp.phys, (c.pfp.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead | ArmSmmu4KPrivileged, 0, 3 },
-        { kGpmuIova, c.gpmu.phys, (c.gpmu.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead | ArmSmmu4KPrivileged, 0, 3 },
+        { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
+        { kPfpIova, c.pfp.phys, (c.pfp.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
+        { kGpmuIova, c.gpmu.phys, (c.gpmu.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kRptrIova, c.rptr.phys, kRptrBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
     };
     if (ArmSmmu4KBuild(&c.cfg, r, 5, reinterpret_cast<uint64_t *>(c.tables.cpu),
@@ -326,11 +326,6 @@ static bool cp_init(Ctx &c) {
     memcpy(c.pfp.cpu, a540_fw_pfp + 4, a540_fw_pfp_size - 4);
     cleanDcache(c.pm4.cpu, c.pm4.bytes);
     cleanDcache(c.pfp.cpu, c.pfp.bytes);
-
-    /* H236ab: the GPU comes up in secured mode; clear RBBM_SECVID_TRUST_CNTL
-     * before the CP fetches the ring/microcode from non-secure memory. */
-    wr(0xf400 * 4, 0);
-    __asm__ volatile("dsb sy" ::: "memory");
 
     wr(CP_RB_RPTR_ADDR_LO, (uint32_t)kRptrIova);
     wr(CP_RB_RPTR_ADDR_HI, (uint32_t)(kRptrIova >> 32));
