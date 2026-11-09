@@ -157,10 +157,16 @@ struct Ctx {
 };
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
-// ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 does not set those
-// and uses the vendor arm-smmu.c layout: GR1 = base + 0x1000, CB0 = base +
-// 0x8000 (size/2), SMR/S2CR at 0x800/0xc00. Program the same stage-1 image
-// directly when the kit reports Unsupported.
+// ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 uses the vendor
+// arm-smmu.c layout (GR1 = base + 0x1000, CB0 = base + 0x8000 = reg_size/2,
+// SMR/S2CR at 0x800/0xc00). Program the same stage-1 image directly when the
+// kit reports Unsupported.
+//
+// H236u: the device tree marks the GPU SMMU qcom,skip-init + qcom,dynamic, so
+// the bootloader may already own CB0 and the stream mapping. Writing CBA2R or
+// CBAR while that bank is enabled is architecturally unpredictable and is the
+// best explanation for H236t's ~70 s heartbeat block. Read the bank first and
+// refuse instead of touching a live context.
 static bool smmu_direct(Ctx &c) {
     const uint64_t root = c.tables_result.root_physical;
     const size_t CB = 0x8000, CBAR = 0x1000, CBA2R = 0x1800, SMR = 0x800, S2CR = 0xc00;
@@ -169,6 +175,22 @@ static bool smmu_direct(Ctx &c) {
     uint64_t ttbr0 = (UINT64_C(1) << 48) | root;                    /* ASID 1 */
     uint64_t ttbr1 = (UINT64_C(1) << 48);
     uint32_t sctlr = 0x1067u | (1u << 8);                           /* CFCFG */
+
+    uint32_t live_sctlr = 0, live_fsr = 0, live_s2cr = 0, live_smr = 0;
+    if (c.io.read32(c.io.cookie, CB, &live_sctlr) ||
+        c.io.read32(c.io.cookie, CB + 0x58, &live_fsr) ||
+        c.io.read32(c.io.cookie, CBA2R, &live_s2cr) ||
+        c.io.read32(c.io.cookie, SMR, &live_smr))
+        return c.fail(7, "direct smmu read");
+    if (live_sctlr & 1) {
+        c.put(live_sctlr);
+        c.put(live_fsr);
+        c.put(live_s2cr);
+        c.put(live_smr);
+        IOLog("NATIVE_GPU_C3: cb0 already enabled sctlr=%08x fsr=%08x cba2r=%08x smr=%08x\n",
+              live_sctlr, live_fsr, live_s2cr, live_smr);
+        return c.fail(9, "cb0 enabled");
+    }
 
     if (c.io.write32(c.io.cookie, CBA2R, 1) ||
         c.io.write32(c.io.cookie, CBAR, 0x1f300u) ||

@@ -63,7 +63,7 @@ static volatile int gSpmiDone;
 // C1e-2: PM8005 S1 survey/sequence results, emitted through the gc= channel as soon as
 // each one is produced (index 80 and up). Keeping them ahead of the one-per-beat GPUCC
 // survey means a failed write at boot still reaches the pulled log in this boot.
-static volatile uint32_t gSpmi2Words[64];
+static volatile uint32_t gSpmi2Words[96];
 static volatile int gSpmi2Count;
 // C1e-2: SPMI PMIC-arbiter transport state (see the C1e-2 block below).
 static IOMemoryMap *gSpmiCoreMap, *gSpmiCnfgMap, *gSpmiChnlsMap, *gSpmiObsrvrMap;
@@ -753,9 +753,45 @@ static uint32_t gS1[8];
 static unsigned gS1Ok;
 static int gS1Uv = -1;
 
+// H236u: read-only SMMU survey (sheng-gpu-power=8, one register per heartbeat).
+// H236t wrote CBA2R/CBAR/CB0 without first observing the bank and blocked the
+// heartbeat for ~70 s with no C3 line. The device tree marks the GPU SMMU
+// qcom,skip-init + qcom,dynamic, so the bootloader may own CB0 and the SMR/S2CR
+// stream mapping; writing those registers while the bank is enabled is
+// architecturally unpredictable. Observe before writing:
+//   GR0 0x000 sCR0, 0x020.. ID0..ID3, 0x048 sGFSR,
+//       0x400/0x420.. the secure-config alias the vendor driver uses,
+//       0x800+ SMR[n], 0xc00+ S2CR[n];
+//   GR1 0x1000 CBAR0, 0x1800 CBA2R0;
+//   implementation page 0x2000 and micro-MMU control at 0x6000 (halt bit 2,
+//   idle bit 3; arm_smmu_impl_def_programming halts before writing);
+//   CB0 at reg_size/2 = 0x8000: SCTLR/ACTLR/TTBCR2/TTBR0/TTBCR/CONTEXTIDR/FSR,
+//   plus CB1 and the secure CB2 SCTLR.
+// Values go through the gc= heartbeat channel (one per beat), so every reading
+// before a blocking register survives the log window.
+static IOMemoryMap *gSmmuSurveyMap;
+static volatile uint32_t *gSmmuSurveyBase;
+static uint32_t gSmmuId0, gSmmuId1, gSmmuId2, gSmmuCb0, gSmmuSmr0, gSmmuS2cr0, gSmmuMicro;
+static const struct { uint32_t off; const char *name; } kSmmuSurvey[] = {
+    { 0x0000, "scr0" },
+    { 0x0020, "id0" }, { 0x0024, "id1" }, { 0x0028, "id2" }, { 0x002c, "id3" },
+    { 0x0048, "sgfsr" },
+    { 0x0400, "ns_scr0" }, { 0x0420, "ns_id0" }, { 0x0424, "ns_id1" }, { 0x0428, "ns_id2" },
+    { 0x0800, "smr0" }, { 0x0804, "smr1" }, { 0x0808, "smr2" },
+    { 0x0c00, "s2cr0" }, { 0x0c04, "s2cr1" }, { 0x0c08, "s2cr2" },
+    { 0x1000, "cbar0" }, { 0x1800, "cba2r0" },
+    { 0x2000, "impl_def0" }, { 0x6000, "micro_mmu_ctrl" },
+    { 0x8000, "cb0_sctlr" }, { 0x8004, "cb0_actlr" }, { 0x8010, "cb0_ttbcr2" },
+    { 0x8020, "cb0_ttbr0_lo" }, { 0x8024, "cb0_ttbr0_hi" }, { 0x8030, "cb0_ttbcr" },
+    { 0x8034, "cb0_contextidr" }, { 0x8058, "cb0_fsr" },
+    { 0x9000, "cb1_sctlr" }, { 0xa000, "cb2_sctlr" },
+    { 0x0020, "id0_again" }, { 0x8000, "cb0_again" },
+};
+static const unsigned kSmmuSurveyCount = sizeof(kSmmuSurvey) / sizeof(kSmmuSurvey[0]);
+
 static int sheng_spmi_power_step(int mode) {
     static unsigned step;
-    if (mode < 2 || step > 40)
+    if (mode < 2 || step > 96)
         return 0;
     if (step == 0) {
         if (!gGpuccBase) {
@@ -1147,6 +1183,64 @@ static int sheng_spmi_power_step(int mode) {
         IOLog("NATIVE_GPU_PWR: c1e2 c3 survey done\n");
         step = 99;
         return 0;
+    }
+    if (step >= 23 && mode == 8) {
+        // H236u: read-only SMMU survey. Nothing here writes a register.
+        unsigned k = step - 23;
+        if (k == 0) {
+            IODeviceMemory *mem = IODeviceMemory::withRange(0x5040000ULL, 0x10000);
+            IOMemoryMap *map = mem ?
+                mem->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+            OSSafeReleaseNULL(mem);
+            gSmmuSurveyBase = map ?
+                reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()) : nullptr;
+            if (!gSmmuSurveyBase) {
+                sheng_spmi2_record(0xdea00041u);
+                IOLog("NATIVE_GPU_PWR: c1e2 smmu survey map failed\n");
+                step = 99;
+                return 0;
+            }
+            gSmmuSurveyMap = map;
+            sheng_spmi2_record(0x600d0058u);
+            IOLog("NATIVE_GPU_PWR: c1e2 smmu survey start\n");
+            ++step;
+            return 1;
+        }
+        if (k <= kSmmuSurveyCount) {
+            unsigned at = k - 1;
+            uint32_t value = osmRead(gSmmuSurveyBase, kSmmuSurvey[at].off);
+            sheng_spmi2_record(value);
+            if (!__builtin_strcmp(kSmmuSurvey[at].name, "id0")) gSmmuId0 = value;
+            else if (!__builtin_strcmp(kSmmuSurvey[at].name, "id1")) gSmmuId1 = value;
+            else if (!__builtin_strcmp(kSmmuSurvey[at].name, "id2")) gSmmuId2 = value;
+            else if (!__builtin_strcmp(kSmmuSurvey[at].name, "cb0_sctlr")) gSmmuCb0 = value;
+            else if (!__builtin_strcmp(kSmmuSurvey[at].name, "smr0")) gSmmuSmr0 = value;
+            else if (!__builtin_strcmp(kSmmuSurvey[at].name, "s2cr0")) gSmmuS2cr0 = value;
+            else if (!__builtin_strcmp(kSmmuSurvey[at].name, "micro_mmu_ctrl")) gSmmuMicro = value;
+            IOLog("NATIVE_GPU_PWR: c1e2 smmu %-15s @%05x = %08x\n",
+                  kSmmuSurvey[at].name, kSmmuSurvey[at].off, value);
+            if (k == kSmmuSurveyCount) {
+                sheng_spmi2_record(0x600d0059u);
+                IOLog("NATIVE_GPU_PWR: c1e2 smmu id0=%08x id1=%08x id2=%08x cb0=%08x "
+                      "smr0=%08x s2cr0=%08x micro=%08x\n",
+                      gSmmuId0, gSmmuId1, gSmmuId2, gSmmuCb0,
+                      gSmmuSmr0, gSmmuS2cr0, gSmmuMicro);
+                IOLog("NATIVE_GPU_PWR: c1e2 smmu id0 s1ts=%u s2ts=%u sms=%u smrg=%u | "
+                      "id1 pg=%u pages=%u cb=%u s2cb=%u | id2 ias=%u oas=%u ubs=%u ptfs=%u%u%u\n",
+                      (gSmmuId0 >> 30) & 1u, (gSmmuId0 >> 29) & 1u, (gSmmuId0 >> 27) & 1u,
+                      gSmmuId0 & 0xffu,
+                      (gSmmuId1 >> 31) & 1u, 1u << (((gSmmuId1 >> 28) & 7u) + 1u),
+                      gSmmuId1 & 0xffu, (gSmmuId1 >> 16) & 0xffu,
+                      gSmmuId2 & 0xfu, (gSmmuId2 >> 4) & 0xfu, (gSmmuId2 >> 8) & 0xfu,
+                      (gSmmuId2 >> 12) & 1u, (gSmmuId2 >> 13) & 1u, (gSmmuId2 >> 14) & 1u);
+                OSSafeReleaseNULL(gSmmuSurveyMap);
+                gSmmuSurveyBase = nullptr;
+                step = 99;
+                return 0;
+            }
+            ++step;
+            return 1;
+        }
     }
     IOLog("NATIVE_GPU_PWR: c1e2 sequence done\n");
     step = 99;
