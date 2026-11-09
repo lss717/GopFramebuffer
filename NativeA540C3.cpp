@@ -765,6 +765,11 @@ static bool submit_probe(Ctx &c) {
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
+    /* H236ay: run the write probes outside protected mode and record the
+     * secure/ME state, so a dropped data write can be separated from a ME
+     * that stopped executing after the GPMU load. */
+    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
+    ring[n++] = 0;
     /* H236aw: standard CACHE_FLUSH_TS writes a 64-bit timestamp to offset 0;
      * CP_MEM_WRITE stores the known word at offset 8. Two independent
      * probes distinguish a dead memory path from a CP_MEM_WRITE-only issue. */
@@ -784,6 +789,8 @@ static bool submit_probe(Ctx &c) {
     ring[n++] = (uint32_t)kRingScratch;
     ring[n++] = (uint32_t)(kRingScratch >> 32);
     ring[n++] = 0xCAFEBABEu;
+    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
+    ring[n++] = 1;
     ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
     cleanDcache(ring + start, (n - start) * 4);
     cleanDcache(c.rptr.cpu, kRptrBytes);
@@ -811,8 +818,10 @@ static bool submit_probe(Ctx &c) {
     c.put(got);
     IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x ring=%08x done=%u\n",
           rd(CP_RB_RPTR), n, tsHi, tsLo, got, ringGot, done ? 1u : 0u);
-    IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x fsr=%08x rbbm=%08x\n",
-          cpInt, hwFault, fsr, rd(RBBM_STATUS_REG));
+    IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x fsr=%08x rbbm=%08x "
+          "trust=%08x me=%08x mestat=%08x\n",
+          cpInt, hwFault, fsr, rd(RBBM_STATUS_REG), rd(0x0f400 * R),
+          rd(CP_ME_CNTL_REG), rd(0x0b14 * R));
     if (!done || got != 0xDEADBEEFu || ringGot != 0xCAFEBABEu)
         return c.fail(30, "cp mem write");
     return true;
