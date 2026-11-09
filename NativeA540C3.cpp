@@ -335,6 +335,8 @@ static bool cp_init(Ctx &c) {
     cleanDcache(c.pm4.cpu, c.pm4.bytes);
     cleanDcache(c.pfp.cpu, c.pfp.bytes);
 
+    c.put(rd(0x13d4));            /* RBBM_STATUS before the CP writes */
+
     /* H236ad: a5xx_start() programs the CP queue thresholds before the ring;
      * zero-sized ME queues keep the ME from consuming ME_INIT. */
     wr(0x2094, 0x40);            /* CP_MEQ_THRESHOLDS (A540) */
@@ -381,6 +383,9 @@ static bool cp_init(Ctx &c) {
     c.put(rd(CP_PFP_INSTR_LO));
     invalidateDcache(c.rptr.cpu, 64);
     c.put(reinterpret_cast<volatile uint32_t *>(c.rptr.cpu)[0]);  /* RPTR shadow */
+    c.put(rd(0x48));              /* sGFSR (unmatched/SID faults) */
+    c.put(rd(0x8058));            /* CB0 FSR */
+    c.put(rd(0x8060));            /* CB0 FAR_LO */
     if (rd(CP_RB_RPTR) != n)
         return c.fail(11, "cp me init");
     return true;
