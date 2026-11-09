@@ -337,6 +337,21 @@ static bool cp_init(Ctx &c) {
 
     c.put(rd(0x13d4));            /* RBBM_STATUS before the CP writes */
 
+    /* H236ag: the bootloader leaves the CP in an unknown (possibly halted)
+     * state, so writing INSTR_BASE + ME_CNTL=0 may never reload the
+     * microcode. Pulse the GPU block reset (RBBM excluded, same value the
+     * vendor uses when RBBM itself cannot be reset) and re-init afterwards.
+     * The SMMU lives outside these blocks and keeps its context. */
+    wr(0x45 * 4, 0xffdffc0u);
+    wr(0x46 * 4, 0x1fffffffu);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    wr(0x45 * 4, 0);
+    wr(0x46 * 4, 0);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    c.put(rd(0x13d4));
+
     /* H236af: a5xx_start() starts VBIF before the CP. Without it the CP's
      * memory fetch can hang and RBBM stays busy. a540_vbif = two writes. */
     wr(0xc124, 0x00000003u);     /* A5XX_VBIF_ROUND_ROBIN_QOS_ARB */
