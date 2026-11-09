@@ -109,9 +109,9 @@ struct Alloc {
 static GpuWindow gGpu;
 static GpuWindow gSmmu;
 
-static bool mapWindow(uint64_t base, uint64_t bytes, GpuWindow *w) {
+static bool mapWindowFlags(uint64_t base, uint64_t bytes, IOOptionBits cache, GpuWindow *w) {
     IODeviceMemory *mem = IODeviceMemory::withRange(base, bytes);
-    IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | cache) : nullptr;
     OSSafeReleaseNULL(mem);
     if (!map)
         return false;
@@ -123,6 +123,19 @@ static bool mapWindow(uint64_t base, uint64_t bytes, GpuWindow *w) {
     w->map = map;
     w->base = p;
     return true;
+}
+
+static bool mapWindow(uint64_t base, uint64_t bytes, GpuWindow *w) {
+    return mapWindowFlags(base, bytes, kIOMapInhibitCache, w);
+}
+
+/* H236cw: the ZAP mdt/image live in ordinary WB DRAM reserved by DarwinBoot,
+ * not in device MMIO. Mapping them uncached makes the kernel's memset/memcpy
+ * (16-byte stores) take an alignment fault on Device-nGnRnE, which is exactly
+ * the "Unaligned kernel data abort" at _bzero seen after zap shutdown. Map
+ * them copyback; cleanDcache() still pushes the bytes to PoC before each SMC. */
+static bool mapWindowCached(uint64_t base, uint64_t bytes, GpuWindow *w) {
+    return mapWindowFlags(base, bytes, kIOMapCopybackCache, w);
 }
 
 static GpuWindow gGcc;
@@ -1008,8 +1021,8 @@ static void c3_thread(void *, wait_result_t) {
         gC3Done = 1;
         return;
     }
-    if (!mapWindow(zapBase, 0x2000, &c->zapHeaderWindow) ||
-        !mapWindow(zapBase + 0x100000, 0x2000, &c->zapImageWindow)) {
+    if (!mapWindowCached(zapBase, 0x2000, &c->zapHeaderWindow) ||
+        !mapWindowCached(zapBase + 0x100000, 0x2000, &c->zapImageWindow)) {
         IOLog("NATIVE_GPU_C3: zap boot window map failed\n");
         native_log_flush_hook();
         c->put(0xdea00038u);
