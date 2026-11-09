@@ -656,8 +656,7 @@ static volatile uint32_t *gGpuRegs;
 static volatile uint32_t *sheng_gpu_regs(void) {
     if (!gGpuRegs) {
         IODeviceMemory *mem = IODeviceMemory::withRange(0x5000000ULL, 0x40000);
-        IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache |
-                                          kIOMapReadOnly) : nullptr;
+        IOMemoryMap *map = mem ? mem->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
         OSSafeReleaseNULL(mem);
         if (!map)
             return nullptr;
@@ -670,6 +669,15 @@ static volatile uint32_t *sheng_gpu_regs(void) {
         gGpuRegs = p;
     }
     return gGpuRegs;
+}
+static uint32_t gpuRegRd(uint32_t off) {
+    return gGpuRegs ? osmRead(gGpuRegs, off) : 0xffffffffu;
+}
+static void gpuRegWr(uint32_t off, uint32_t value) {
+    if (!gGpuRegs)
+        return;
+    gGpuRegs[off / 4] = value;
+    __asm__ volatile ("dmb oshst" ::: "memory");
 }
 // First C3 step: read-only A5xx CP/GPMU/RBBM survey. Values are dword offsets
 // from a5xx_reg.h multiplied by four. No block is reset or clocked here.
@@ -783,6 +791,15 @@ static int sheng_spmi_power_step(int mode) {
             step = 99;
             return 0;
         }
+        // A previous boot can leave S1 enabled. Reads of the FTS426 voltage
+        // register while the rail is live are not reliable on this PMIC, so
+        // disable it once before the identity/voltage survey. The GPU is off
+        // at this point (GX GDSC collapsed).
+        int drc = sheng_spmi_write((uint16_t)(kPm8005S1Base + kPm8005Enable), 0u, 1);
+        sheng_spmi2_record(drc ? sheng_spmi_err(drc) : 0x600d0003u);
+        IOLog("NATIVE_GPU_PWR: c1e2 s1 pre-disable rc=%d status=%08x\n",
+              drc, gSpmiLastStatus);
+        gpuDelay(256);
         ++step;
         return 1;
     }
@@ -959,7 +976,27 @@ static int sheng_spmi_power_step(int mode) {
     if (step == 20) {
         // Fabia PLL (gpupll0): 1028 MHz VCO, even post-div /2 -> 514 MHz,
         // gfx3d RCG /2 -> 257 MHz. L = 1028/19.2 = 53, alpha = 0x8aab.
-        // USER_CTL_LO already selects the even /2 output and main output (0x107).
+        // A warm reset can leave the PLL and root running from the previous
+        // boot. Re-running the reset sequence with the root enabled is not
+        // safe; if the PLL is already locked at L=53 just re-assert the output
+        // and keep the root for step 21.
+        uint32_t mode0 = gpuccRd(0x00);
+        uint32_t l0 = gpuccRd(0x04);
+        if ((mode0 & (1u << 31)) && l0 == 53u) {
+            gpuccWr(0x0c, gpuccRd(0x0c) | 7u);
+            gpuccWr(0x00, mode0 | 1u);
+            gpuDelay(256);
+            sheng_spmi2_record(gpuccRd(0x00));
+            sheng_spmi2_record(gpuccRd(0x04));
+            IOLog("NATIVE_GPU_PWR: c1e2 pll already locked mode=%08x l=%08x\n",
+                  gpuccRd(0x00), gpuccRd(0x04));
+            ++step;
+            return 1;
+        }
+        // Stop the branch and root before touching the PLL.
+        gpuccWr(0x1098, gpuccRd(0x1098) | (1u << 31));
+        gpuccWr(0x1070, (gpuccRd(0x1070) & ~(1u << 31)) & ~2u);
+        gpuDelay(128);
         gpuccWr(0x04, 53u);                 /* L_VAL */
         gpuccWr(0x08, 53u);                 /* CAL_L_VAL */
         gpuccWr(0x38, 0x8aabu);             /* ALPHA (16-bit) */
@@ -1031,7 +1068,48 @@ static int sheng_spmi_power_step(int mode) {
         ++step;
         return 1;
     }
-    if (step >= 23 && mode >= 5) {
+    if (step >= 23 && mode == 6) {
+        if (step == 23) {
+            // Do NOT issue a standalone RBBM_SW_RESET here: the vendor soft reset
+            // resets the whole GPU logic and must be followed by the full a5xx
+            // restart (power state, VBIF, microcode, ringbuffer). Reading the bus
+            // after the reset without that sequence hangs. Only sample the state.
+            sheng_spmi2_record(gpuRegRd(0x13d4));   /* RBBM_STATUS */
+            sheng_spmi2_record(gpuRegRd(0x20c8));   /* CP_ME_CNTL */
+            IOLog("NATIVE_GPU_PWR: c1e2 c3 reset skipped rbbm=%08x cp=%08x\n",
+                  gpuRegRd(0x13d4), gpuRegRd(0x20c8));
+            ++step;
+            return 1;
+        }
+        if (step == 24) {
+            // A540 CP queue thresholds from a5xx_start(); CP microcode is not loaded.
+            gpuRegWr(0x2094, 0x00000040u);  /* CP_MEQ_THRESHOLDS */
+            gpuRegWr(0x2098, 0x00000400u);  /* CP_MERCIU_SIZE */
+            gpuRegWr(0x2080, 0x80000060u);  /* CP_ROQ_THRESHOLDS_2 */
+            gpuRegWr(0x207c, 0x40201B16u);  /* CP_ROQ_THRESHOLDS_1 */
+            __asm__ volatile ("dmb oshst" ::: "memory");
+            gpuDelay(512);
+            sheng_spmi2_record(0x600d0006u);
+            sheng_spmi2_record(gpuRegRd(0x20c8));
+            IOLog("NATIVE_GPU_PWR: c1e2 c3 cp thresholds cp=%08x\n", gpuRegRd(0x20c8));
+            ++step;
+            return 1;
+        }
+        if (step == 25) {
+            sheng_spmi2_record(gpuRegRd(0x13d4));   /* RBBM_STATUS */
+            sheng_spmi2_record(gpuRegRd(0x2a360));  /* GPMU_CM3_SYSRESET */
+            sheng_spmi2_record(gpuRegRd(0x2a380));  /* GPMU_GENERAL_0 */
+            sheng_spmi2_record(gpuRegRd(0x20c8));   /* CP_ME_CNTL */
+            IOLog("NATIVE_GPU_PWR: c1e2 c3 state rbbm=%08x cm3=%08x gen0=%08x cp=%08x\n",
+                  gpuRegRd(0x13d4), gpuRegRd(0x2a360), gpuRegRd(0x2a380), gpuRegRd(0x20c8));
+            ++step;
+            return 1;
+        }
+        IOLog("NATIVE_GPU_PWR: c1e2 c3 reset/threshold step done\n");
+        step = 99;
+        return 0;
+    }
+    if (step >= 23 && mode == 5) {
         unsigned k = step - 23;
         if (k < sizeof(kA5xxRegs) / sizeof(kA5xxRegs[0])) {
             volatile uint32_t *base = sheng_gpu_regs();
