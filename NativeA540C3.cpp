@@ -765,8 +765,16 @@ static bool submit_probe(Ctx &c) {
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
-    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    /* H236aw: standard CACHE_FLUSH_TS writes a 64-bit timestamp to offset 0;
+     * CP_MEM_WRITE stores the known word at offset 8. Two independent
+     * probes distinguish a dead memory path from a CP_MEM_WRITE-only issue. */
+    ring[n++] = type7(0x46 /*CP_EVENT_WRITE*/, 4);
+    ring[n++] = 4u | (1u << 31);                  /* CACHE_FLUSH_TS + IRQ */
     ring[n++] = (uint32_t)kRptrIova;
+    ring[n++] = (uint32_t)(kRptrIova >> 32);
+    ring[n++] = 0x12345678u;
+    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    ring[n++] = (uint32_t)(kRptrIova + 8);
     ring[n++] = (uint32_t)(kRptrIova >> 32);
     ring[n++] = 0xDEADBEEFu;
     ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
@@ -783,11 +791,17 @@ static bool submit_probe(Ctx &c) {
         spinMs(1);
     }
     invalidateDcache(c.rptr.cpu, kRptrBytes);
-    const uint32_t got = *reinterpret_cast<volatile uint32_t *>(c.rptr.cpu);
+    const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
+    const uint32_t tsLo = scratch[0], tsHi = scratch[1], got = scratch[2];
+    const uint32_t cpInt = rd(CP_INT_STATUS), hwFault = rd(0x0b1a * R);
+    uint32_t fsr = 0;
+    c.io.read32(c.io.cookie, 0x8058, &fsr);
     c.put(rd(CP_RB_RPTR));
     c.put(got);
-    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u value=%08x done=%u\n",
-          rd(CP_RB_RPTR), n, got, done ? 1u : 0u);
+    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x done=%u\n",
+          rd(CP_RB_RPTR), n, tsHi, tsLo, got, done ? 1u : 0u);
+    IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x fsr=%08x rbbm=%08x\n",
+          cpInt, hwFault, fsr, rd(RBBM_STATUS_REG));
     if (!done || got != 0xDEADBEEFu)
         return c.fail(30, "cp mem write");
     return true;
