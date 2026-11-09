@@ -14,6 +14,8 @@
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
 
+extern "C" void native_log_flush_hook(void);
+
 extern "C" {
 #include "ArmSmmu4K.h"
 #include "ArmSmmu4KContext.h"
@@ -359,21 +361,28 @@ static bool gpu_reset(Ctx &c) {
     if (!gGpu.base && !mapWindow(kGpuBase, kGpuBytes, &gGpu))
         return c.fail(12, "gpu map reset");
     c.put(rd(RBBM_STATUS_REG));
+    IOLog("NATIVE_GPU_C3: reset halt write me=%08x vbif=%08x\n",
+          rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
+    native_log_flush_hook();
     wr(RBBM_INT_MASK, 0);
     wr(CP_ME_CNTL_REG, kCpHalt);
     wr(VBIF_HALT, 0xf);
-    if (!waitReg(CP_ME_CNTL_REG, kCpHalt, kCpHalt, 20000) ||
-        !waitReg(VBIF_HALTED, 0xf, 0xf, 20000)) {
-        c.put(rd(CP_ME_CNTL_REG));
-        c.put(rd(VBIF_HALTED));
-        IOLog("NATIVE_GPU_C3: reset halt me=%08x vbif=%08x\n",
-              rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
+    bool meHalted = waitReg(CP_ME_CNTL_REG, kCpHalt, kCpHalt, 20000);
+    IOLog("NATIVE_GPU_C3: reset halt me=%08x ok=%u\n", rd(CP_ME_CNTL_REG), meHalted ? 1u : 0u);
+    native_log_flush_hook();
+    bool vbifHalted = waitReg(VBIF_HALTED, 0xf, 0xf, 20000);
+    IOLog("NATIVE_GPU_C3: reset vbif=%08x ok=%u\n", rd(VBIF_HALTED), vbifHalted ? 1u : 0u);
+    native_log_flush_hook();
+    if (!meHalted || !vbifHalted)
         return c.fail(12, "gpu halt");
-    }
+    IOLog("NATIVE_GPU_C3: reset pulse\n");
+    native_log_flush_hook();
     wr(RBBM_SW_RESET_CMD_, 1);
     (void)rd(RBBM_SW_RESET_CMD_);
     wr(RBBM_SW_RESET_CMD_, 0);
     for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    IOLog("NATIVE_GPU_C3: reset pulse done rst=%08x\n", rd(RBBM_SW_RESET_CMD_));
+    native_log_flush_hook();
     wr(RBBM_INT_MASK, 0);
     wr(CP_ME_CNTL_REG, kCpHalt);
     wr(VBIF_HALT, 0xf);
@@ -484,6 +493,8 @@ static bool cp_init(Ctx &c) {
     wr(CP_RB_BASE, (uint32_t)kRingIova);
     wr(CP_RB_BASE_HI, (uint32_t)(kRingIova >> 32));
     wr(CP_CONTEXT_SWITCH, 0);
+    IOLog("NATIVE_GPU_C3: cp configure done\n");
+    native_log_flush_hook();
     wr(CP_RB_CNTL, kRingControl);
     wr(CP_RB_WPTR, 0);
     wr(RBBM_INT_MASK, 0);
