@@ -623,7 +623,13 @@ static bool cp_init(Ctx &c) {
         if (((ints & 0x7e) || (cpints & 0x3f)) && firstMs == ~0u) {
             firstInts = ints; firstCpints = cpints; firstStatus = status; firstMs = ms;
         }
-        if (rd(CP_RB_READ) == n && !(status & ~1u) && !(rd(RBBM_STATUS3_REG) & (1u << 24))) {
+        /* H236at: after the PM4 headers were fixed, the CP busy bits
+         * (CP_ME/CP_PFP/CP_ETS/CP_CRASH/GPMU_MASTER/CP_BUSY, mask 0x7e) and
+         * CP_ME_CNTL all read 0, but the global GPU_BUSY_IGN_AHB/HYST bits
+         * (31/30/8) stay set while the 3D blocks are not power-collapsed.
+         * Those are not CP idle indicators; do not wait for them. */
+        if (rd(CP_RB_READ) == n && !(status & 0x7eu) &&
+            !(rd(RBBM_STATUS3_REG) & (1u << 24))) {
             idle = true;
             break;
         }
