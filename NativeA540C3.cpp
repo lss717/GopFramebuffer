@@ -128,6 +128,14 @@ static void cleanDcache(void *p, size_t bytes) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
+static void invalidateDcache(void *p, size_t bytes) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~UINT64_C(63);
+    uintptr_t e = (reinterpret_cast<uintptr_t>(p) + bytes + 63) & ~UINT64_C(63);
+    for (; a < e; a += 64)
+        __asm__ volatile("dc ivac, %0" : : "r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
 static uint32_t type4(uint32_t addr, uint32_t count) {
     return 0x40000000u | ((count - 1) << 16) | (addr & 0xffffu);
 }
@@ -327,6 +335,13 @@ static bool cp_init(Ctx &c) {
     cleanDcache(c.pm4.cpu, c.pm4.bytes);
     cleanDcache(c.pfp.cpu, c.pfp.bytes);
 
+    /* H236ad: a5xx_start() programs the CP queue thresholds before the ring;
+     * zero-sized ME queues keep the ME from consuming ME_INIT. */
+    wr(0x2094, 0x40);            /* CP_MEQ_THRESHOLDS (A540) */
+    wr(0x2098, 0x400);           /* CP_MERCIU_SIZE */
+    wr(0x2080, 0x80000060u);     /* CP_ROQ_THRESHOLDS_2 */
+    wr(0x207c, 0x40201b16u);     /* CP_ROQ_THRESHOLDS_1 */
+
     wr(CP_RB_RPTR_ADDR_LO, (uint32_t)kRptrIova);
     wr(CP_RB_RPTR_ADDR_HI, (uint32_t)(kRptrIova >> 32));
     wr(CP_RB_CNTL, (2u << 8) | 12u);            /* 32 KiB ring, 4-byte? */
@@ -364,6 +379,8 @@ static bool cp_init(Ctx &c) {
     c.put(rd(CP_ME_CNTL));
     c.put(rd(CP_RB_WPTR));
     c.put(rd(CP_PFP_INSTR_LO));
+    invalidateDcache(c.rptr.cpu, 64);
+    c.put(reinterpret_cast<volatile uint32_t *>(c.rptr.cpu)[0]);  /* RPTR shadow */
     if (rd(CP_RB_RPTR) != n)
         return c.fail(11, "cp me init");
     return true;
