@@ -321,6 +321,7 @@ static bool smmu_setup(Ctx &c) {
 // adreno_a5xx sequence. DWORD indices scaled to bytes.
 namespace {
 constexpr uint32_t R             = 4;
+constexpr uint32_t RBBM_SW_RESET_CMD_   = 0x0043 * R;
 constexpr uint32_t RBBM_INT_MASK        = 0x0038 * R;
 constexpr uint32_t RBBM_INT_CLEAR       = 0x0037 * R;
 constexpr uint32_t RBBM_INT_STATUS      = 0x04e1 * R;
@@ -374,10 +375,19 @@ static bool gpu_reset(Ctx &c) {
     native_log_flush_hook();
     if (!meHalted || !vbifHalted)
         return c.fail(12, "gpu halt");
-    /* H236aj: the RBBM_SW_RESET_CMD pulse itself hangs the AP bus on this
-     * board even with the CP and VBIF halted, so it cannot be used from the
-     * kernel. Keep the halted state and let the ME reload from INSTR_BASE. */
-    IOLog("NATIVE_GPU_C3: reset pulse skipped\n");
+    /* H236al: the reference does write-1 / dummy-read / write-0. The dummy
+     * read may be what wedges the bus while RBBM is in reset, so pulse
+     * without reading and log each write separately. */
+    IOLog("NATIVE_GPU_C3: reset w1\n");
+    native_log_flush_hook();
+    wr(RBBM_SW_RESET_CMD_, 1);
+    IOLog("NATIVE_GPU_C3: reset w1 done\n");
+    native_log_flush_hook();
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
+    wr(RBBM_SW_RESET_CMD_, 0);
+    IOLog("NATIVE_GPU_C3: reset w0 done\n");
+    native_log_flush_hook();
+    for (unsigned i = 0; i < 20000; ++i) __asm__ volatile("yield");
     wr(RBBM_INT_MASK, 0);
     wr(CP_ME_CNTL_REG, kCpHalt);
     wr(VBIF_HALT, 0xf);
@@ -539,14 +549,20 @@ static bool cp_init(Ctx &c) {
         }
         for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
     }
+    uint32_t gfsr = 0, fsr = 0, far = 0;
+    c.io.read32(c.io.cookie, 0x48, &gfsr);
+    c.io.read32(c.io.cookie, 0x8058, &fsr);
+    c.io.read32(c.io.cookie, 0x8060, &far);
     c.put(rd(CP_RB_READ));
     c.put(rd(RBBM_STATUS_REG));
     c.put(rd(CP_ME_CNTL_REG));
     c.put(rd(RBBM_INT_STATUS));
     c.put(rd(CP_INT_STATUS));
-    IOLog("NATIVE_GPU_C3: cp rptr=%08x rbbm=%08x me=%08x wptr=%08x ints=%08x cpints=%08x idle=%u\n",
+    c.put(gfsr); c.put(fsr); c.put(far);
+    IOLog("NATIVE_GPU_C3: cp rptr=%08x rbbm=%08x me=%08x wptr=%08x ints=%08x cpints=%08x "
+          "gfsr=%08x fsr=%08x far=%08x idle=%u\n",
           rd(CP_RB_READ), rd(RBBM_STATUS_REG), rd(CP_ME_CNTL_REG), rd(CP_RB_WRITE),
-          rd(RBBM_INT_STATUS), rd(CP_INT_STATUS), idle ? 1u : 0u);
+          rd(RBBM_INT_STATUS), rd(CP_INT_STATUS), gfsr, fsr, far, idle ? 1u : 0u);
     if (!idle || rd(CP_RB_READ) != n)
         return c.fail(11, "cp me init");
     return true;
