@@ -828,13 +828,14 @@ static bool zap_load(Ctx &c) {
     if (status != 0 || answer != 0)
         return c.fail(41, "zap init image");
 
-    /* H236bc: the a540 ZAP is three segments at image offsets 0/0x1000/0x3000
-     * (.b00/.b01/.b02); the complete concatenation is a540_zap.elf (17204
-     * bytes). H236bb only copied .b02 at offset 0, so the ZAP code/data image
-     * was incomplete even though TrustZone accepted the signature. */
-    const size_t kZapImageBytes = a540_fw_zap_elf_size;
+    /* H236be: mdt_loader only loads p_type==PT_LOAD segments. For a540 that
+     * is .b02 alone (p_paddr=0x5000, p_memsz=0x1334, relocatable to offset 0);
+     * .b01 is the hash segment, not runtime data. Load .b02 at offset 0 with
+     * a 0x2000 image, as H236bb did, but move the ZAP/PAS work before the CP
+     * ME_INIT and the secure-mode command before the GPMU start. */
+    constexpr size_t kZapImageBytes = 0x2000;
     memset(c.zapImage.cpu, 0, c.zapImage.bytes);
-    memcpy(c.zapImage.cpu, a540_fw_zap_elf, a540_fw_zap_elf_size);
+    memcpy(c.zapImage.cpu, a540_fw_zap_b02, a540_fw_zap_b02_size);
     cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
     IOLog("NATIVE_GPU_C3: zap mem setup call image=%llx/%u\n",
           c.zapImage.phys, unsigned(kZapImageBytes));
@@ -847,12 +848,12 @@ static bool zap_load(Ctx &c) {
     if (status != 0 || answer != 0)
         return c.fail(42, "zap mem setup");
 
-    IOLog("NATIVE_GPU_C3: zap auth call elf=%u\n", a540_fw_zap_elf_size);
+    IOLog("NATIVE_GPU_C3: zap auth call b02=%u\n", a540_fw_zap_b02_size);
     native_log_flush_hook();
     status = smcCall(kScm64 | kScmSip | kScmPasAuthAndReset, kScmOneValue,
                      kPasGpu, 0, 0, &answer);
-    IOLog("NATIVE_GPU_C3: zap auth rc=%d answer=%llx elf=%u\n",
-          status, answer, a540_fw_zap_elf_size);
+    IOLog("NATIVE_GPU_C3: zap auth rc=%d answer=%llx b02=%u\n",
+          status, answer, a540_fw_zap_b02_size);
     native_log_flush_hook();
     if (status != 0 || answer != 0)
         return c.fail(43, "zap auth and reset");
@@ -987,16 +988,18 @@ static void c3_thread(void *, wait_result_t) {
     if (!gpu_reset(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: smmu setup\n");
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
+    /* Vendor a5xx_rb_start order: ZAP is available before the CP starts,
+     * CP_SET_SECURE_MODE(0) follows ME_INIT, and GPMU starts after that. */
+    IOLog("NATIVE_GPU_C3: zap load\n");
+    if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp init\n");
     if (!cp_init(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: zap unsecure\n");
+    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
 
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
-    IOLog("NATIVE_GPU_C3: zap load\n");
-    if (!zap_load(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: zap unsecure\n");
-    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
