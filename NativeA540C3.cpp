@@ -702,6 +702,31 @@ static bool gpmu_load(Ctx &c) {
     if (rd(CP_RB_RPTR) != n)
         return c.fail(21, "gpmu packets");
 
+    /* H236au: the vendor/sagit sequence programs the AGC init message, the
+     * voltage/power thresholds and the power-collapse parameters before
+     * releasing the CM3. Without them the firmware was loaded but never wrote
+     * GPMU_GENERAL_0=0xBABEFACE. Values follow sagit's A540 gpmu() with the
+     * 752 mV S1 setting and the 257 MHz gfx3d point. */
+    wr(0xac60 * R, 0x80000000u);                 /* GPMU_GPMU_VOLTAGE */
+    wr(0xac80 * R, 0x80000000u | 6000u);         /* GPMU_GPMU_PWR_THRESHOLD */
+    const uint32_t agcMsg = 0x9800u + 7u, agcPayload = agcMsg + 5u;
+    for (uint32_t i = 0; i < 36; ++i)
+        wr((agcPayload + i) * R, 0);
+    wr(agcMsg * R, 0x80000001u);
+    wr((agcMsg + 1) * R, 1u);
+    wr(agcPayload * R, 5448u);
+    wr((agcPayload + 1) * R, 1u);
+    wr((agcPayload + 2) * R, 752u);              /* microvolts / 1000 */
+    wr((agcPayload + 3) * R, 257u);              /* Hz / 1000000 */
+    wr((agcPayload + 34) * R, (1u << 24) | (1u << 17) | (2u << 8));
+    wr((agcPayload + 35) * R, ~0x303u);
+    wr((agcMsg + 3) * R, 36u * 4u);
+    wr((0x9800u + 5u) * R, 0xBABEFACEu);         /* AGC_INIT_MSG_MAGIC */
+    wr(0xa892 * R, 0x7fu);                       /* PWR_COL_INTER_FRAME_CTRL */
+    wr(0xa894 * R, 0u);                          /* PWR_COL_BINNING_CTRL */
+    wr(0xa893 * R, 0xa0080u);                    /* PWR_COL_INTER_FRAME_HYST */
+    wr(0xa891 * R, 0x600040u);                   /* PWR_COL_STAGGER_DELAY */
+
     wr(GPMU_CM3_SYSRESET, 0);
     uint32_t general = 0;
     /* Vendor a5xx_gpmu_init uses GPMU_FW_INIT_RETRY=5000 one-millisecond
@@ -712,8 +737,13 @@ static bool gpmu_load(Ctx &c) {
             break;
         spinMs(1);
     }
+    const uint32_t general1 = rd(GPMU_GENERAL_1);
     c.put(general);
-    c.put(rd(GPMU_GENERAL_1));
+    c.put(general1);
+    IOLog("NATIVE_GPU_C3: gpmu general0=%08x general1=%08x voltage=%08x threshold=%08x "
+          "magic=%08x cm3=%08x\n",
+          general, general1, rd(0xac60 * R), rd(0xac80 * R),
+          rd((0x9800u + 5u) * R), rd(GPMU_CM3_SYSRESET));
     if (general != 0xBABEFACEu)
         return c.fail(22, "gpmu handshake");
     return true;
