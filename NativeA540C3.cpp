@@ -156,6 +156,66 @@ struct Ctx {
     }
 };
 
+// The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
+// ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 does not set those
+// and uses the vendor arm-smmu.c layout: GR1 = base + 0x1000, CB0 = base +
+// 0x8000 (size/2), SMR/S2CR at 0x800/0xc00. Program the same stage-1 image
+// directly when the kit reports Unsupported.
+static bool smmu_direct(Ctx &c) {
+    const uint64_t root = c.tables_result.root_physical;
+    const size_t CB = 0x8000, CBAR = 0x1000, CBA2R = 0x1800, SMR = 0x800, S2CR = 0xc00;
+    uint32_t tcr = (2u << 30) | 0x3500u | (64u - 32u) | (1u << 23); /* T0SZ, EPD1 */
+    uint32_t tcr2 = (7u << 15) | (1u << 4) | 2u;                    /* OAS 40 */
+    uint64_t ttbr0 = (UINT64_C(1) << 48) | root;                    /* ASID 1 */
+    uint64_t ttbr1 = (UINT64_C(1) << 48);
+    uint32_t sctlr = 0x1067u | (1u << 8);                           /* CFCFG */
+
+    if (c.io.write32(c.io.cookie, CBA2R, 1) ||
+        c.io.write32(c.io.cookie, CBAR, 0x1f300u) ||
+        c.io.write32(c.io.cookie, CB + 0x10, tcr2) ||
+        c.io.write32(c.io.cookie, CB + 0x30, tcr) ||
+        c.io.write64(c.io.cookie, CB + 0x20, ttbr0) ||
+        c.io.write64(c.io.cookie, CB + 0x28, ttbr1) ||
+        c.io.write32(c.io.cookie, CB + 0x38, 0xff44u) ||
+        c.io.write32(c.io.cookie, CB + 0x3c, 0) ||
+        c.io.write32(c.io.cookie, CB + 0x58, 0xffffffffu))
+        return c.fail(7, "direct smmu regs");
+
+    c.io.barrier(c.io.cookie);
+    c.io.write32(c.io.cookie, CB + 0x618, 0);          /* TLBIALL */
+    c.io.write32(c.io.cookie, CB + 0x7f0, 0xffffffffu);/* TLBSYNC */
+    for (unsigned i = 0; i < 2000; ++i) {
+        uint32_t st = 1;
+        if (c.io.read32(c.io.cookie, CB + 0x7f4, &st) || !(st & 1))
+            break;
+        for (unsigned d = 0; d < 64; ++d) __asm__ volatile("yield");
+    }
+    c.io.barrier(c.io.cookie);
+    c.io.write32(c.io.cookie, CB, sctlr);
+    c.io.barrier(c.io.cookie);
+
+    uint32_t rback = 0, fsr = 0;
+    c.io.read32(c.io.cookie, CB, &rback);
+    c.io.read32(c.io.cookie, CB + 0x58, &fsr);
+    c.put(rback);
+    c.put(fsr);
+
+    /* SID 0 -> CB0, stage-1 translation. */
+    c.io.write32(c.io.cookie, S2CR, 0);
+    c.io.write32(c.io.cookie, SMR, 0x80000000u);
+    c.io.barrier(c.io.cookie);
+    uint32_t smr = 0, s2cr = 0xffffffffu;
+    c.io.read32(c.io.cookie, SMR, &smr);
+    c.io.read32(c.io.cookie, S2CR, &s2cr);
+    c.put(smr);
+    c.put(s2cr);
+    IOLog("NATIVE_GPU_C3: direct smmu cb=%08x fsr=%08x smr=%08x s2cr=%08x\n",
+          rback, fsr, smr, s2cr);
+    if (!(rback & 1) || (fsr & 0xc00001feu))
+        return c.fail(8, "direct smmu enable");
+    return true;
+}
+
 static bool smmu_setup(Ctx &c) {
     if (!mapWindow(kSmmuBase, kSmmuBytes, &gSmmu))
         return c.fail(1, "smmu map");
@@ -206,6 +266,8 @@ static bool smmu_setup(Ctx &c) {
         c.put(scr0);
         IOLog("NATIVE_GPU_C3: smmu context status=%u phase=%u fault=%08x scr0=%08x\n",
               (unsigned)st, c.prog.phase, c.prog.fault_status, scr0);
+        if (st == ArmSmmu4KUnsupported)
+            return smmu_direct(c);
         return c.fail(5, "smmu context");
     }
     c.put(c.prog.readback.sctlr);
@@ -363,9 +425,9 @@ extern "C" int sheng_a540_c3_run(void (*record)(uint32_t)) {
         return -2;
     gC3->record = record;
     gC3Started = 1;
-    thread_t thread = nullptr;
-    if (kernel_thread_start(c3_thread, nullptr, &thread) != KERN_SUCCESS)
-        return -4;
-    thread_deallocate(thread);
+    /* Run synchronously: the threaded version did not reach its first log on
+     * H236s (kernel thread start instability). The synchronous path already
+     * reached the SMMU on H236p. */
+    c3_thread(nullptr, 0);
     return 0;
 }
