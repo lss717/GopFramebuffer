@@ -708,7 +708,15 @@ void native_legacy_display_late_probe(void) {
             // (sqrt(1080^2+1920^2)/5.5 = 401 ppi).
             publishRegistryWord32(nub,"canvas-width",(uint32_t)video.v_width);
             publishRegistryWord32(nub,"canvas-height",(uint32_t)video.v_height);
-            publishRegistryWord32(nub,"dot-pitch",401);
+            // H236fq: the original family reports the display in points as
+            // pixels * 163 / dot-pitch, so the pitch selects the point size the
+            // framework sees. Keep the panel value (401) by default and allow a
+            // sweep through the boot argument without rebuilding.
+            unsigned pitchArg=0;
+            PE_parse_boot_argn("offline-legacy-dot-pitch",&pitchArg,sizeof pitchArg);
+            if(pitchArg<20 || pitchArg>1000)pitchArg=401;
+            publishRegistryWord32(nub,"dot-pitch",pitchArg);
+            IOLog("NATIVE_LEGACY: dot-pitch=%u\n",pitchArg);
             nubAttached=nub->attach(parent);if(nubAttached)nubStarted=nub->start(parent);
             IOLog("NATIVE_LEGACY: nub attach=%d start=%d\n",nubAttached,nubStarted);
             if(nubStarted) {
