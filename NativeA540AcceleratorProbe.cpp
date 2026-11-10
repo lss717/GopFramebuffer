@@ -186,6 +186,22 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
             NativeAdrenoAbiTimestamp stamp = { mach_absolute_time() };
             return accelCopyOut(arguments, &stamp, sizeof stamp);
         }
+        case NativeAdrenoMethodLog: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiLog))
+                return kIOReturnBadArgument;
+            const NativeAdrenoAbiLog *line =
+                reinterpret_cast<const NativeAdrenoAbiLog *>(input + 2);
+            uint32_t n = line->bytes;
+            if (n > NativeAdrenoAbiLogBytes) n = NativeAdrenoAbiLogBytes;
+            char text[NativeAdrenoAbiLogBytes + 1];
+            memcpy(text, line->text, n);
+            text[n] = 0;
+            for (uint32_t i = 0; i < n; ++i)
+                if (text[i] == '\n' || text[i] == '\r') text[i] = ' ';
+            static unsigned logged;
+            if (logged < 1200) { ++logged; IOLog("NATIVE_MTL: %s\n", text); }
+            return kIOReturnSuccess;
+        }
         case NativeAdrenoMethodBoAlloc: {
             /* H236fd: the render-server test can reach the ABI before the C3
              * step machine has finished (it runs at ~35 s, C3 at ~70 s), so a
