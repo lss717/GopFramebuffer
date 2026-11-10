@@ -187,6 +187,10 @@ constexpr uint64_t kScmPasShutdown = (2ull << 8) | 6;
 constexpr uint64_t kScmOneValue = 1, kScmThreeValues = 3;
 constexpr uint64_t kScmValueAndBuffer = 2 | (2 << 6);
 constexpr uint32_t kPasGpu = 13;
+constexpr uint64_t kScmRestoreSecCfg = (0xCull << 8) | 2; /* SCM_SVC_MP, RESTORE_SEC_CFG */
+constexpr uint32_t kTzDeviceGpu = 18;                     /* TZ_DEVICE_GPU */
+constexpr uint64_t kScmIoWrite = (0x5ull << 8) | 2;       /* SCM_SVC_IO, SCM_IO_WRITE */
+constexpr uint64_t kScmFast = 1ull << 31;
 
 static int32_t smcCall(uint64_t function, uint64_t argInfo, uint64_t a1, uint64_t a2,
                        uint64_t a3, uint64_t *answer) {
@@ -1168,12 +1172,12 @@ static void c3_thread(void *, wait_result_t) {
      * path the ZAP itself uses to run. kgsl's IOMMU driver preserves that
      * state across start.
      */
-    IOLog("NATIVE_GPU_C3: zap load\n");
-    native_log_flush_hook();
-    if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: smmu setup\n");
     native_log_flush_hook();
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: zap load\n");
+    native_log_flush_hook();
+    if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp configure\n");
     if (!cp_configure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp start\n");
