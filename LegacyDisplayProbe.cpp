@@ -430,6 +430,9 @@ static IOReturn wrappedRegister(IOUserClient *client,mach_port_t port,UInt32 typ
     ClientStat *stat=statFor(client);
     IOReturn status=stat?reinterpret_cast<RegisterFn>(stat->original_register)(client,port,type,refCon):kIOReturnNotAttached;
     if(stat && stat->regs<kRegEvents){auto &e=stat->reg[stat->regs++];e.type=type;e.port=(uint64_t)(uintptr_t)port;e.ref=refCon;e.status=(uint32_t)status;}
+    if(stat && stat->regs<=4)
+        IOLog("NATIVE_LEGACY: reg pid=%d type=%u ref=%x status=%x port=%llx\n",
+              stat->pid,type,refCon,(unsigned)status,(unsigned long long)(uintptr_t)port);
     return status;
 }
 static void interpose(IOUserClient *client,int pid) {
@@ -453,6 +456,18 @@ extern "C" unsigned native_legacy_state_words(char *out,unsigned cap) {
     unsigned at=snprintf(out,cap,"d+5808:");
     for(unsigned o=5808;o<5872 && at+16<cap;o+=4){uint32_t v;memcpy(&v,object+o,4);at+=snprintf(out+at,cap-at," %x",v);}
     return at;
+}
+extern "C" unsigned native_legacy_client_stats(uint32_t *clients,uint32_t *calls,uint32_t *fails,
+    uint32_t *sel6,uint32_t *regs,uint32_t *swap3,uint32_t *swap4,uint32_t *swap5) {
+    uint32_t n=0,c=0,f=0,s6=0,r=0,a3=0,a4=0,a5=0;
+    for(unsigned i=0;i<seenClientCount;++i) {
+        const ClientStat &s=seenClients[i];
+        ++n;c+=s.calls;f+=s.fails;s6+=s.selector_calls[6];r+=s.regs;
+        a3+=s.selector_calls[3];a4+=s.selector_calls[4];a5+=s.selector_calls[5];
+    }
+    if(clients)*clients=n;if(calls)*calls=c;if(fails)*fails=f;if(sel6)*sel6=s6;
+    if(regs)*regs=r;if(swap3)*swap3=a3;if(swap4)*swap4=a4;if(swap5)*swap5=a5;
+    return n;
 }
 extern "C" unsigned native_legacy_clients_dump(char *out,unsigned cap) {
     unsigned at=0;out[0]=0;
