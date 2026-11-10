@@ -556,7 +556,13 @@ static bool gpu_reset(Ctx &c) {
     return true;
 }
 
-static bool cp_init(Ctx &c) {
+/* H236dk: kgsl's a5xx_rb_start order is
+ *   RB_CNTL -> RB_BASE -> microcode_load(INSTR bases) -> ZAP/PAS
+ *   -> ME_CNTL=0 -> ME_INIT -> CP_SET_SECURE_MODE(0) -> GPMU
+ * Split configure (everything up to and including the CP base registers and the
+ * readback) from start (ME release + ME_INIT) so the ZAP is authenticated with
+ * the CP instruction/RB bases already programmed. */
+static bool cp_configure(Ctx &c) {
     if (!gGpu.base && !mapWindow(kGpuBase, kGpuBytes, &gGpu))
         return c.fail(10, "gpu map");
 
@@ -666,6 +672,10 @@ static bool cp_init(Ctx &c) {
         back_rptr || back_wptr || back_cs || back_am != 1 || back_pr != 7)
         return c.fail(13, "cp register readback");
 
+    return true;
+}
+
+static bool cp_start(Ctx &c) {
     // Publish the ring, release halt, start the ME, then submit ME_INIT.
     __asm__ volatile("dsb sy" ::: "memory");
     wr(VBIF_HALT, 0);
@@ -872,12 +882,16 @@ static bool zap_load(Ctx &c) {
     /* H236be: mdt_loader only loads p_type==PT_LOAD segments. For a540 that
      * is .b02 alone (p_paddr=0x5000, p_memsz=0x1334, relocatable to offset 0);
      * .b01 is the hash segment, not runtime data. Load .b02 at offset 0 with
-     * a 0x2000 image, as H236bb did, but move the ZAP/PAS work before the CP
-     * ME_INIT and the secure-mode command before the GPMU start. */
+     * a 0x2000 image.
+     *
+     * H236di: the vendor/Linux order is pas_init_image -> pas_mem_setup ->
+     * copy the segment -> pas_auth_and_reset (qcom_mdt_load, and the A-line's
+     * step_zap_load: "the memory is looked at only now: TrustZone has just said
+     * that it is not its own"). We used to copy the image before mem_setup, so
+     * TrustZone took ownership and cleared it, and auth_and_reset authenticated
+     * a zeroed image: rc=0, no running ZAP, 0x66 a no-op, AP trust write hangs.
+     * Copy after mem_setup and log the cleared region as evidence. */
     constexpr size_t kZapImageBytes = 0x2000;
-    memset(c.zapImage.cpu, 0, c.zapImage.bytes);
-    memcpy(c.zapImage.cpu, a540_fw_zap_b02, a540_fw_zap_b02_size);
-    cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
     IOLog("NATIVE_GPU_C3: zap mem setup call image=%llx/%u\n",
           c.zapImage.phys, unsigned(kZapImageBytes));
     native_log_flush_hook();
@@ -888,6 +902,18 @@ static bool zap_load(Ctx &c) {
     native_log_flush_hook();
     if (status != 0 || answer != 0)
         return c.fail(42, "zap mem setup");
+
+    invalidateDcache(c.zapImage.cpu, c.zapImage.bytes);
+    const volatile uint32_t *zapWords =
+        reinterpret_cast<const volatile uint32_t *>(c.zapImage.cpu);
+    IOLog("NATIVE_GPU_C3: zap image after setup=%08x %08x\n", zapWords[0], zapWords[1]);
+    native_log_flush_hook();
+    memset(c.zapImage.cpu, 0, c.zapImage.bytes);
+    memcpy(c.zapImage.cpu, a540_fw_zap_b02, a540_fw_zap_b02_size);
+    cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
+    __asm__ volatile("dsb sy" ::: "memory");
+    IOLog("NATIVE_GPU_C3: zap image written=%08x %08x\n", zapWords[0], zapWords[1]);
+    native_log_flush_hook();
 
     IOLog("NATIVE_GPU_C3: zap auth call b02=%u\n", a540_fw_zap_b02_size);
     native_log_flush_hook();
@@ -908,19 +934,33 @@ static bool zap_unsecure(Ctx &c) {
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
     /*
-     * H236df (variant B): the AP write to RBBM_SECVID_TRUST_CNTL wedges the
-     * bus (H236az/dc), so let the CP write it instead, exactly like kgsl's
-     * a4xx cp_secure_mode(): protected-mode off, CP_WIDE_REG_WRITE of the
-     * trust register, protected-mode on.
+     * H236dg: the a5xx-specific secure-mode switch is CP_SET_SECURE_MODE(0),
+     * opcode 0x66. kgsl's cp_secure_mode() a5xx branch is exactly
+     *     cp_packet(CP_SET_SECURE_MODE, 1); *cmds++ = set;
+     * with no WAIT_FOR_IDLE and no wide register write (the 0x5f/0x74 form in
+     * H236df is the a4xx branch and is not the a5xx mechanism). The protect
+     * ranges installed by a5xx_protect_init() include 0xf400/0xf800, so the
+     * protected-mode window is not needed here either.
      */
-    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
+    const uint32_t cpIntBefore = rd(CP_INT_STATUS);
+    const uint32_t hwFaultBefore = rd(0x0b1a * R);
+    ring[n++] = type7(0x66 /*CP_SET_SECURE_MODE*/, 1);
     ring[n++] = 0;
-    ring[n++] = type7(0x74 /*CP_WIDE_REG_WRITE*/, 2);
-    ring[n++] = 0x0000F400;   /* RBBM_SECVID_TRUST_CNTL (dword index) */
-    ring[n++] = 0;
-    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
-    ring[n++] = 1;
+    /* H236dl: sagit's Engine::start always follows CP_SET_SECURE_MODE(0) with
+     * CP_WAIT_FOR_IDLE so the PFP stalls until the transition is complete
+     * before any fence DMA. */
     ring[n++] = type7(0x26 /*CP_WAIT_FOR_IDLE*/, 0);
+    /*
+     * H236dj: trust is not the vendor's acceptance criterion -- kgsl never
+     * reads RBBM_SECVID_TRUST_CNTL and the A-line judges step 21 by whether a
+     * CP_MEM_WRITE lands. Probe the data path directly instead of trusting the
+     * status bit (which may latch the hardware strap, not the CP's mode).
+     */
+    constexpr uint32_t kProbeOff = 0x10;
+    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    ring[n++] = (uint32_t)(kRptrIova + kProbeOff);
+    ring[n++] = (uint32_t)((kRptrIova + kProbeOff) >> 32);
+    ring[n++] = 0xDEADBEEFu;
     /*
      * H236da: sagit's AdrenoSubmit::Engine::start submits a real timestamp in
      * the same stream as CP_SET_SECURE_MODE(0) and only accepts the transition
@@ -935,12 +975,34 @@ static bool zap_unsecure(Ctx &c) {
     ring[n++] = 0xA540C3u;
     cleanDcache(ring + start, (n - start) * 4);
     cleanDcache(c.rptr.cpu, kRptrBytes);
+    /*
+     * H236dl: stage the transition with the CP stopped. Sagit (a540, working
+     * submissions) halts the ME and VBIF, publishes the whole 0x66+timestamp
+     * stream while the pipeline is halted, and only then releases both. kgsl
+     * appends the command to a running ME; on this part that retires the
+     * packet (RPTR advances) without switching the mode.
+     */
+    wr(CP_ME_CNTL_REG, kCpHalt);
+    wr(VBIF_HALT, 0xf);
+    if (!waitReg(CP_ME_CNTL_REG, kCpHalt, kCpHalt, 20000) ||
+        !waitReg(VBIF_HALTED, 0xf, 0xf, 20000)) {
+        IOLog("NATIVE_GPU_C3: secure halt me=%08x vbif=%08x\n",
+              rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
+        return c.fail(45, "secure halt");
+    }
     wr(CP_RB_WPTR, n);
+    __asm__ volatile("dsb sy" ::: "memory");
+    wr(VBIF_HALT, 0);
+    wr(CP_ME_CNTL_REG, 0);
     bool done = false;
     for (unsigned ms = 0; ms < 2000; ++ms) {
         if (rd(CP_RB_RPTR) == n) { done = true; break; }
         spinMs(1);
     }
+    /* Read the fault status before the 2 s poll so a rejected 0x66 shows up
+     * as an opcode error instead of "nothing happened". */
+    const uint32_t cpIntAfter = rd(CP_INT_STATUS);
+    const uint32_t hwFaultAfter = rd(0x0b1a * R);
     uint32_t trust = rd(0x0f400 * R);
     for (unsigned ms = 0; ms < 2000 && trust; ++ms) {
         spinMs(1);
@@ -948,10 +1010,19 @@ static bool zap_unsecure(Ctx &c) {
     }
     invalidateDcache(c.rptr.cpu, kRptrBytes);
     const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
-    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x ts=%08x:%08x\n",
-          rd(CP_RB_RPTR), n, done ? 1u : 0u, trust, scratch[0], scratch[1]);
-    if (!done || trust != 0)
+    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x ts=%08x:%08x mem=%08x\n",
+          rd(CP_RB_RPTR), n, done ? 1u : 0u, trust, scratch[0], scratch[1],
+          scratch[kProbeOff / 4]);
+    IOLog("NATIVE_GPU_C3: secure diag cpint=%08x->%08x hwfault=%08x->%08x "
+          "rbbm=%08x me=%08x mestat=%08x protect=%08x\n",
+          cpIntBefore, cpIntAfter, hwFaultBefore, hwFaultAfter,
+          rd(RBBM_STATUS_REG), rd(CP_ME_CNTL_REG), rd(0x0b14 * R), rd(0x0b1c * R));
+    /* H236dj: log-only. The GPMU load (type4 register writes through the ring)
+     * is the next real test of the CP's mode; failing here only hides it. */
+    if (!done)
         return c.fail(44, "zap unsecure");
+    if (trust)
+        IOLog("NATIVE_GPU_C3: zap unsecure continuing with trust=%08x\n", trust);
     return true;
 }
 
@@ -1089,20 +1160,25 @@ static void c3_thread(void *, wait_result_t) {
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
     /* Vendor a5xx_rb_start order: ZAP is available before the CP starts,
      * CP_SET_SECURE_MODE(0) follows ME_INIT, and GPMU starts after that. */
+    IOLog("NATIVE_GPU_C3: cp configure\n");
+    if (!cp_configure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: zap load\n");
     native_log_flush_hook();
     if (!zap_load(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: cp init\n");
-    if (!cp_init(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: cp start\n");
+    if (!cp_start(*c)) { gC3Done = 1; return; }
     /* H236db: kgsl a5xx_rb_start does microcode_load -> ME_INIT ->
      * set_unsecured_mode -> gpmu_init, i.e. the secure-mode switch comes
      * before the GPMU firmware (H236cz had it after and still saw trust=1). */
-    IOLog("NATIVE_GPU_C3: zap unsecure\n");
-    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
+    /* H236dl: sagit's AdrenoStartup finishes ME_INIT and the GPMU handshake
+     * first, then the engine stage halts the pipeline and performs the
+     * secure-mode transition. GPMU register writes work with trust=1
+     * (H236cz reached BABEFACE before the transition), so keep that order. */
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
-
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
+    IOLog("NATIVE_GPU_C3: zap unsecure\n");
+    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
