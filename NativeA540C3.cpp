@@ -676,7 +676,12 @@ static bool cp_init(Ctx &c) {
     ring[n++] = 0x20000000;      // error detection
     ring[n++] = 0;               // header dump addr
     ring[n++] = 0;               // header dump enable/size
-    ring[n++] = 0;               // A540: no ucode workaround (sagit runs 0)
+    /*
+     * H236db: kgsl's _me_init_ucode_workarounds() returns 0x0A on a540v1
+     * ("WFI after every direct-render 3D and 2D mode-3 draw") and 0 only on
+     * v2+. The old value 0 matched a530v2, not this chip.
+     */
+    ring[n++] = 0x0000000Au;     // CP_INIT_UCODE_WORKAROUND_MASK (a540v1)
     ring[n++] = 0;
     ring[n++] = 0;
     cleanDcache(ring, n * 4);
@@ -1074,15 +1079,15 @@ static void c3_thread(void *, wait_result_t) {
     if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp init\n");
     if (!cp_init(*c)) { gC3Done = 1; return; }
-    /* H236cz: sagit AdrenoSubmit::Engine::start requires GPMUReady=0xbabeface
-     * before it accepts CP_SET_SECURE_MODE(0); the secure-mode transition only
-     * takes effect with the GPMU firmware already loaded. */
+    /* H236db: kgsl a5xx_rb_start does microcode_load -> ME_INIT ->
+     * set_unsecured_mode -> gpmu_init, i.e. the secure-mode switch comes
+     * before the GPMU firmware (H236cz had it after and still saw trust=1). */
+    IOLog("NATIVE_GPU_C3: zap unsecure\n");
+    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
 
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
-    IOLog("NATIVE_GPU_C3: zap unsecure\n");
-    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
