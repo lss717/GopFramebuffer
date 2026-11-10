@@ -57,6 +57,12 @@ constexpr uint64_t kGpmuIova = 0x1300000ULL;
 constexpr uint64_t kRptrIova = 0x1400000ULL;
 constexpr size_t kRingBytes  = 0x8000;   /* 32 KiB = 8192 dwords */
 constexpr size_t kRptrBytes  = 0x1000;
+/* C4-B: the first two real GPU buffers (an indirect-buffer page and a target
+ * page). They sit above the bring-up IOVAs and are mapped exactly like the ring,
+ * so a submission through them exercises the same path user space will use. */
+constexpr uint64_t kIbIova    = 0x2000000ULL;
+constexpr uint64_t kTgtIova   = 0x2001000ULL;
+constexpr size_t   kBoBytes   = 0x1000;
 
 struct GpuWindow {
     IOMemoryMap *map;
@@ -234,7 +240,7 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
 
 struct Ctx {
     void (*record)(uint32_t);
-    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win;
+    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win, boIb, boTarget;
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
@@ -379,15 +385,17 @@ static bool smmu_setup(Ctx &c) {
     c.cfg.table_physical = c.tables.phys;
     c.cfg.leaf_budget = 0x80000000ULL / 4096;
 
-    ArmSmmu4KRange r[6] = {
+    ArmSmmu4KRange r[8] = {
         { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
         { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kPfpIova, c.pfp.phys, (c.pfp.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kGpmuIova, c.gpmu.phys, (c.gpmu.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kRptrIova, c.rptr.phys, kRptrBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
+        { kIbIova, c.boIb.phys, kBoBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
+        { kTgtIova, c.boTarget.phys, kBoBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
         { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
     };
-    if (ArmSmmu4KBuild(&c.cfg, r, 6, reinterpret_cast<uint64_t *>(c.tables.cpu),
+    if (ArmSmmu4KBuild(&c.cfg, r, 8, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
         return c.fail(4, "smmu build");
     cleanDcache(c.tables.cpu, c.tables.bytes);
@@ -1229,6 +1237,63 @@ static void tz_log_probe(void) {
         dump_text_window(hypPtr, hypSize, "hyp");
 }
 
+/*
+ * C4-B step 1: submit through a real buffer object. The IB page holds three
+ * CP_MEM_WRITE packets that target the second page, and it is submitted with
+ * CP_INDIRECT_BUFFER_PFE - the same shape the user-space Turnip test uses.
+ */
+static bool bo_submit_test(Ctx &c) {
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.boIb.cpu);
+    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(c.boTarget.cpu);
+    for (unsigned i = 0; i < kBoBytes / 4; ++i)
+        tgt[i] = 0xdeadbeefu;
+    const uint32_t vals[3] = { 0x0adc0de1u, 0xfeed0002u, 0x600d0003u };
+    unsigned w = 0;
+    for (unsigned i = 0; i < 3; ++i) {
+        ib[w++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+        ib[w++] = (uint32_t)(kTgtIova + i * 4);
+        ib[w++] = (uint32_t)((kTgtIova + i * 4) >> 32);
+        ib[w++] = vals[i];
+    }
+    cleanDcache(c.boIb.cpu, kBoBytes);
+    cleanDcache(c.boTarget.cpu, kBoBytes);
+
+    uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
+    unsigned n = rd(CP_RB_RPTR);
+    const unsigned start = n;
+    ring[n++] = type7(0x3f /*CP_INDIRECT_BUFFER_PFE*/, 3);
+    ring[n++] = (uint32_t)kIbIova;
+    ring[n++] = (uint32_t)(kIbIova >> 32);
+    ring[n++] = w;
+    ring[n++] = type7(0x46 /*CP_EVENT_WRITE*/, 4);
+    ring[n++] = 4u;                       /* CACHE_FLUSH_TS */
+    ring[n++] = (uint32_t)kRptrIova;
+    ring[n++] = (uint32_t)(kRptrIova >> 32);
+    ring[n++] = 0xB0B0B0B0u;
+    ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
+    cleanDcache(ring + start, (n - start) * 4);
+    cleanDcache(c.rptr.cpu, kRptrBytes);
+    wr(CP_RB_WPTR, n);
+    bool done = false;
+    for (unsigned ms = 0; ms < 2000; ++ms) {
+        if (rd(CP_RB_RPTR) == n) { done = true; break; }
+        spinMs(1);
+    }
+    for (unsigned ms = 0; ms < 500 && (rd(RBBM_STATUS_REG) & 0x7eu); ++ms)
+        spinMs(1);
+    spinMs(20);
+    invalidateDcache(c.rptr.cpu, kRptrBytes);
+    invalidateDcache(c.boTarget.cpu, kBoBytes);
+    const uint32_t *t = reinterpret_cast<const uint32_t *>(c.boTarget.cpu);
+    const unsigned hits = (t[0] == vals[0]) + (t[1] == vals[1]) + (t[2] == vals[2]) +
+                          (t[3] == 0xdeadbeefu);
+    IOLog("NATIVE_GPU_C3: bo submit done=%u rptr=%u/%u ib0=%08x tgt=%08x/%08x/%08x "
+          "t3=%08x hits=%u\n",
+          done ? 1u : 0u, rd(CP_RB_RPTR), n, ib[0], t[0], t[1], t[2], t[3], hits);
+    native_log_flush_hook();
+    return done && hits == 4;
+}
+
 /* H236ba: ask the authenticated CP firmware to leave secure mode, then confirm
  * via the timestamp/trust register that data writes are no longer dropped. */
 static bool zap_unsecure(Ctx &c) {
@@ -1404,6 +1469,8 @@ static void c3_thread(void *, wait_result_t) {
     /* H236dq: one page inside kgsl's trusted IOVA window (0xE8000000..0xF8000000)
      * to compare CP writes inside vs outside the window. */
     if (!c->win.init(0x1000)) { c->put(0xdea00039u); gC3Done = 1; return; }
+    if (!c->boIb.init(kBoBytes)) { c->put(0xdea0003au); gC3Done = 1; return; }
+    if (!c->boTarget.init(kBoBytes)) { c->put(0xdea0003bu); gC3Done = 1; return; }
     /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
      * window inside the kernel window and appends zap-base=<phys>. Map the
      * metadata at +0 and the .b02 image at +1 MiB. */
@@ -1482,6 +1549,8 @@ static void c3_thread(void *, wait_result_t) {
      * The earlier "writes stop landing after gpmu" was a probe bug. */
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: bo submit test\n");
+    if (!bo_submit_test(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
     c->put(0x600d00c3u);
     gC3Done = 1;
