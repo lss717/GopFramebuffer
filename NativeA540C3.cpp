@@ -344,6 +344,28 @@ static bool smmu_setup(Ctx &c) {
     if (ArmSmmu4KBindMmio(&c.smmu_mmio, &c.io) != ArmSmmu4KSuccess)
         return c.fail(2, "smmu bind");
 
+    /*
+     * H236ea: is the secure context bank (SID2 -> CB2) configured at all? The
+     * bootloader/TZ owns it; if it reads back as zero there is no secure
+     * translation path and the ZAP cannot run, no matter what the CP does.
+     * Read only: never write CB2.
+     */
+    {
+        uint32_t cb0s = 0, cb0t = 0, cb2s = 0, cb2t = 0, cb2h = 0;
+        uint32_t cba2r2 = 0, s2cr2 = 0, smr2 = 0;
+        c.io.read32(c.io.cookie, 0x8000, &cb0s);
+        c.io.read32(c.io.cookie, 0x8020, &cb0t);
+        c.io.read32(c.io.cookie, 0xa000, &cb2s);
+        c.io.read32(c.io.cookie, 0xa020, &cb2t);
+        c.io.read32(c.io.cookie, 0xa024, &cb2h);
+        c.io.read32(c.io.cookie, 0x1808, &cba2r2);
+        c.io.read32(c.io.cookie, 0xc08, &s2cr2);
+        c.io.read32(c.io.cookie, 0x808, &smr2);
+        IOLog("NATIVE_GPU_C3: cb0 sctlr=%08x ttbr=%08x | cb2 sctlr=%08x "
+              "ttbr=%08x/%08x cba2r=%08x s2cr=%08x smr=%08x\n",
+              cb0s, cb0t, cb2s, cb2t, cb2h, cba2r2, s2cr2, smr2);
+        native_log_flush_hook();
+    }
     uint32_t id0 = 0, id1 = 0, id2 = 0;
     if (c.io.read32(c.io.cookie, 0x20, &id0) || c.io.read32(c.io.cookie, 0x24, &id1) ||
         c.io.read32(c.io.cookie, 0x28, &id2))
@@ -927,6 +949,20 @@ static bool zap_load(Ctx &c) {
     IOLog("NATIVE_GPU_C3: zap image written=%08x %08x\n", zapWords[0], zapWords[1]);
     native_log_flush_hook();
 
+    /*
+     * H236dy (P2): snapshot the CP/RBBM state immediately before the auth
+     * call. Mainline and kgsl both call PAS_AUTH_AND_RESET at this point and
+     * then keep using the same ring, so this snapshot is the reference for the
+     * post-auth one: if the TZ really resets the GPU, CP_ME_CNTL must be back
+     * at 0x303 and CP_RB_BASE must read 0 afterwards. All of these live in the
+     * CP/RBBM blocks, which are readable in secure mode.
+     */
+    IOLog("NATIVE_GPU_C3: pre-auth me=%08x rb=%08x/%08x prot=%08x am=%08x "
+          "ahb2=%08x gpmu_rst=%08x trust=%08x\n",
+          rd(CP_ME_CNTL_REG), rd(CP_RB_BASE), rd(CP_RB_BASE_HI),
+          rd(CP_PROTECT_CNTL_REG), rd(CP_ADDR_MODE_CNTL), rd(0x254),
+          rd(GPMU_CM3_SYSRESET), rd(0x0f400 * R));
+    native_log_flush_hook();
     IOLog("NATIVE_GPU_C3: zap auth call b02=%u\n", a540_fw_zap_b02_size);
     native_log_flush_hook();
     status = smcCall(kScm64 | kScmSip | kScmPasAuthAndReset, kScmOneValue,
@@ -936,7 +972,115 @@ static bool zap_load(Ctx &c) {
     native_log_flush_hook();
     if (status != 0 || answer != 0)
         return c.fail(43, "zap auth and reset");
+    /* H236dy (P2 post): same snapshot after auth. Log first, then read, so a
+     * hang identifies the access. */
+    IOLog("NATIVE_GPU_C3: post-auth snapshot begin\n");
+    native_log_flush_hook();
+    IOLog("NATIVE_GPU_C3: post-auth me=%08x rb=%08x/%08x prot=%08x am=%08x "
+          "ahb2=%08x gpmu_rst=%08x\n",
+          rd(CP_ME_CNTL_REG), rd(CP_RB_BASE), rd(CP_RB_BASE_HI),
+          rd(CP_PROTECT_CNTL_REG), rd(CP_ADDR_MODE_CNTL), rd(0x254),
+          rd(GPMU_CM3_SYSRESET));
+    native_log_flush_hook();
+    /*
+     * H236dy (P1): one SECVID read, right after auth and before anything else
+     * touches the GPU. In this order the only thing between auth and
+     * zap_unsecure() is one GPMU_GENERAL0 read, so a 1 here is conclusive:
+     * the secure world never cleared it. A hang is also an answer (the block
+     * belongs to the TZ after auth). Do not add more SECVID reads to this
+     * boot.
+     */
+    IOLog("NATIVE_GPU_C3: trust after auth read begin\n");
+    native_log_flush_hook();
+    {
+        const uint32_t trustAfterAuth = rd(0x0f400 * R);
+        IOLog("NATIVE_GPU_C3: trust after auth=%08x\n", trustAfterAuth);
+        native_log_flush_hook();
+    }
     return true;
+}
+
+/* H236ea (P3): the DT describes qcom,tz-log@146BF720 (0x3000) with the hyp log
+ * pointer/size at +0x410/+0x414. Reading it is the only way to see what the
+ * secure world decided about the ZAP. Read four words first: if IMEM is
+ * XPU-protected the read itself hangs, which is also an answer. */
+static GpuWindow gTzLog;
+
+/* H236ee: compressed text dump. The old version emitted 99-char lines and
+ * flushed once at the end; that lost whole windows in the log path. Collapse
+ * runs of zeros/non-printables, skip lines without real text, flush every
+ * line and cap the output. */
+static void dump_text_window(uint64_t phys, uint32_t size, const char *tag) {
+    GpuWindow w;
+    if (!mapWindow(phys & ~0xfffULL, (size + 0xfff) & ~0xfffULL, &w)) {
+        IOLog("NATIVE_GPU_C3: %s map failed\n", tag);
+        native_log_flush_hook();
+        return;
+    }
+    const volatile uint8_t *b =
+        reinterpret_cast<const volatile uint8_t *>(w.base) + (phys & 0xfff);
+    IOLog("NATIVE_GPU_C3: %s begin %llx/%u\n", tag, phys, size);
+    native_log_flush_hook();
+    char line[96];
+    unsigned n = 0, dots = 0, printable = 0, emitted = 0;
+    for (uint32_t i = 0; i <= size; ++i) {
+        const uint8_t ch = (i < size) ? b[i] : 0;
+        const bool pr = (ch >= 0x20 && ch < 0x7f);
+        if (pr) {
+            if (dots >= 6 && n + 1 < sizeof(line))
+                line[n++] = ' ';
+            dots = 0;
+            if (n + 1 < sizeof(line))
+                line[n++] = static_cast<char>(ch);
+            ++printable;
+        } else {
+            ++dots;
+            if (dots == 1 && n + 1 < sizeof(line))
+                line[n++] = '.';
+        }
+        if ((n + 2 >= sizeof(line) || i == size) && emitted < 48) {
+            line[n] = 0;
+            if (printable >= 4) {
+                IOLog("NATIVE_GPU_C3: %s |%s|\n", tag, line);
+                native_log_flush_hook();
+                ++emitted;
+            }
+            n = 0;
+            dots = 0;
+            printable = 0;
+        }
+    }
+    IOLog("NATIVE_GPU_C3: %s end lines=%u\n", tag, emitted);
+    native_log_flush_hook();
+}
+
+static void tz_log_probe(void) {
+    if (!mapWindow(0x146BF000ULL, 0x4000ULL, &gTzLog)) {
+        IOLog("NATIVE_GPU_C3: tzlog map failed\n");
+        native_log_flush_hook();
+        return;
+    }
+    const volatile uint32_t *w =
+        reinterpret_cast<const volatile uint32_t *>(gTzLog.base);
+    IOLog("NATIVE_GPU_C3: tzlog read begin\n");
+    native_log_flush_hook();
+    IOLog("NATIVE_GPU_C3: tzlog %08x %08x %08x %08x\n",
+          w[0x720 / 4], w[0x724 / 4], w[0x728 / 4], w[0x72c / 4]);
+    IOLog("NATIVE_GPU_C3: tzlog+10 %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          w[0x730 / 4], w[0x734 / 4], w[0x738 / 4], w[0x73c / 4],
+          w[0x740 / 4], w[0x744 / 4], w[0x748 / 4], w[0x74c / 4]);
+    IOLog("NATIVE_GPU_C3: tzlog+30 %08x %08x %08x %08x %08x %08x %08x %08x\n",
+          w[0x750 / 4], w[0x754 / 4], w[0x758 / 4], w[0x75c / 4],
+          w[0x760 / 4], w[0x764 / 4], w[0x768 / 4], w[0x76c / 4]);
+    native_log_flush_hook();
+    const uint32_t hypPtr = w[0xb30 / 4];
+    const uint32_t hypSize = w[0xb34 / 4];
+    IOLog("NATIVE_GPU_C3: hyplog ptr=%08x size=%08x\n", hypPtr, hypSize);
+    native_log_flush_hook();
+    dump_text_window(0x14692000ULL, 0x1000, "tzptr");
+    dump_text_window(0x146BF720ULL, 0x3000, "tzring");
+    if (hypPtr && hypSize >= 16 && hypSize <= 0x8000)
+        dump_text_window(hypPtr, hypSize, "hyp");
 }
 
 /* H236ba: ask the authenticated CP firmware to leave secure mode, then confirm
@@ -1157,38 +1301,41 @@ static void c3_thread(void *, wait_result_t) {
     c->put((uint32_t)(c->tables.phys >> 12));
     c->put((uint32_t)(c->ring.phys >> 12));
 
-    /* Real GPU reset first: it clears the GPU-side CP/TSB state, so the
-     * SMMU context and the SID0 route are (re)built afterwards. */
     IOLog("NATIVE_GPU_C3: gpu reset\n");
+    native_log_flush_hook();
     if (!gpu_reset(*c)) { gC3Done = 1; return; }
     /*
-     * H236ds: authenticate the ZAP before touching the GPU SMMU. The secure
-     * world keeps its own stream/context state in the SMMU; smmu_setup()
-     * reprograms CB0, SMR/S2CR and ACTLR from scratch, which may tear down the
-     * path the ZAP itself uses to run. kgsl's IOMMU driver preserves that
-     * state across start.
+     * kgsl cold order (a5xx_rb_start -> a5xx_microcode_load): SMMU -> CP base
+     * registers -> ZAP/PAS -> ME release -> ME_INIT -> CP_SET_SECURE_MODE(0)
+     * -> GPMU. The PAS call sits inside microcode_load, i.e. with the ME still
+     * halted and the instruction/RB bases already programmed.
      */
     IOLog("NATIVE_GPU_C3: smmu setup\n");
     native_log_flush_hook();
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp configure\n");
     if (!cp_configure(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: cp start\n");
-    if (!cp_start(*c)) { gC3Done = 1; return; }
-    /* H236dx: bring the GPMU up first, then authenticate the ZAP; if the ZAP
-     * runs on the GPMU this is the first order in which it can execute. */
-    IOLog("NATIVE_GPU_C3: gpmu load\n");
-    if (!gpmu_load(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
     IOLog("NATIVE_GPU_C3: zap load\n");
     native_log_flush_hook();
     if (!zap_load(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: gpmu after auth=%08x\n", rd(GPMU_GENERAL0));
+    IOLog("NATIVE_GPU_C3: cp start\n");
+    if (!cp_start(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: trust before 0x66=%08x\n", rd(0x0f400 * R));
+    native_log_flush_hook();
     /* H236db: kgsl a5xx_rb_start does microcode_load -> ME_INIT ->
      * set_unsecured_mode -> gpmu_init, i.e. the secure-mode switch comes
      * before the GPMU firmware (H236cz had it after and still saw trust=1). */
     IOLog("NATIVE_GPU_C3: zap unsecure\n");
     if (!zap_unsecure(*c)) { gC3Done = 1; return; }
+    /* H236eb: probe the TZ log before the GPMU stage: the gpmu ring writes can
+     * fail in secure mode (H236cb/db), and a failed stage must not hide the
+     * only secure-world evidence we have. */
+    tz_log_probe();
+    IOLog("NATIVE_GPU_C3: gpmu load\n");
+    if (!gpmu_load(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE trust=%08x\n",
+          rd(0x0f400 * R));
+    native_log_flush_hook();
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
