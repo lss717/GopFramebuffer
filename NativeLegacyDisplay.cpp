@@ -35,6 +35,7 @@ extern "C" volatile uint32_t native_legacy_stage;
 extern "C" volatile uint32_t native_boot_flags;
 extern "C" volatile uint32_t native_legacy_client_calls;
 extern "C" volatile uint32_t native_legacy_swap_validation_calls;
+static volatile unsigned gSwapTrace;   /* H236fn: bounded kick/guard trace */
 extern "C" volatile uint32_t native_legacy_transfer_calls;
 extern "C" volatile int native_legacy_client_status;
 extern "C" char native_legacy_client_comm[64];
@@ -416,6 +417,7 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: kick transferred=%u pending=%u\n",transferred?1u:0u,pendingSwapRequest()?1u:0u);}
         armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;
@@ -428,9 +430,17 @@ public:
     }
     void kickOnce() {
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
-        if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
+        if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary) {
+            if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip en=%u tr=%u pm=%u map=%u pri=%u\n",
+                enabled,transferred?1u:0u,logicalPM?1u:0u,bootMapping?1u:0u,primary?1u:0u);}
+            return;
+        }
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
-        if(!request || !isValidated(request))return;
+        if(!request || !isValidated(request)) {
+            if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip req=%u valid=%u\n",
+                request?1u:0u,(request && isValidated(request))?1u:0u);}
+            return;
+        }
         // This bounded first-frame transfer preserves the original queue's
         // resource ownership. Separately gated retirement follows the copy;
         // neither path signals a hardware fence, announces a vblank or
