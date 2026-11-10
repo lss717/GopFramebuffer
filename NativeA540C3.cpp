@@ -597,10 +597,14 @@ static bool cp_init(Ctx &c) {
         { 0x3318, 2u << 1 },      // RB_MODE_CNTL
         { 0x3a3c, 0x00000002u },  // UCHE_DBG_ECO_CNTL_2
         { 0x2280, 0x00000007u },  // CP_PROTECT_CNTL
-        { 0x3e00c, 0x00000000u }, // RBBM_SECVID_TSB_CNTL
-        { 0x3e000, 0x00000000u }, // RBBM_SECVID_TSB_TRUSTED_BASE_LO
-        { 0x3e004, 0x00000000u }, // ..._HI
-        { 0x3e008, 0x00000000u }, // ..._SIZE
+        /*
+         * H236dd: do not clear the secure TSB. kgsl's _set_secvid() only
+         * programs TSB base/size when the MMU is secured and otherwise leaves
+         * the firmware values alone; zeroing TRUSTED_BASE/SIZE here can make
+         * CP_SET_SECURE_MODE(0) a no-op (H236da/db: trust stays 1).
+         * TSB_ADDR_MODE_CNTL=1 matches a5xx_gpmu_reset/addr-mode setup.
+         */
+        { 0x3e040, 0x00000001u }, // RBBM_SECVID_TSB_ADDR_MODE_CNTL
     };
     for (const auto &e : cfg)
         wr(e.off, e.val);
