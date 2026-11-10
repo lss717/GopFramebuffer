@@ -178,7 +178,7 @@ static void invalidateDcache(void *p, size_t bytes) {
 
 /* H236ba: ZAP/PAS via the secure monitor, following the A-line redwood SCM
  * helper and the vendor mdt_loader PAS sequence. PAS image 13 is the GPU. */
-constexpr uint64_t kScm64 = 1ull << 30, kScmSip = 2ull << 24;
+constexpr uint64_t kScm64 = 1ull << 30, kScmSip = 2ull << 24, kScmFast = 1ull << 31;
 constexpr uint64_t kScmInterrupted = 1;
 constexpr uint64_t kScmPasInitImage = (2ull << 8) | 1;
 constexpr uint64_t kScmPasMemSetup = (2ull << 8) | 2;
@@ -234,7 +234,7 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
 
 struct Ctx {
     void (*record)(uint32_t);
-    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage;
+    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win;
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
@@ -357,14 +357,15 @@ static bool smmu_setup(Ctx &c) {
     c.cfg.table_physical = c.tables.phys;
     c.cfg.leaf_budget = 0x80000000ULL / 4096;
 
-    ArmSmmu4KRange r[5] = {
+    ArmSmmu4KRange r[6] = {
         { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
         { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kPfpIova, c.pfp.phys, (c.pfp.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kGpmuIova, c.gpmu.phys, (c.gpmu.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
         { kRptrIova, c.rptr.phys, kRptrBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
+        { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
     };
-    if (ArmSmmu4KBuild(&c.cfg, r, 5, reinterpret_cast<uint64_t *>(c.tables.cpu),
+    if (ArmSmmu4KBuild(&c.cfg, r, 6, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
         return c.fail(4, "smmu build");
     cleanDcache(c.tables.cpu, c.tables.bytes);
@@ -553,6 +554,30 @@ static bool gpu_reset(Ctx &c) {
     if (rd(GPMU_CM3_SYSRESET) != 1 || rd(GPMU_GENERAL0) || rd(GPMU_GENERAL1))
         return c.fail(12, "gpmu reset");
     IOLog("NATIVE_GPU_C3: gpu reset ok\n");
+    /*
+     * H236do: kgsl's _adreno_start() runs _soft_reset() then _set_secvid(),
+     * i.e. the SECVID trusted window is programmed before the CP exists.
+     * The window is a GPU IOVA range (top 256 MiB: base 0xE8000000 for the
+     * 32-bit VA space), not a page table; the real secure tables live in the
+     * SMMU's secure context. 0xF800..0xF803 and 0xF400 are CP_PROTECT ranges,
+     * so this can only be written before CP_ME_CNTL=0. Never read them back:
+     * reads of this block hang the bus (H236dn).
+     */
+    IOLog("NATIVE_GPU_C3: tsb cntl\n");
+    native_log_flush_hook();
+    wr(0x3e00c, 0x00000000u);           /* RBBM_SECVID_TSB_CNTL */
+    IOLog("NATIVE_GPU_C3: tsb base\n");
+    native_log_flush_hook();
+    wr(0x3e000, 0xe8000000u);           /* TRUSTED_BASE_LO */
+    wr(0x3e004, 0x00000000u);           /* TRUSTED_BASE_HI */
+    IOLog("NATIVE_GPU_C3: tsb size\n");
+    native_log_flush_hook();
+    wr(0x3e008, 0x10000000u);           /* TRUSTED_SIZE */
+    IOLog("NATIVE_GPU_C3: tsb mode\n");
+    native_log_flush_hook();
+    wr(0x3e040, 0x00000001u);           /* ADDR_MODE_CNTL */
+    IOLog("NATIVE_GPU_C3: tsb written\n");
+    native_log_flush_hook();
     return true;
 }
 
@@ -961,6 +986,11 @@ static bool zap_unsecure(Ctx &c) {
     ring[n++] = (uint32_t)(kRptrIova + kProbeOff);
     ring[n++] = (uint32_t)((kRptrIova + kProbeOff) >> 32);
     ring[n++] = 0xDEADBEEFu;
+    /* H236dq: same write, but the destination is inside the trusted window. */
+    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    ring[n++] = 0xE9000000u;
+    ring[n++] = 0x00000000u;
+    ring[n++] = 0xEA57BEEFu;
     /*
      * H236da: sagit's AdrenoSubmit::Engine::start submits a real timestamp in
      * the same stream as CP_SET_SECURE_MODE(0) and only accepts the transition
@@ -1009,10 +1039,12 @@ static bool zap_unsecure(Ctx &c) {
         trust = rd(0x0f400 * R);
     }
     invalidateDcache(c.rptr.cpu, kRptrBytes);
+    invalidateDcache(c.win.cpu, 0x1000);
     const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
-    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x ts=%08x:%08x mem=%08x\n",
+    const uint32_t *window = reinterpret_cast<const uint32_t *>(c.win.cpu);
+    IOLog("NATIVE_GPU_C3: zap unsecure rptr=%u/%u done=%u trust=%08x ts=%08x:%08x mem=%08x win=%08x\n",
           rd(CP_RB_RPTR), n, done ? 1u : 0u, trust, scratch[0], scratch[1],
-          scratch[kProbeOff / 4]);
+          scratch[kProbeOff / 4], window[0]);
     IOLog("NATIVE_GPU_C3: secure diag cpint=%08x->%08x hwfault=%08x->%08x "
           "rbbm=%08x me=%08x mestat=%08x protect=%08x\n",
           cpIntBefore, cpIntAfter, hwFaultBefore, hwFaultAfter,
@@ -1119,6 +1151,9 @@ static void c3_thread(void *, wait_result_t) {
     if (!c->pfp.init((a540_fw_pfp_size + 0xfff) & ~0xfffu)) { c->put(0xdea00034u); gC3Done = 1; return; }
     if (!c->gpmu.init((a540_fw_gpmu_size + 0xfff) & ~0xfffu)) { c->put(0xdea00035u); gC3Done = 1; return; }
     if (!c->rptr.init(kRptrBytes)) { c->put(0xdea00036u); gC3Done = 1; return; }
+    /* H236dq: one page inside kgsl's trusted IOVA window (0xE8000000..0xF8000000)
+     * to compare CP writes inside vs outside the window. */
+    if (!c->win.init(0x1000)) { c->put(0xdea00039u); gC3Done = 1; return; }
     /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
      * window inside the kernel window and appends zap-base=<phys>. Map the
      * metadata at +0 and the .b02 image at +1 MiB. */
@@ -1165,6 +1200,21 @@ static void c3_thread(void *, wait_result_t) {
     IOLog("NATIVE_GPU_C3: zap load\n");
     native_log_flush_hook();
     if (!zap_load(*c)) { gC3Done = 1; return; }
+    /*
+     * H236dp: kgsl's a5xx_microcode_load(), after writing the CP instruction
+     * bases and with a retained ZAP, calls
+     *     SCM_SIP_FNID(SCM_SVC_BOOT, 0xA) with {0, 13} (atomic)
+     * so the secure world re-attaches the authenticated ZAP base to this
+     * power session. Our INSTR bases are already programmed (cp_configure) and
+     * the ME has not started yet, which is the same window.
+     */
+    {
+        uint64_t answer = ~0ull;
+        int32_t rc = smcCall(kScmFast | kScm64 | kScmSip | ((1ull << 8) | 0x0A), 2,
+                             0, kPasGpu, 0, &answer);
+        IOLog("NATIVE_GPU_C3: zap resume rc=%d answer=%llx\n", rc, answer);
+        native_log_flush_hook();
+    }
     IOLog("NATIVE_GPU_C3: cp start\n");
     if (!cp_start(*c)) { gC3Done = 1; return; }
     /* H236db: kgsl a5xx_rb_start does microcode_load -> ME_INIT ->
