@@ -263,6 +263,12 @@ struct Ctx {
     }
 };
 
+static Ctx *gC3;
+static volatile int gC3Started, gC3Done;
+static volatile int gA540Ready;      /* C4-B: set once the self-tests passed */
+static volatile int gA540EngineUp;   /* engine usable (0x66 done, GPMU optional) */
+static uint32_t gA540Fence;          /* monotonic fence payload */
+
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
 // ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 uses the vendor
 // arm-smmu.c layout (GR1 = base + 0x1000, CB0 = base + 0x8000 = reg_size/2,
@@ -1300,6 +1306,63 @@ static bool bo_submit_test(Ctx &c) {
     return done && hits == 4;
 }
 
+/*
+ * C5a: Fill32. One 4 KiB BO holds a 1024-dword indirect buffer (256
+ * CP_MEM_WRITE packets) that fills a 1 KiB range of the next BO; a
+ * CP_EVENT_WRITE/CACHE_FLUSH_TS in the ring gives the fence, and every dword is
+ * read back. This is the first C5 acceptance step (Barrier = CP_WAIT_MEM_WRITES
+ * already appended by submit_bo).
+ */
+extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence);
+extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns);
+
+static bool fill32_test(Ctx &c) {
+    /* H236fi: one 1024-dword IB (exactly one page) does not run, 256 dwords do,
+     * so fill the 4 KiB target with four 1 KiB submissions and verify all of
+     * it. Each round also exercises the fence counter. */
+    constexpr unsigned kChunk = 256;
+    constexpr unsigned kChunks = 4;
+    constexpr uint32_t kMagic = 0xF1E20000u;
+    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(c.bo[3].cpu);
+    const uint64_t tgtIova = kBoBase + 3 * kBoPage;
+    for (unsigned i = 0; i < kBoPage / 4; ++i)
+        tgt[i] = 0u;
+    cleanDcache(c.bo[3].cpu, kBoPage);
+    for (unsigned q = 0; q < kChunks; ++q) {
+        volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[2].cpu);
+        unsigned w = 0;
+        for (unsigned i = 0; i < kChunk; ++i) {
+            const unsigned idx = q * kChunk + i;
+            const uint64_t addr = tgtIova + idx * 4;
+            ib[w++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+            ib[w++] = (uint32_t)addr;
+            ib[w++] = (uint32_t)(addr >> 32);
+            ib[w++] = kMagic | idx;
+        }
+        uint64_t fence = 0;
+        if (native_a540_submit_bo(2, w, &fence))
+            return c.fail(50, "fill32 submit");
+        if (native_a540_wait_fence(fence, 1000000000ull))
+            return c.fail(51, "fill32 fence");
+    }
+    invalidateDcache(c.bo[3].cpu, kBoPage);
+    const uint32_t *t = reinterpret_cast<const uint32_t *>(c.bo[3].cpu);
+    unsigned hits = 0;
+    for (unsigned i = 0; i < kChunk * kChunks; ++i)
+        if (t[i] == (kMagic | i))
+            ++hits;
+    const unsigned untouched = t[kChunk * kChunks] == 0u ? 1u : 0u;
+    uint32_t fsr = 0;
+    c.io.read32(c.io.cookie, 0x8058, &fsr);
+    IOLog("NATIVE_GPU_C3: fill32 words=%u hits=%u untouch=%u fence=%llu "
+          "cpint=%08x hwfault=%08x fsr=%08x t0=%08x t1=%08x\n",
+          kChunk * kChunks, hits, untouched,
+          (unsigned long long)gA540Fence,
+          rd(CP_INT_STATUS), rd(0x0b1a * R), fsr, t[0], t[1]);
+    native_log_flush_hook();
+    return hits == kChunk * kChunks && untouched == 1u;
+}
+
 /* H236ba: ask the authenticated CP firmware to leave secure mode, then confirm
  * via the timestamp/trust register that data writes are no longer dropped. */
 static bool zap_unsecure(Ctx &c) {
@@ -1454,10 +1517,6 @@ static bool submit_probe(Ctx &c) {
 
 } // namespace
 
-static Ctx *gC3;
-static volatile int gC3Started, gC3Done;
-static volatile int gA540Ready;      /* C4-B: set once the engine is usable */
-static uint32_t gA540Fence;          /* monotonic fence payload */
 
 static void c3_thread(void *, wait_result_t) {
     Ctx *c = gC3;
@@ -1556,10 +1615,13 @@ static void c3_thread(void *, wait_result_t) {
     /* H236ex: kgsl order (0x66 -> gpmu_init -> submit) works as long as the
      * probe waits for CP_WAIT_MEM_WRITES and an idle RBBM before reading back.
      * The earlier "writes stop landing after gpmu" was a probe bug. */
+    gA540EngineUp = 1;   /* the engine can submit from here on (C4-B/C5) */
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: bo submit test\n");
     if (!bo_submit_test(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: fill32 test\n");
+    if (!fill32_test(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
     gA540Ready = 1;
     c->put(0x600d00c3u);
@@ -1582,7 +1644,7 @@ extern "C" void *native_a540_bo_descriptor(unsigned slot) {
 }
 
 extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence) {
-    if (!gC3 || !gA540Ready || slot >= kBoSlots || !fence || !words || words > kBoPage / 4)
+    if (!gC3 || !gA540EngineUp || slot >= kBoSlots || !fence || !words || words > kBoPage / 4)
         return -1;
     Ctx &c = *gC3;
     /* The caller writes the IB through its own mapping; flush those physical
