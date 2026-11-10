@@ -178,7 +178,7 @@ static void invalidateDcache(void *p, size_t bytes) {
 
 /* H236ba: ZAP/PAS via the secure monitor, following the A-line redwood SCM
  * helper and the vendor mdt_loader PAS sequence. PAS image 13 is the GPU. */
-constexpr uint64_t kScm64 = 1ull << 30, kScmSip = 2ull << 24, kScmFast = 1ull << 31;
+constexpr uint64_t kScm64 = 1ull << 30, kScmSip = 2ull << 24;
 constexpr uint64_t kScmInterrupted = 1;
 constexpr uint64_t kScmPasInitImage = (2ull << 8) | 1;
 constexpr uint64_t kScmPasMemSetup = (2ull << 8) | 2;
@@ -554,30 +554,6 @@ static bool gpu_reset(Ctx &c) {
     if (rd(GPMU_CM3_SYSRESET) != 1 || rd(GPMU_GENERAL0) || rd(GPMU_GENERAL1))
         return c.fail(12, "gpmu reset");
     IOLog("NATIVE_GPU_C3: gpu reset ok\n");
-    /*
-     * H236do: kgsl's _adreno_start() runs _soft_reset() then _set_secvid(),
-     * i.e. the SECVID trusted window is programmed before the CP exists.
-     * The window is a GPU IOVA range (top 256 MiB: base 0xE8000000 for the
-     * 32-bit VA space), not a page table; the real secure tables live in the
-     * SMMU's secure context. 0xF800..0xF803 and 0xF400 are CP_PROTECT ranges,
-     * so this can only be written before CP_ME_CNTL=0. Never read them back:
-     * reads of this block hang the bus (H236dn).
-     */
-    IOLog("NATIVE_GPU_C3: tsb cntl\n");
-    native_log_flush_hook();
-    wr(0x3e00c, 0x00000000u);           /* RBBM_SECVID_TSB_CNTL */
-    IOLog("NATIVE_GPU_C3: tsb base\n");
-    native_log_flush_hook();
-    wr(0x3e000, 0xe8000000u);           /* TRUSTED_BASE_LO */
-    wr(0x3e004, 0x00000000u);           /* TRUSTED_BASE_HI */
-    IOLog("NATIVE_GPU_C3: tsb size\n");
-    native_log_flush_hook();
-    wr(0x3e008, 0x10000000u);           /* TRUSTED_SIZE */
-    IOLog("NATIVE_GPU_C3: tsb mode\n");
-    native_log_flush_hook();
-    wr(0x3e040, 0x00000001u);           /* ADDR_MODE_CNTL */
-    IOLog("NATIVE_GPU_C3: tsb written\n");
-    native_log_flush_hook();
     return true;
 }
 
@@ -636,6 +612,17 @@ static bool cp_configure(Ctx &c) {
          * TSB_ADDR_MODE_CNTL=1 matches a5xx_gpmu_reset/addr-mode setup.
          */
         { 0x3e040, 0x00000001u }, // RBBM_SECVID_TSB_ADDR_MODE_CNTL
+        /*
+         * H236dr: upstream msm a5xx_hw_init() disables the trusted range
+         * ("we don't actually support secure memory rendering"): TSB_CNTL=0,
+         * TRUSTED_BASE=0, TRUSTED_SIZE=0, written before the CP starts.
+         * kgsl programs a 256 MiB window (0xE8000000) only when the MMU is
+         * secured; H236do tried that with no effect.
+         */
+        { 0x3e00c, 0x00000000u }, // RBBM_SECVID_TSB_CNTL
+        { 0x3e000, 0x00000000u }, // RBBM_SECVID_TSB_TRUSTED_BASE_LO
+        { 0x3e004, 0x00000000u }, // ..._HI
+        { 0x3e008, 0x00000000u }, // ..._SIZE
     };
     for (const auto &e : cfg)
         wr(e.off, e.val);
@@ -1005,25 +992,9 @@ static bool zap_unsecure(Ctx &c) {
     ring[n++] = 0xA540C3u;
     cleanDcache(ring + start, (n - start) * 4);
     cleanDcache(c.rptr.cpu, kRptrBytes);
-    /*
-     * H236dl: stage the transition with the CP stopped. Sagit (a540, working
-     * submissions) halts the ME and VBIF, publishes the whole 0x66+timestamp
-     * stream while the pipeline is halted, and only then releases both. kgsl
-     * appends the command to a running ME; on this part that retires the
-     * packet (RPTR advances) without switching the mode.
-     */
-    wr(CP_ME_CNTL_REG, kCpHalt);
-    wr(VBIF_HALT, 0xf);
-    if (!waitReg(CP_ME_CNTL_REG, kCpHalt, kCpHalt, 20000) ||
-        !waitReg(VBIF_HALTED, 0xf, 0xf, 20000)) {
-        IOLog("NATIVE_GPU_C3: secure halt me=%08x vbif=%08x\n",
-              rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
-        return c.fail(45, "secure halt");
-    }
+    /* H236dr: upstream a5xx_hw_init appends CP_SET_SECURE_MODE(0) to the
+     * running ring and waits for idle (gpu->funcs->flush + a5xx_idle). */
     wr(CP_RB_WPTR, n);
-    __asm__ volatile("dsb sy" ::: "memory");
-    wr(VBIF_HALT, 0);
-    wr(CP_ME_CNTL_REG, 0);
     bool done = false;
     for (unsigned ms = 0; ms < 2000; ++ms) {
         if (rd(CP_RB_RPTR) == n) { done = true; break; }
@@ -1190,45 +1161,31 @@ static void c3_thread(void *, wait_result_t) {
      * SMMU context and the SID0 route are (re)built afterwards. */
     IOLog("NATIVE_GPU_C3: gpu reset\n");
     if (!gpu_reset(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: smmu setup\n");
-    native_log_flush_hook();
-    if (!smmu_setup(*c)) { gC3Done = 1; return; }
-    /* Vendor a5xx_rb_start order: ZAP is available before the CP starts,
-     * CP_SET_SECURE_MODE(0) follows ME_INIT, and GPMU starts after that. */
-    IOLog("NATIVE_GPU_C3: cp configure\n");
-    if (!cp_configure(*c)) { gC3Done = 1; return; }
+    /*
+     * H236ds: authenticate the ZAP before touching the GPU SMMU. The secure
+     * world keeps its own stream/context state in the SMMU; smmu_setup()
+     * reprograms CB0, SMR/S2CR and ACTLR from scratch, which may tear down the
+     * path the ZAP itself uses to run. kgsl's IOMMU driver preserves that
+     * state across start.
+     */
     IOLog("NATIVE_GPU_C3: zap load\n");
     native_log_flush_hook();
     if (!zap_load(*c)) { gC3Done = 1; return; }
-    /*
-     * H236dp: kgsl's a5xx_microcode_load(), after writing the CP instruction
-     * bases and with a retained ZAP, calls
-     *     SCM_SIP_FNID(SCM_SVC_BOOT, 0xA) with {0, 13} (atomic)
-     * so the secure world re-attaches the authenticated ZAP base to this
-     * power session. Our INSTR bases are already programmed (cp_configure) and
-     * the ME has not started yet, which is the same window.
-     */
-    {
-        uint64_t answer = ~0ull;
-        int32_t rc = smcCall(kScmFast | kScm64 | kScmSip | ((1ull << 8) | 0x0A), 2,
-                             0, kPasGpu, 0, &answer);
-        IOLog("NATIVE_GPU_C3: zap resume rc=%d answer=%llx\n", rc, answer);
-        native_log_flush_hook();
-    }
+    IOLog("NATIVE_GPU_C3: smmu setup\n");
+    native_log_flush_hook();
+    if (!smmu_setup(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: cp configure\n");
+    if (!cp_configure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp start\n");
     if (!cp_start(*c)) { gC3Done = 1; return; }
     /* H236db: kgsl a5xx_rb_start does microcode_load -> ME_INIT ->
      * set_unsecured_mode -> gpmu_init, i.e. the secure-mode switch comes
      * before the GPMU firmware (H236cz had it after and still saw trust=1). */
-    /* H236dl: sagit's AdrenoStartup finishes ME_INIT and the GPMU handshake
-     * first, then the engine stage halts the pipeline and performs the
-     * secure-mode transition. GPMU register writes work with trust=1
-     * (H236cz reached BABEFACE before the transition), so keep that order. */
+    IOLog("NATIVE_GPU_C3: zap unsecure\n");
+    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
-    IOLog("NATIVE_GPU_C3: zap unsecure\n");
-    if (!zap_unsecure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
