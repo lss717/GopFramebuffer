@@ -187,10 +187,6 @@ constexpr uint64_t kScmPasShutdown = (2ull << 8) | 6;
 constexpr uint64_t kScmOneValue = 1, kScmThreeValues = 3;
 constexpr uint64_t kScmValueAndBuffer = 2 | (2 << 6);
 constexpr uint32_t kPasGpu = 13;
-constexpr uint64_t kScmRestoreSecCfg = (0xCull << 8) | 2; /* SCM_SVC_MP, RESTORE_SEC_CFG */
-constexpr uint32_t kTzDeviceGpu = 18;                     /* TZ_DEVICE_GPU */
-constexpr uint64_t kScmIoWrite = (0x5ull << 8) | 2;       /* SCM_SVC_IO, SCM_IO_WRITE */
-constexpr uint64_t kScmFast = 1ull << 31;
 
 static int32_t smcCall(uint64_t function, uint64_t argInfo, uint64_t a1, uint64_t a2,
                        uint64_t a3, uint64_t *answer) {
@@ -1175,21 +1171,24 @@ static void c3_thread(void *, wait_result_t) {
     IOLog("NATIVE_GPU_C3: smmu setup\n");
     native_log_flush_hook();
     if (!smmu_setup(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: zap load\n");
-    native_log_flush_hook();
-    if (!zap_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp configure\n");
     if (!cp_configure(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: cp start\n");
     if (!cp_start(*c)) { gC3Done = 1; return; }
+    /* H236dx: bring the GPMU up first, then authenticate the ZAP; if the ZAP
+     * runs on the GPMU this is the first order in which it can execute. */
+    IOLog("NATIVE_GPU_C3: gpmu load\n");
+    if (!gpmu_load(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
+    IOLog("NATIVE_GPU_C3: zap load\n");
+    native_log_flush_hook();
+    if (!zap_load(*c)) { gC3Done = 1; return; }
+    IOLog("NATIVE_GPU_C3: gpmu after auth=%08x\n", rd(GPMU_GENERAL0));
     /* H236db: kgsl a5xx_rb_start does microcode_load -> ME_INIT ->
      * set_unsecured_mode -> gpmu_init, i.e. the secure-mode switch comes
      * before the GPMU firmware (H236cz had it after and still saw trust=1). */
     IOLog("NATIVE_GPU_C3: zap unsecure\n");
     if (!zap_unsecure(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: gpmu load\n");
-    if (!gpmu_load(*c)) { gC3Done = 1; return; }
-    IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE\n");
     IOLog("NATIVE_GPU_C3: submit probe\n");
     if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
