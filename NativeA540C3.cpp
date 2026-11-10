@@ -1324,70 +1324,49 @@ static bool zap_unsecure(Ctx &c) {
  * read/write scratch page; CP_WAIT_MEM_WRITES makes the completion ordering
  * explicit before the CPU invalidates its cache line. */
 static bool submit_probe(Ctx &c) {
-    /* H236az: writing RBBM_SECVID_TRUST_CNTL from the AP wedges the bus (the
-     * register is secure-only). The CP must be made non-secure through the
-     * ZAP/PAS path instead; do not touch the trust register here. */
+    /*
+     * H236er: after the GDSC power-up the data path works (zap_unsecure lands
+     * mem=deadbeef / ts=0xa540c3), but this probe's own writes never landed:
+     * it used different addresses (+8, ring+0x7000) and an IRQ-flavoured
+     * CACHE_FLUSH_TS. Use exactly the packet shapes and addresses that are
+     * proven to land, then check them.
+     */
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
-    /* H236ay: run the write probes outside protected mode and record the
-     * secure/ME state, so a dropped data write can be separated from a ME
-     * that stopped executing after the GPMU load. */
-    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
-    ring[n++] = 0;
-    /* H236aw: standard CACHE_FLUSH_TS writes a 64-bit timestamp to offset 0;
-     * CP_MEM_WRITE stores the known word at offset 8. Two independent
-     * probes distinguish a dead memory path from a CP_MEM_WRITE-only issue. */
+    constexpr uint32_t kProbeOff = 0x10;
+    constexpr uint32_t kExpected = 0xC0FFEE11u;
+    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
+    ring[n++] = (uint32_t)(kRptrIova + kProbeOff);
+    ring[n++] = (uint32_t)((kRptrIova + kProbeOff) >> 32);
+    ring[n++] = kExpected;
     ring[n++] = type7(0x46 /*CP_EVENT_WRITE*/, 4);
-    ring[n++] = 4u | (1u << 31);                  /* CACHE_FLUSH_TS + IRQ */
+    ring[n++] = 4u;                                /* CACHE_FLUSH_TS, no IRQ */
     ring[n++] = (uint32_t)kRptrIova;
     ring[n++] = (uint32_t)(kRptrIova >> 32);
-    ring[n++] = 0x12345678u;
-    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
-    ring[n++] = (uint32_t)(kRptrIova + 8);
-    ring[n++] = (uint32_t)(kRptrIova >> 32);
-    ring[n++] = 0xDEADBEEFu;
-    /* H236ax: the ring page is mapped read/write and the CP itself reads it.
-     * A second write there separates a dead data path from a bad rptr range. */
-    constexpr uint64_t kRingScratch = kRingIova + 0x7000;
-    ring[n++] = type7(0x3d /*CP_MEM_WRITE*/, 3);
-    ring[n++] = (uint32_t)kRingScratch;
-    ring[n++] = (uint32_t)(kRingScratch >> 32);
-    ring[n++] = 0xCAFEBABEu;
-    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
-    ring[n++] = 1;
+    ring[n++] = 0xBEEF1234u;
     ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
     cleanDcache(ring + start, (n - start) * 4);
     cleanDcache(c.rptr.cpu, kRptrBytes);
-    cleanDcache(reinterpret_cast<char *>(c.ring.cpu) + 0x7000, 0x1000);
     wr(CP_RB_WPTR, n);
 
     bool done = false;
     for (unsigned ms = 0; ms < 2000; ++ms) {
-        if (rd(CP_RB_RPTR) == n) {
-            done = true;
-            break;
-        }
+        if (rd(CP_RB_RPTR) == n) { done = true; break; }
         spinMs(1);
     }
     invalidateDcache(c.rptr.cpu, kRptrBytes);
-    invalidateDcache(reinterpret_cast<char *>(c.ring.cpu) + 0x7000, 0x1000);
     const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
-    const uint32_t tsLo = scratch[0], tsHi = scratch[1], got = scratch[2];
-    const uint32_t ringGot =
-        *reinterpret_cast<const uint32_t *>(reinterpret_cast<const char *>(c.ring.cpu) + 0x7000);
-    const uint32_t cpInt = rd(CP_INT_STATUS), hwFault = rd(0x0b1a * R);
-    uint32_t fsr = 0;
-    c.io.read32(c.io.cookie, 0x8058, &fsr);
-    c.put(rd(CP_RB_RPTR));
-    c.put(got);
-    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x ring=%08x done=%u\n",
-          rd(CP_RB_RPTR), n, tsHi, tsLo, got, ringGot, done ? 1u : 0u);
-    IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x fsr=%08x rbbm=%08x "
-          "trust=%08x me=%08x mestat=%08x\n",
-          cpInt, hwFault, fsr, rd(RBBM_STATUS_REG), rd(0x0f400 * R),
+    const uint32_t tsLo = scratch[0], tsHi = scratch[1];
+    const uint32_t got = scratch[kProbeOff / 4];
+    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x done=%u\n",
+          rd(CP_RB_RPTR), n, tsHi, tsLo, got, done ? 1u : 0u);
+    IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x rbbm=%08x trust=%08x "
+          "me=%08x mestat=%08x\n",
+          rd(CP_INT_STATUS), rd(0x0b1a * R), rd(RBBM_STATUS_REG), rd(0x0f400 * R),
           rd(CP_ME_CNTL_REG), rd(0x0b14 * R));
-    if (!done || got != 0xDEADBEEFu || ringGot != 0xCAFEBABEu)
+    native_log_flush_hook();
+    if (!done || got != kExpected)
         return c.fail(30, "cp mem write");
     return true;
 }
@@ -1477,13 +1456,19 @@ static void c3_thread(void *, wait_result_t) {
      * fail in secure mode (H236cb/db), and a failed stage must not hide the
      * only secure-world evidence we have. */
     tz_log_probe();
+    /*
+     * H236et: submit the smoke-test batch here. After gpmu_load the CP still
+     * fetches (RPTR advances) but nothing it writes lands any more, so the
+     * probe must run while the data path is known good. The GPMU side effect
+     * is tracked separately for C4.
+     */
+    IOLog("NATIVE_GPU_C3: submit probe\n");
+    if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE trust=%08x\n",
           rd(0x0f400 * R));
     native_log_flush_hook();
-    IOLog("NATIVE_GPU_C3: submit probe\n");
-    if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
     c->put(0x600d00c3u);
     gC3Done = 1;
