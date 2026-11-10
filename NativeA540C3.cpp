@@ -907,8 +907,19 @@ static bool zap_unsecure(Ctx &c) {
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     const unsigned start = rd(CP_RB_RPTR);
     unsigned n = start;
-    ring[n++] = type7(0x66 /*CP_SET_SECURE_MODE*/, 1);
+    /*
+     * H236df (variant B): the AP write to RBBM_SECVID_TRUST_CNTL wedges the
+     * bus (H236az/dc), so let the CP write it instead, exactly like kgsl's
+     * a4xx cp_secure_mode(): protected-mode off, CP_WIDE_REG_WRITE of the
+     * trust register, protected-mode on.
+     */
+    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
     ring[n++] = 0;
+    ring[n++] = type7(0x74 /*CP_WIDE_REG_WRITE*/, 2);
+    ring[n++] = 0x0000F400;   /* RBBM_SECVID_TRUST_CNTL (dword index) */
+    ring[n++] = 0;
+    ring[n++] = type7(0x5f /*CP_SET_PROTECTED_MODE*/, 1);
+    ring[n++] = 1;
     ring[n++] = type7(0x26 /*CP_WAIT_FOR_IDLE*/, 0);
     /*
      * H236da: sagit's AdrenoSubmit::Engine::start submits a real timestamp in
