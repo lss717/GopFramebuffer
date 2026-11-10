@@ -648,6 +648,111 @@ static bool cp_configure(Ctx &c) {
     };
     for (const auto &e : cfg)
         wr(e.off, e.val);
+    /*
+     * H236ef: last missing block of the vendor/mainline a5xx hw-init - the
+     * a540 hardware clock-gating table (kgsl a5xx_hwcg_set ->
+     * a540_hwcg_regs, mainline a5xx_set_hwcg(gpu, true)). Byte offsets into
+     * the GPU register block, extracted mechanically from a5xx_reg.h.
+     */
+    static const struct { uint32_t off, val; } hwcg[] = {
+        { 0x001a0u, 0x02222222u },  // A5XX_RBBM_CLOCK_CNTL_SP0
+        { 0x001a4u, 0x02222222u },  // A5XX_RBBM_CLOCK_CNTL_SP1
+        { 0x001a8u, 0x02222222u },  // A5XX_RBBM_CLOCK_CNTL_SP2
+        { 0x001acu, 0x02222222u },  // A5XX_RBBM_CLOCK_CNTL_SP3
+        { 0x001b0u, 0x02222220u },  // A5XX_RBBM_CLOCK_CNTL2_SP0
+        { 0x001b4u, 0x02222220u },  // A5XX_RBBM_CLOCK_CNTL2_SP1
+        { 0x001b8u, 0x02222220u },  // A5XX_RBBM_CLOCK_CNTL2_SP2
+        { 0x001bcu, 0x02222220u },  // A5XX_RBBM_CLOCK_CNTL2_SP3
+        { 0x001c0u, 0x0000f3cfu },  // A5XX_RBBM_CLOCK_HYST_SP0
+        { 0x001c4u, 0x0000f3cfu },  // A5XX_RBBM_CLOCK_HYST_SP1
+        { 0x001c8u, 0x0000f3cfu },  // A5XX_RBBM_CLOCK_HYST_SP2
+        { 0x001ccu, 0x0000f3cfu },  // A5XX_RBBM_CLOCK_HYST_SP3
+        { 0x001d0u, 0x00000080u },  // A5XX_RBBM_CLOCK_DELAY_SP0
+        { 0x001d4u, 0x00000080u },  // A5XX_RBBM_CLOCK_DELAY_SP1
+        { 0x001d8u, 0x00000080u },  // A5XX_RBBM_CLOCK_DELAY_SP2
+        { 0x001dcu, 0x00000080u },  // A5XX_RBBM_CLOCK_DELAY_SP3
+        { 0x00128u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_TP0
+        { 0x0012cu, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_TP1
+        { 0x00130u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_TP2
+        { 0x00134u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_TP3
+        { 0x00138u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL2_TP0
+        { 0x0013cu, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL2_TP1
+        { 0x00140u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL2_TP2
+        { 0x00144u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL2_TP3
+        { 0x00148u, 0x00002222u },  // A5XX_RBBM_CLOCK_CNTL3_TP0
+        { 0x0014cu, 0x00002222u },  // A5XX_RBBM_CLOCK_CNTL3_TP1
+        { 0x00150u, 0x00002222u },  // A5XX_RBBM_CLOCK_CNTL3_TP2
+        { 0x00154u, 0x00002222u },  // A5XX_RBBM_CLOCK_CNTL3_TP3
+        { 0x002c0u, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST_TP0
+        { 0x002c4u, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST_TP1
+        { 0x002c8u, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST_TP2
+        { 0x002ccu, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST_TP3
+        { 0x002d0u, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST2_TP0
+        { 0x002d4u, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST2_TP1
+        { 0x002d8u, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST2_TP2
+        { 0x002dcu, 0x77777777u },  // A5XX_RBBM_CLOCK_HYST2_TP3
+        { 0x002e0u, 0x00007777u },  // A5XX_RBBM_CLOCK_HYST3_TP0
+        { 0x002e4u, 0x00007777u },  // A5XX_RBBM_CLOCK_HYST3_TP1
+        { 0x002e8u, 0x00007777u },  // A5XX_RBBM_CLOCK_HYST3_TP2
+        { 0x002ecu, 0x00007777u },  // A5XX_RBBM_CLOCK_HYST3_TP3
+        { 0x00290u, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY_TP0
+        { 0x00294u, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY_TP1
+        { 0x00298u, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY_TP2
+        { 0x0029cu, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY_TP3
+        { 0x002a0u, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY2_TP0
+        { 0x002a4u, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY2_TP1
+        { 0x002a8u, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY2_TP2
+        { 0x002acu, 0x11111111u },  // A5XX_RBBM_CLOCK_DELAY2_TP3
+        { 0x002b0u, 0x00001111u },  // A5XX_RBBM_CLOCK_DELAY3_TP0
+        { 0x002b4u, 0x00001111u },  // A5XX_RBBM_CLOCK_DELAY3_TP1
+        { 0x002b8u, 0x00001111u },  // A5XX_RBBM_CLOCK_DELAY3_TP2
+        { 0x002bcu, 0x00001111u },  // A5XX_RBBM_CLOCK_DELAY3_TP3
+        { 0x00168u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_UCHE
+        { 0x0016cu, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL2_UCHE
+        { 0x00170u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL3_UCHE
+        { 0x00174u, 0x00222222u },  // A5XX_RBBM_CLOCK_CNTL4_UCHE
+        { 0x00178u, 0x00444444u },  // A5XX_RBBM_CLOCK_HYST_UCHE
+        { 0x0017cu, 0x00000002u },  // A5XX_RBBM_CLOCK_DELAY_UCHE
+        { 0x001e0u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_RB0
+        { 0x001e4u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_RB1
+        { 0x001e8u, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_RB2
+        { 0x001ecu, 0x22222222u },  // A5XX_RBBM_CLOCK_CNTL_RB3
+        { 0x001f0u, 0x00222222u },  // A5XX_RBBM_CLOCK_CNTL2_RB0
+        { 0x001f4u, 0x00222222u },  // A5XX_RBBM_CLOCK_CNTL2_RB1
+        { 0x001f8u, 0x00222222u },  // A5XX_RBBM_CLOCK_CNTL2_RB2
+        { 0x001fcu, 0x00222222u },  // A5XX_RBBM_CLOCK_CNTL2_RB3
+        { 0x00208u, 0x00022220u },  // A5XX_RBBM_CLOCK_CNTL_CCU0
+        { 0x0020cu, 0x00022220u },  // A5XX_RBBM_CLOCK_CNTL_CCU1
+        { 0x00210u, 0x00022220u },  // A5XX_RBBM_CLOCK_CNTL_CCU2
+        { 0x00214u, 0x00022220u },  // A5XX_RBBM_CLOCK_CNTL_CCU3
+        { 0x00228u, 0x05522222u },  // A5XX_RBBM_CLOCK_CNTL_RAC
+        { 0x0022cu, 0x00505555u },  // A5XX_RBBM_CLOCK_CNTL2_RAC
+        { 0x00218u, 0x04040404u },  // A5XX_RBBM_CLOCK_HYST_RB_CCU0
+        { 0x0021cu, 0x04040404u },  // A5XX_RBBM_CLOCK_HYST_RB_CCU1
+        { 0x00220u, 0x04040404u },  // A5XX_RBBM_CLOCK_HYST_RB_CCU2
+        { 0x00224u, 0x04040404u },  // A5XX_RBBM_CLOCK_HYST_RB_CCU3
+        { 0x00200u, 0x07444044u },  // A5XX_RBBM_CLOCK_HYST_RAC
+        { 0x00230u, 0x00000002u },  // A5XX_RBBM_CLOCK_DELAY_RB_CCU_L1_0
+        { 0x00234u, 0x00000002u },  // A5XX_RBBM_CLOCK_DELAY_RB_CCU_L1_1
+        { 0x00238u, 0x00000002u },  // A5XX_RBBM_CLOCK_DELAY_RB_CCU_L1_2
+        { 0x0023cu, 0x00000002u },  // A5XX_RBBM_CLOCK_DELAY_RB_CCU_L1_3
+        { 0x00204u, 0x00010011u },  // A5XX_RBBM_CLOCK_DELAY_RAC
+        { 0x0018cu, 0x04222222u },  // A5XX_RBBM_CLOCK_CNTL_TSE_RAS_RBBM
+        { 0x00180u, 0x02222222u },  // A5XX_RBBM_CLOCK_MODE_GPC
+        { 0x00244u, 0x00002222u },  // A5XX_RBBM_CLOCK_MODE_VFD
+        { 0x00190u, 0x00000000u },  // A5XX_RBBM_CLOCK_HYST_TSE_RAS_RBBM
+        { 0x00188u, 0x04104004u },  // A5XX_RBBM_CLOCK_HYST_GPC
+        { 0x00240u, 0x00000000u },  // A5XX_RBBM_CLOCK_HYST_VFD
+        { 0x00198u, 0x00000000u },  // A5XX_RBBM_CLOCK_DELAY_HLSQ
+        { 0x00194u, 0x00004000u },  // A5XX_RBBM_CLOCK_DELAY_TSE_RAS_RBBM
+        { 0x00184u, 0x00000200u },  // A5XX_RBBM_CLOCK_DELAY_GPC
+        { 0x00248u, 0x00002222u },  // A5XX_RBBM_CLOCK_DELAY_VFD
+        { 0x00328u, 0x00000222u },  // A5XX_RBBM_CLOCK_HYST_GPMU
+        { 0x00324u, 0x00000770u },  // A5XX_RBBM_CLOCK_DELAY_GPMU
+        { 0x00328u, 0x00000004u },  // A5XX_RBBM_CLOCK_HYST_GPMU
+    };
+    for (const auto &e : hwcg)
+        wr(e.off, e.val);
     wr(0x3980, rd(0x3980) | (1u << 10) | (1u << 23));  // VPC_DBG_ECO_CNTL
     wr(0x3810, rd(0x3810) & ~(1u << 18));              // HLSQ_DBG_ECO_CNTL
 
@@ -1077,8 +1182,11 @@ static void tz_log_probe(void) {
     const uint32_t hypSize = w[0xb34 / 4];
     IOLog("NATIVE_GPU_C3: hyplog ptr=%08x size=%08x\n", hypPtr, hypSize);
     native_log_flush_hook();
-    dump_text_window(0x14692000ULL, 0x1000, "tzptr");
-    dump_text_window(0x146BF720ULL, 0x3000, "tzring");
+    /*
+     * H236eg: do not walk 0x146BF720 / 0x14692000 any more. Reading deeper into
+     * the TZ diag region hangs the bus (H236ed/ee/ef); the hyp log below is the
+     * part that reads reliably, and the qsee ring is encrypted anyway.
+     */
     if (hypPtr && hypSize >= 16 && hypSize <= 0x8000)
         dump_text_window(hypPtr, hypSize, "hyp");
 }
