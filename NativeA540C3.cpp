@@ -522,6 +522,37 @@ static bool gpu_reset(Ctx &c) {
           gAhb, gccRd(0x71004), gBimc, gccRd(0x71010), gSrc, gccRd(0x7100c),
           gBgfx, gccRd(0x46040), gPll0, gccRd(0x5200c));
     native_log_flush_hook();
+    /*
+     * H236eq: kgsl's a5xx_regulator_enable() powers the RBCCU and SP(SPTP)
+     * GDSCs through the GPMU on every power-on and waits for bit 20 in the
+     * status registers; then it toggles the SP clock with hwcg applied. We
+     * never did any of this, so the shader side stayed collapsed - which is
+     * exactly why 0xE000+ reads return a floating pattern and 0x0EC0
+     * (SP_DBG_ECO_CNTL) hangs the bus. Order and values follow the vendor
+     * code (0x778000 = default values with SW_COLLAPSE cleared).
+     */
+    wr(0xa887 * R, 0x00778000u);            /* GPMU_RBCCU_POWER_CNTL */
+    bool rbcOn = false;
+    for (unsigned i = 0; i < 200; ++i) {
+        if (rd(0xa88d * R) & (1u << 20)) { rbcOn = true; break; }
+        spinMs(1);
+    }
+    wr(0xa881 * R, 0x00778000u);            /* GPMU_SP_POWER_CNTL */
+    bool spOn = false;
+    for (unsigned i = 0; i < 200; ++i) {
+        if (rd(0xa88b * R) & (1u << 20)) { spOn = true; break; }
+        spinMs(1);
+    }
+    IOLog("NATIVE_GPU_C3: gdsc rbbu=%08x(%u) sp=%08x(%u)\n",
+          rd(0xa88d * R), rbcOn ? 1u : 0u, rd(0xa88b * R), spOn ? 1u : 0u);
+    native_log_flush_hook();
+    /* Disable/enable the SP clock around the hwcg programming, as the vendor
+     * sequence does (CNTL_IP_CLK_ENABLE = BIT(0)). */
+    wr(0xa880 * R, rd(0xa880 * R) & ~1u);
+    wr(0xa880 * R, rd(0xa880 * R) | 1u);
+    IOLog("NATIVE_GPU_C3: sp clk ctl=%08x\n", rd(0xa880 * R));
+    native_log_flush_hook();
+
     IOLog("NATIVE_GPU_C3: reset halt write me=%08x vbif=%08x\n",
           rd(CP_ME_CNTL_REG), rd(VBIF_HALTED));
     native_log_flush_hook();
