@@ -25,6 +25,15 @@
 // purpose so the test reports "reached the driver" instead of failing at the open.
 // H203: persistent ABI state for the UFS heartbeat; the boot log window is unreliable, so the counters
 // and the last SetMetadata text must survive in the kernel and be printed every heartbeat instead.
+/* C4-B: the ABI surface exported by NativeA540C3.cpp. */
+extern "C" int native_a540_gpu_ready(void);
+extern "C" uint64_t native_a540_bo_iova(unsigned slot);
+extern "C" unsigned native_a540_bo_bytes(void);
+extern "C" unsigned native_a540_bo_slots(void);
+extern "C" void *native_a540_bo_descriptor(unsigned slot);
+extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence);
+extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns);
+
 extern "C" volatile int native_a540_abi_calls;
 extern "C" volatile int native_a540_abi_last_method;
 extern "C" volatile int native_a540_abi_reports;
@@ -41,10 +50,22 @@ extern "C" { volatile uint32_t native_a540_open_count = 0; volatile uint32_t nat
 // H194's kernel-side grant was followed by "IOUC NativeAcceleratorClient failed MACF".
 class AGXDeviceUserClient : public IOUserClient {
     OSDeclareDefaultStructors(AGXDeviceUserClient)
+    /* C4-B: handles are slot+1, so zero stays invalid. The pool itself lives in
+     * NativeA540C3.cpp and is never freed, which is why a fresh descriptor per
+     * clientMemoryForType call is safe here. */
+    bool boUsed_[8] = {};
+    int slotOf(uint64_t handle) {
+        if (!handle) return -1;
+        const unsigned s = (unsigned)(handle - 1);
+        if (s >= native_a540_bo_slots() || s >= 8 || !boUsed_[s]) return -1;
+        return (int)s;
+    }
 public:
     bool initWithTask(task_t owningTask,void *securityID,UInt32 type,OSDictionary *properties) override;
     IOReturn clientClose() override;
     IOReturn clientDied() override;
+    IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
+                                 IOMemoryDescriptor **memory) override;
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                             IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
 };
@@ -76,6 +97,21 @@ IOReturn accelCopyOut(IOExternalMethodArguments *arguments, const void *data, si
     return kIOReturnSuccess;
 }
 }  // namespace
+
+IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+                                                  IOMemoryDescriptor **memory) {
+    if (memory) *memory = nullptr;
+    for (unsigned i = 0; i < 2400 && !native_a540_gpu_ready(); ++i)
+        IOSleep(50);
+    if (!native_a540_gpu_ready()) return kIOReturnNotReady;
+    if (type >= native_a540_bo_slots()) return kIOReturnNoDevice;
+    IOMemoryDescriptor *d = static_cast<IOMemoryDescriptor *>(native_a540_bo_descriptor(type));
+    if (!d) return kIOReturnNoDevice;
+    d->retain();
+    if (memory) *memory = d;
+    if (options) *options = 0;
+    return kIOReturnSuccess;
+}
 
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                                  IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) {
@@ -138,8 +174,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
         case NativeAdrenoMethodGetDeviceInfo: {
             NativeAdrenoAbiDeviceInfo info = {};
             info.chip_id = 0x05040000;   /* Adreno 540 family (a5xx) */
-            info.va_start = 0x10000000;
-            info.va_size = 0x10000000;
+            info.va_start = native_a540_bo_iova(0);
+            info.va_size = (uint64_t)native_a540_bo_slots() * native_a540_bo_bytes();
             return accelCopyOut(arguments, &info, sizeof info);
         }
         case NativeAdrenoMethodGetStatus: {
@@ -149,6 +185,82 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
         case NativeAdrenoMethodGetTimestamp: {
             NativeAdrenoAbiTimestamp stamp = { mach_absolute_time() };
             return accelCopyOut(arguments, &stamp, sizeof stamp);
+        }
+        case NativeAdrenoMethodBoAlloc: {
+            /* H236fd: the render-server test can reach the ABI before the C3
+             * step machine has finished (it runs at ~35 s, C3 at ~70 s), so a
+             * plain NotReady makes it give up. Wait for the engine instead. */
+            for (unsigned i = 0; i < 2400 && !native_a540_gpu_ready(); ++i)
+                IOSleep(50);   /* up to 120 s */
+            if (!native_a540_gpu_ready()) return kIOReturnNotReady;
+            int slot = -1;
+            for (unsigned i = 0; i < native_a540_bo_slots() && i < 8; ++i)
+                if (!boUsed_[i]) { slot = (int)i; break; }
+            if (slot < 0) return kIOReturnNoSpace;
+            boUsed_[slot] = true;
+            NativeAdrenoAbiBoAllocReply reply = { (uint64_t)(slot + 1) };
+            return accelCopyOut(arguments, &reply, sizeof reply);
+        }
+        case NativeAdrenoMethodBoMap: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiBoMap))
+                return kIOReturnBadArgument;
+            const NativeAdrenoAbiBoMap *m =
+                reinterpret_cast<const NativeAdrenoAbiBoMap *>(input + 2);
+            const int slot = slotOf(m->handle);
+            if (slot < 0) return kIOReturnBadArgument;
+            if (m->iova != native_a540_bo_iova((unsigned)slot)) return kIOReturnBadArgument;
+            NativeAdrenoAbiBoMapReply reply = { m->iova };
+            return accelCopyOut(arguments, &reply, sizeof reply);
+        }
+        case NativeAdrenoMethodBoCpuMap: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiBoCpuMap))
+                return kIOReturnBadArgument;
+            const NativeAdrenoAbiBoCpuMap *m =
+                reinterpret_cast<const NativeAdrenoAbiBoCpuMap *>(input + 2);
+            const int slot = slotOf(m->handle);
+            if (slot < 0) return kIOReturnBadArgument;
+            NativeAdrenoAbiBoCpuMapReply reply = {};
+            reply.token = (uint32_t)slot;
+            reply.bytes = native_a540_bo_bytes();
+            return accelCopyOut(arguments, &reply, sizeof reply);
+        }
+        case NativeAdrenoMethodBoCpuUnmap:
+            return kIOReturnSuccess;
+        case NativeAdrenoMethodBoFree: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiBoFree))
+                return kIOReturnBadArgument;
+            const NativeAdrenoAbiBoFree *f =
+                reinterpret_cast<const NativeAdrenoAbiBoFree *>(input + 2);
+            const int slot = slotOf(f->handle);
+            if (slot < 0) return kIOReturnBadArgument;
+            boUsed_[slot] = false;
+            return kIOReturnSuccess;
+        }
+        case NativeAdrenoMethodSubmit: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiSubmit))
+                return kIOReturnBadArgument;
+            const NativeAdrenoAbiSubmit *sub =
+                reinterpret_cast<const NativeAdrenoAbiSubmit *>(input + 2);
+            if (sub->buffer_count != 1) return kIOReturnBadArgument;
+            const int slot = slotOf(sub->buffers[0].handle);
+            if (slot < 0) return kIOReturnBadArgument;
+            if (sub->buffers[0].iova != native_a540_bo_iova((unsigned)slot))
+                return kIOReturnBadArgument;
+            const unsigned words = (unsigned)(sub->buffers[0].bytes / 4);
+            uint64_t fence = 0;
+            if (native_a540_submit_bo((unsigned)slot, words, &fence))
+                return kIOReturnError;
+            NativeAdrenoAbiSubmitReply reply = { fence };
+            return accelCopyOut(arguments, &reply, sizeof reply);
+        }
+        case NativeAdrenoMethodWaitFence: {
+            if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiWaitFence))
+                return kIOReturnBadArgument;
+            const NativeAdrenoAbiWaitFence *w =
+                reinterpret_cast<const NativeAdrenoAbiWaitFence *>(input + 2);
+            if (native_a540_wait_fence(w->fence, w->timeout_ns))
+                return kIOReturnTimeout;
+            return kIOReturnSuccess;
         }
         case NativeAdrenoMethodSetMetadata: {
             if (arguments->structureInputSize < 8 + sizeof(NativeAdrenoAbiMetadata)) return kIOReturnBadArgument;

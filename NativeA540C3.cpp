@@ -60,9 +60,11 @@ constexpr size_t kRptrBytes  = 0x1000;
 /* C4-B: the first two real GPU buffers (an indirect-buffer page and a target
  * page). They sit above the bring-up IOVAs and are mapped exactly like the ring,
  * so a submission through them exercises the same path user space will use. */
-constexpr uint64_t kIbIova    = 0x2000000ULL;
-constexpr uint64_t kTgtIova   = 0x2001000ULL;
-constexpr size_t   kBoBytes   = 0x1000;
+constexpr unsigned kBoSlots   = 8;          /* C4-B: pool of user-visible BOs */
+constexpr uint64_t kBoBase    = 0x2000000ULL;
+constexpr size_t   kBoPage    = 0x1000;
+#define kIbIova  (kBoBase)
+#define kTgtIova (kBoBase + kBoPage)
 
 struct GpuWindow {
     IOMemoryMap *map;
@@ -240,7 +242,8 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
 
 struct Ctx {
     void (*record)(uint32_t);
-    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win, boIb, boTarget;
+    Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win;
+    Alloc bo[kBoSlots];
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
@@ -385,17 +388,20 @@ static bool smmu_setup(Ctx &c) {
     c.cfg.table_physical = c.tables.phys;
     c.cfg.leaf_budget = 0x80000000ULL / 4096;
 
-    ArmSmmu4KRange r[8] = {
-        { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
-        { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
-        { kPfpIova, c.pfp.phys, (c.pfp.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
-        { kGpmuIova, c.gpmu.phys, (c.gpmu.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 },
-        { kRptrIova, c.rptr.phys, kRptrBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
-        { kIbIova, c.boIb.phys, kBoBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
-        { kTgtIova, c.boTarget.phys, kBoBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
-        { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 },
-    };
-    if (ArmSmmu4KBuild(&c.cfg, r, 8, reinterpret_cast<uint64_t *>(c.tables.cpu),
+    /* ArmSmmu4KBuild requires ascending, non-overlapping IOVAs: bring-up
+     * buffers, then the BO pool, then the trusted window. */
+    ArmSmmu4KRange r[6 + kBoSlots];
+    size_t nr = 0;
+    r[nr++] = { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    r[nr++] = { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 };
+    r[nr++] = { kPfpIova, c.pfp.phys, (c.pfp.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 };
+    r[nr++] = { kGpmuIova, c.gpmu.phys, (c.gpmu.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 };
+    r[nr++] = { kRptrIova, c.rptr.phys, kRptrBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    for (unsigned i = 0; i < kBoSlots; ++i)
+        r[nr++] = { kBoBase + i * kBoPage, c.bo[i].phys, kBoPage,
+                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    r[nr++] = { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    if (ArmSmmu4KBuild(&c.cfg, r, nr, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
         return c.fail(4, "smmu build");
     cleanDcache(c.tables.cpu, c.tables.bytes);
@@ -1243,9 +1249,9 @@ static void tz_log_probe(void) {
  * CP_INDIRECT_BUFFER_PFE - the same shape the user-space Turnip test uses.
  */
 static bool bo_submit_test(Ctx &c) {
-    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.boIb.cpu);
-    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(c.boTarget.cpu);
-    for (unsigned i = 0; i < kBoBytes / 4; ++i)
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[0].cpu);
+    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(c.bo[1].cpu);
+    for (unsigned i = 0; i < kBoPage / 4; ++i)
         tgt[i] = 0xdeadbeefu;
     const uint32_t vals[3] = { 0x0adc0de1u, 0xfeed0002u, 0x600d0003u };
     unsigned w = 0;
@@ -1255,8 +1261,8 @@ static bool bo_submit_test(Ctx &c) {
         ib[w++] = (uint32_t)((kTgtIova + i * 4) >> 32);
         ib[w++] = vals[i];
     }
-    cleanDcache(c.boIb.cpu, kBoBytes);
-    cleanDcache(c.boTarget.cpu, kBoBytes);
+    cleanDcache(c.bo[0].cpu, kBoPage);
+    cleanDcache(c.bo[1].cpu, kBoPage);
 
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     unsigned n = rd(CP_RB_RPTR);
@@ -1283,8 +1289,8 @@ static bool bo_submit_test(Ctx &c) {
         spinMs(1);
     spinMs(20);
     invalidateDcache(c.rptr.cpu, kRptrBytes);
-    invalidateDcache(c.boTarget.cpu, kBoBytes);
-    const uint32_t *t = reinterpret_cast<const uint32_t *>(c.boTarget.cpu);
+    invalidateDcache(c.bo[1].cpu, kBoPage);
+    const uint32_t *t = reinterpret_cast<const uint32_t *>(c.bo[1].cpu);
     const unsigned hits = (t[0] == vals[0]) + (t[1] == vals[1]) + (t[2] == vals[2]) +
                           (t[3] == 0xdeadbeefu);
     IOLog("NATIVE_GPU_C3: bo submit done=%u rptr=%u/%u ib0=%08x tgt=%08x/%08x/%08x "
@@ -1450,6 +1456,8 @@ static bool submit_probe(Ctx &c) {
 
 static Ctx *gC3;
 static volatile int gC3Started, gC3Done;
+static volatile int gA540Ready;      /* C4-B: set once the engine is usable */
+static uint32_t gA540Fence;          /* monotonic fence payload */
 
 static void c3_thread(void *, wait_result_t) {
     Ctx *c = gC3;
@@ -1469,8 +1477,9 @@ static void c3_thread(void *, wait_result_t) {
     /* H236dq: one page inside kgsl's trusted IOVA window (0xE8000000..0xF8000000)
      * to compare CP writes inside vs outside the window. */
     if (!c->win.init(0x1000)) { c->put(0xdea00039u); gC3Done = 1; return; }
-    if (!c->boIb.init(kBoBytes)) { c->put(0xdea0003au); gC3Done = 1; return; }
-    if (!c->boTarget.init(kBoBytes)) { c->put(0xdea0003bu); gC3Done = 1; return; }
+    for (unsigned i = 0; i < kBoSlots; ++i) {
+        if (!c->bo[i].init(kBoPage)) { c->put(0xdea0003au); gC3Done = 1; return; }
+    }
     /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
      * window inside the kernel window and appends zap-base=<phys>. Map the
      * metadata at +0 and the .b02 image at +1 MiB. */
@@ -1552,9 +1561,83 @@ static void c3_thread(void *, wait_result_t) {
     IOLog("NATIVE_GPU_C3: bo submit test\n");
     if (!bo_submit_test(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
+    gA540Ready = 1;
     c->put(0x600d00c3u);
     gC3Done = 1;
 }
+
+
+/*
+ * C4-B step 2: the ABI surface. The C3 context owns the ring, the SMMU table and
+ * the BO pool; the accelerator user client only routes calls here.
+ */
+extern "C" int native_a540_gpu_ready(void) { return gA540Ready; }
+extern "C" uint64_t native_a540_bo_iova(unsigned slot) {
+    return slot < kBoSlots ? (kBoBase + slot * kBoPage) : 0;
+}
+extern "C" unsigned native_a540_bo_bytes(void) { return (unsigned)kBoPage; }
+extern "C" unsigned native_a540_bo_slots(void) { return kBoSlots; }
+extern "C" void *native_a540_bo_descriptor(unsigned slot) {
+    return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
+}
+
+extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence) {
+    if (!gC3 || !gA540Ready || slot >= kBoSlots || !fence || !words || words > kBoPage / 4)
+        return -1;
+    Ctx &c = *gC3;
+    /* The caller writes the IB through its own mapping; flush those physical
+     * lines so the GPU-side read cannot come from a stale cache line. */
+    cleanDcache(c.bo[slot].cpu, kBoPage);
+    uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
+    unsigned n = rd(CP_RB_RPTR);
+    const unsigned start = n;
+    const uint64_t iova = kBoBase + slot * kBoPage;
+    ring[n++] = type7(0x3f /*CP_INDIRECT_BUFFER_PFE*/, 3);
+    ring[n++] = (uint32_t)iova;
+    ring[n++] = (uint32_t)(iova >> 32);
+    ring[n++] = words;
+    const uint64_t f = ++gA540Fence;
+    ring[n++] = type7(0x46 /*CP_EVENT_WRITE*/, 4);
+    ring[n++] = 4u;                       /* CACHE_FLUSH_TS */
+    ring[n++] = (uint32_t)kRptrIova;
+    ring[n++] = (uint32_t)(kRptrIova >> 32);
+    ring[n++] = (uint32_t)f;
+    ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
+    cleanDcache(ring + start, (n - start) * 4);
+    cleanDcache(c.rptr.cpu, kRptrBytes);
+    wr(CP_RB_WPTR, n);
+    bool done = false;
+    for (unsigned ms = 0; ms < 2000; ++ms) {
+        if (rd(CP_RB_RPTR) == n) { done = true; break; }
+        spinMs(1);
+    }
+    for (unsigned ms = 0; ms < 500 && (rd(RBBM_STATUS_REG) & 0x7eu); ++ms)
+        spinMs(1);
+    spinMs(20);
+    if (!done)
+        return -2;
+    *fence = f;
+    return 0;
+}
+
+extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns) {
+    if (!gC3 || !fence)
+        return -1;
+    Ctx &c = *gC3;
+    unsigned ms = (unsigned)(timeout_ns / 1000000ull);
+    if (ms == 0) ms = 1;
+    if (ms > 5000) ms = 5000;
+    for (unsigned i = 0; i < ms; ++i) {
+        invalidateDcache(c.rptr.cpu, kRptrBytes);
+        const uint32_t *s = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
+        if (s[0] == (uint32_t)fence && s[1] == 0u)
+            return 0;
+        spinMs(1);
+    }
+    return -1;
+}
+
+extern "C" uint64_t native_a540_gpu_fence(void) { return gA540Fence; }
 
 extern "C" int sheng_a540_c3_run(void (*record)(uint32_t)) {
     if (gC3Started)
