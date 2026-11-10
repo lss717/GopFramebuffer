@@ -1355,12 +1355,22 @@ static bool submit_probe(Ctx &c) {
         if (rd(CP_RB_RPTR) == n) { done = true; break; }
         spinMs(1);
     }
+    /* H236ez: RPTR advancing only means the packets were fetched. Wait for the
+     * RBBM to go idle and give the writes a moment before reading them back;
+     * without this the probe reported the previous run's values. */
+    unsigned idleMs = 0;
+    for (; idleMs < 500; ++idleMs) {
+        if (!(rd(RBBM_STATUS_REG) & 0x7eu)) break;
+        spinMs(1);
+    }
+    spinMs(20);
     invalidateDcache(c.rptr.cpu, kRptrBytes);
     const uint32_t *scratch = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
     const uint32_t tsLo = scratch[0], tsHi = scratch[1];
     const uint32_t got = scratch[kProbeOff / 4];
-    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u ts=%08x%08x value=%08x done=%u\n",
-          rd(CP_RB_RPTR), n, tsHi, tsLo, got, done ? 1u : 0u);
+    IOLog("NATIVE_GPU_C3: submit write rptr=%u/%u idle_ms=%u ts=%08x%08x value=%08x "
+          "done=%u\n",
+          rd(CP_RB_RPTR), n, idleMs, tsHi, tsLo, got, done ? 1u : 0u);
     IOLog("NATIVE_GPU_C3: submit diag cpint=%08x hwfault=%08x rbbm=%08x trust=%08x "
           "me=%08x mestat=%08x\n",
           rd(CP_INT_STATUS), rd(0x0b1a * R), rd(RBBM_STATUS_REG), rd(0x0f400 * R),
@@ -1462,13 +1472,16 @@ static void c3_thread(void *, wait_result_t) {
      * probe must run while the data path is known good. The GPMU side effect
      * is tracked separately for C4.
      */
-    IOLog("NATIVE_GPU_C3: submit probe\n");
-    if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: gpmu load\n");
     if (!gpmu_load(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: GPMU firmware reached BABEFACE trust=%08x\n",
           rd(0x0f400 * R));
     native_log_flush_hook();
+    /* H236ex: kgsl order (0x66 -> gpmu_init -> submit) works as long as the
+     * probe waits for CP_WAIT_MEM_WRITES and an idle RBBM before reading back.
+     * The earlier "writes stop landing after gpmu" was a probe bug. */
+    IOLog("NATIVE_GPU_C3: submit probe\n");
+    if (!submit_probe(*c)) { gC3Done = 1; return; }
     IOLog("NATIVE_GPU_C3: submit test ok\n");
     c->put(0x600d00c3u);
     gC3Done = 1;
