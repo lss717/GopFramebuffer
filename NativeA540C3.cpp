@@ -1050,6 +1050,13 @@ static bool zap_load(Ctx &c) {
     memset(c.zapImage.cpu, 0, c.zapImage.bytes);
     memcpy(c.zapImage.cpu, a540_fw_zap_b02, a540_fw_zap_b02_size);
     cleanDcache(c.zapImage.cpu, c.zapImage.bytes);
+    /*
+     * H236ej: ownership hygiene. After the clean every line is in DRAM, but the
+     * CPU lines are still present and clean; invalidate them so no later
+     * eviction can write anything over the page once the TZ takes it.
+     */
+    invalidateDcache(c.zapImage.cpu, c.zapImage.bytes);
+    __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("dsb sy" ::: "memory");
     IOLog("NATIVE_GPU_C3: zap image written=%08x %08x\n", zapWords[0], zapWords[1]);
     native_log_flush_hook();
