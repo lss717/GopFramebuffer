@@ -474,6 +474,7 @@ public:
             finishTransfer(request);
             return;
         }
+        uint64_t kickStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(kickStart));
         if(!surface->metaCast("IOSurface"))return;
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
         PE_Video video={};
@@ -548,7 +549,28 @@ public:
             stored=length;
         }
         __asm__ volatile("dsb sy" ::: "memory");
-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
+        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
+            native_legacy_copy_timing_observed(copyEnd-copyStart,stored);
+            /* H272r: the total time from kick entry to copy end, so the 99 s can be
+             * attributed to a segment instead of the whole swap. */
+            uint64_t nowTick;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(nowTick));
+            IOLog("NATIVE_LEGACY_COPY: ticks=%llu us=%llu bytes=%llu kick_us=%llu\n",
+                  (unsigned long long)(copyEnd-copyStart),
+                  (unsigned long long)((copyEnd-copyStart)/24),
+                  (unsigned long long)stored,
+                  (unsigned long long)((nowTick-kickStart)/24));
+        }
+        /* H272r: read back what is actually in the scanout right now - numeric proof of
+         * who wrote last, independent of whatever the console decided to draw. */
+        {
+            volatile uint32_t *scan=(volatile uint32_t *)bootMapping->getVirtualAddress();
+            const uint64_t stride4=video.v_rowBytes/4;
+            IOLog("NATIVE_LEGACY_READBACK: tl=%08x c=%08x br=%08x q=%08x\n",
+                  scan[0],
+                  scan[stride4*(height/2)+width/2],
+                  scan[stride4*(height-1)+width-1],
+                  scan[stride4*(height/4)+width/4]);
+        }
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
