@@ -429,7 +429,7 @@ public:
         kicking=false;
     }
     void kickOnce() {
-        uint64_t tEntry,tDescriptor,tMap;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tEntry));
+        uint64_t tEntry,tDescriptor,tMap;uint64_t tLayout,tScan;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tEntry));
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary) {
             if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip en=%u tr=%u pm=%u map=%u pri=%u\n",
@@ -512,6 +512,7 @@ public:
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
         }
+        __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tLayout));
         // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
         if(scanBudget) {
             --scanBudget;
@@ -522,6 +523,7 @@ public:
             if(native_legacy_frame_colors(reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height,colors,counts,&other))
                 native_legacy_frame_colors_observed(colors,counts,other);
         }
+        __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tScan));
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
@@ -568,6 +570,8 @@ public:
         {
             volatile uint32_t *scan=(volatile uint32_t *)bootMapping->getVirtualAddress();
             const uint64_t stride4=video.v_rowBytes/4;
+            IOLog("NATIVE_LEGACY_RAW: entry=%llu desc=%llu map=%llu kick=%llu\\n",(unsigned long long)tEntry,(unsigned long long)tDescriptor,(unsigned long long)tMap,(unsigned long long)kickStart);
+            IOLog("NATIVE_LEGACY_RAW2: layout=%llu scan=%llu copy=%llu\\n",(unsigned long long)tLayout,(unsigned long long)tScan,(unsigned long long)copyStart);
             IOLog("NATIVE_LEGACY_STAMPS: entry_us=%llu descriptor_us=%llu map_us=%llu\n",(unsigned long long)((tDescriptor-tEntry)/24),(unsigned long long)((tMap-tDescriptor)/24),(unsigned long long)((kickStart-tMap)/24));
             IOLog("NATIVE_LEGACY_READBACK: tl=%08x c=%08x br=%08x q=%08x\n",
                   scan[0],
