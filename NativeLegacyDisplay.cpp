@@ -429,6 +429,7 @@ public:
         kicking=false;
     }
     void kickOnce() {
+        uint64_t tEntry,tDescriptor,tMap;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tEntry));
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary) {
             if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip en=%u tr=%u pm=%u map=%u pri=%u\n",
@@ -477,6 +478,7 @@ public:
         uint64_t kickStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(kickStart));
         if(!surface->metaCast("IOSurface"))return;
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
+        __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tDescriptor));
         PE_Video video={};
         uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
         uint64_t length=(uint64_t)width*height*4;
@@ -501,6 +503,7 @@ public:
             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;return;
         }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tMap));
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
@@ -565,6 +568,7 @@ public:
         {
             volatile uint32_t *scan=(volatile uint32_t *)bootMapping->getVirtualAddress();
             const uint64_t stride4=video.v_rowBytes/4;
+            IOLog("NATIVE_LEGACY_STAMPS: entry_us=%llu descriptor_us=%llu map_us=%llu\n",(unsigned long long)((tDescriptor-tEntry)/24),(unsigned long long)((tMap-tDescriptor)/24),(unsigned long long)((kickStart-tMap)/24));
             IOLog("NATIVE_LEGACY_READBACK: tl=%08x c=%08x br=%08x q=%08x\n",
                   scan[0],
                   scan[stride4*(height/2)+width/2],
