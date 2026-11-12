@@ -49,6 +49,7 @@ extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32
 extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
+extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap);
 extern "C" void native_legacy_retirement_observed(IOService *);
 // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
@@ -75,7 +76,7 @@ static NativeLegacyDisplay *gTestDisplay;
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
-    uint32_t scanBudget=32;
+    uint32_t scanBudget=0;   /* H272w: the scans read the drawable's device memory at 0.24 MB/s (68 s/frame); opt in with sheng-fb-scan=N */
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
     bool logicalPM=false;
@@ -417,7 +418,7 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
-        if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: kick transferred=%u pending=%u\n",transferred?1u:0u,pendingSwapRequest()?1u:0u);}
+        if(gSwapTrace<64){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: kick transferred=%u pending=%u\n",transferred?1u:0u,pendingSwapRequest()?1u:0u);}
         armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;
@@ -432,13 +433,13 @@ public:
         uint64_t tEntry,tDescriptor,tMap;uint64_t tLayout,tScan;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tEntry));
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary) {
-            if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip en=%u tr=%u pm=%u map=%u pri=%u\n",
+            if(gSwapTrace<64){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip en=%u tr=%u pm=%u map=%u pri=%u\n",
                 enabled,transferred?1u:0u,logicalPM?1u:0u,bootMapping?1u:0u,primary?1u:0u);}
             return;
         }
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request)) {
-            if(gSwapTrace<8){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip req=%u valid=%u\n",
+            if(gSwapTrace<64){gSwapTrace=gSwapTrace+1;IOLog("NATIVE_LEGACY_SWAP: skip req=%u valid=%u\n",
                 request?1u:0u,(request && isValidated(request))?1u:0u);}
             return;
         }
@@ -514,6 +515,7 @@ public:
         }
         __asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(tLayout));
         // The two content scans read every pixel again; they only describe the first frames (the probe keeps 32).
+        {static bool scanArgRead;if(!scanArgRead){scanArgRead=true;unsigned v=0;PE_parse_boot_argn("sheng-fb-scan",&v,sizeof v);if(v)scanBudget=v;}}
         if(scanBudget) {
             --scanBudget;
             uint64_t scan[5];
@@ -573,6 +575,7 @@ public:
             IOLog("NATIVE_LEGACY_RAW: entry=%llu desc=%llu map=%llu kick=%llu\\n",(unsigned long long)tEntry,(unsigned long long)tDescriptor,(unsigned long long)tMap,(unsigned long long)kickStart);
             IOLog("NATIVE_LEGACY_RAW2: layout=%llu scan=%llu copy=%llu\\n",(unsigned long long)tLayout,(unsigned long long)tScan,(unsigned long long)copyStart);
             IOLog("NATIVE_LEGACY_STAMPS: entry_us=%llu descriptor_us=%llu map_us=%llu\n",(unsigned long long)((tDescriptor-tEntry)/24),(unsigned long long)((tMap-tDescriptor)/24),(unsigned long long)((kickStart-tMap)/24));
+            {static bool prepShown;if(!prepShown){prepShown=true;char pb[120];if(native_legacy_prepare_report(pb,sizeof pb))IOLog("NATIVE_LEGACY_PREPARE: %s\n",pb);}}
             IOLog("NATIVE_LEGACY_READBACK: tl=%08x c=%08x br=%08x q=%08x\n",
                   scan[0],
                   scan[stride4*(height/2)+width/2],
