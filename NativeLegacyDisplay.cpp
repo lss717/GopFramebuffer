@@ -68,7 +68,8 @@ extern "C" uint64_t mach_continuous_time(void);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
-    return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1);
+    return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1) ||
+           (format==0x62336138 && planes==2);   // H274: 'b3a8', two-plane wide colour
 }
 class NativeLegacyDisplay;
 static NativeLegacyDisplay *gTestDisplay;
@@ -483,7 +484,9 @@ public:
         PE_Video video={};
         uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
         uint64_t length=(uint64_t)width*height*4;
-        uint64_t sourceStride=native_legacy_surface_stride(surface);
+        uint32_t sourceFormat=native_legacy_surface_format(surface);
+        uint64_t sourceStride=native_legacy_surface_bytestride(width,sourceFormat,
+            native_legacy_surface_stride(surface));
         uint64_t allocation=native_legacy_surface_allocation(surface);
         if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
            native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
@@ -656,7 +659,9 @@ public:
                     if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
                        nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
-                       native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
+                       native_legacy_surface_bounds(width,height,
+                           native_legacy_surface_bytestride(width,native_legacy_surface_format(surface),
+                               native_legacy_surface_stride(surface)),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
                         reason=0;accepted=true;
                     } else {
