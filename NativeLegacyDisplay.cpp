@@ -199,7 +199,7 @@ public:
         if(video.v_width!=w||video.v_height!=h)return;
         if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,w,h,color))return;
-        uintptr_t base=reinterpret_cast<uintptr_t>(bootMapping->getVirtualAddress());
+        uintptr_t base=static_cast<uintptr_t>(bootMapping->getVirtualAddress());
         uintptr_t end=base+static_cast<uintptr_t>(video.v_rowBytes)*h;
         for(uintptr_t a=base&~static_cast<uintptr_t>(63);a<end;a+=64)
             __asm__ volatile("dc civac, %0"::"r"(a):"memory");
