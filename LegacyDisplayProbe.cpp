@@ -152,6 +152,10 @@ volatile uint64_t native_legacy_rej_surface[7];   // width, height, format, plan
 void native_legacy_surface_rejected(uint64_t width,uint64_t height,uint32_t format,uint32_t planes,uint64_t stride,uint64_t allocation,uint64_t bytes) {
     native_legacy_rej_surface[0]=width;native_legacy_rej_surface[1]=height;native_legacy_rej_surface[2]=format;native_legacy_rej_surface[3]=planes;
     native_legacy_rej_surface[4]=stride;native_legacy_rej_surface[5]=allocation;native_legacy_rej_surface[6]=bytes;
+    // H274: the verdict alone (reason=4) cannot say which of the four surface checks failed.
+    IOLog("NATIVE_LEGACY_SURFACE: rejected w=%llu h=%llu fmt=%u planes=%u stride=%llu alloc=%llu bytes=%llu\n",
+        (unsigned long long)width,(unsigned long long)height,(unsigned)format,(unsigned)planes,
+        (unsigned long long)stride,(unsigned long long)allocation,(unsigned long long)bytes);
 }
 static void recordRejectedSwap(unsigned reason,const void *request,const void *surface) {
     const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
