@@ -73,6 +73,8 @@ static inline bool nativeBgra(uint32_t format,uint32_t planes) {
 }
 class NativeLegacyDisplay;
 static NativeLegacyDisplay *gTestDisplay;
+// H315: set once the framebuffer is started, so the panic hook can paint without the registry.
+static NativeLegacyDisplay *gPanicDisplay;
 
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
@@ -181,7 +183,27 @@ public:
         // and that IOKit instantiated and started the framebuffer.
         native_boot_flags |= 0x4000000U;
         if(!startDisplay(provider))return false;
+        gPanicDisplay=this;   // H315: the panic hook reaches the panel through this
         startVsync();return true;
+    }
+    // H315: a dying machine gets one full-screen fill of the real scanout.  Nothing here takes a
+    // lock, waits or retries: either the panel turns solid or the fill is skipped and the marker
+    // block remains the only record.
+    void panicPaint(uint32_t color) {
+        if(!bootMapping) return;
+        uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
+        if(!w||!h)return;
+        PE_Video video={};
+        if(!PE_current_console(&video))return;
+        if(video.v_baseAddr!=bootMapping->getPhysicalAddress()||video.v_depth!=32||video.v_rotate)return;
+        if(video.v_width!=w||video.v_height!=h)return;
+        if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+            bootMapping->getLength(),video.v_rowBytes,w,h,color))return;
+        uintptr_t base=reinterpret_cast<uintptr_t>(bootMapping->getVirtualAddress());
+        uintptr_t end=base+static_cast<uintptr_t>(video.v_rowBytes)*h;
+        for(uintptr_t a=base&~static_cast<uintptr_t>(63);a<end;a+=64)
+            __asm__ volatile("dc civac, %0"::"r"(a):"memory");
+        __asm__ volatile("dsb sy":::"memory");
     }
     int drawTestPattern() {
         if(!bootMapping) return 0;
@@ -768,6 +790,9 @@ public:
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 extern "C" int native_legacy_test_pattern(void) {return gTestDisplay?gTestDisplay->drawTestPattern():0;}
+// H315: panic paint entry.  Absent (weak_import) in builds without the display archive, which is
+// why the caller checks the pointer before using it.
+extern "C" void native_legacy_panic_paint(uint32_t color) {if(gPanicDisplay)gPanicDisplay->panicPaint(color);}
 extern "C" void native_legacy_heartbeat_cell(void) {sheng_cpufreq_tick();if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
