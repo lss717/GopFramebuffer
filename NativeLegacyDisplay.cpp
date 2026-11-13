@@ -402,15 +402,10 @@ public:
                   isInactive()?1:0,
                   ioClass?ioClass->getCStringNoCopy():"-",
                   prov?prov->getMetaClass()->getClassName():"-");
-            const char *probeNames[3]={"IOMobileFramebuffer","IOMobileFramebufferLegacy",
-                                       "NativeLegacyDisplay"};
-            for(unsigned i=0;i<3;i++){
-                OSDictionary *m=IOService::serviceMatching(probeNames[i]);
-                IOService *s=m?IOService::copyMatchingService(m):nullptr;
-                IOLog("NATIVE_LEGACY: self-match name=%s -> %p same=%d\n",
-                      probeNames[i],s,s==this?1:0);
-                OSSafeReleaseNULL(s);OSSafeReleaseNULL(m);
-            }
+            // H340: this loop called IOService::copyMatchingService() from inside the driver's
+            // own registration path.  That waits for the registry lock the matcher already holds,
+            // so the boot stopped after the first two names printed.  The service is registered
+            // and published; the self lookup was only an H141 diagnostic and is gone.
         }
     }
     // H142: the KernelConfigTable personality asks the driver whether it
