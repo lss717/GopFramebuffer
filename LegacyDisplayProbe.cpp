@@ -361,9 +361,9 @@ static ClientStat *statFor(IOUserClient *client) {
 static bool tracedSelector(uint32_t selector) {
     switch(selector) {
         case 3:case 4:case 5:case 6:case 7:case 8:case 28:case 29:
-            /* H319: 22/33/57 are unimplemented and answer 0; trace them so the arguments show
+            /* H319: 22/33 are unimplemented and answer 0; trace them so the arguments show
              * whether CA is asking for the swap contract through one of them. */
-        case 22:case 33:case 57:
+        case 22:case 33:
         case 57:case 72:case 74:case 79:case 83:return true;
         default:return false;
     }
