@@ -341,16 +341,36 @@ public:
         else if(native_cpu_freq_state==5)cpuColor=blue;
         else if(native_cpu_freq_state==6)cpuColor=0xff808080U;   // H213: OSM not readable
         fill(0,0,16,16,cpuColor);
-        // H103 slot writer state: red = thread never entered, blue = thread
-        // entered but window not ready, yellow = ready but write failed,
-        // green = at least one slot+header write succeeded.
+        // H103 slot writer: green/white pulse while writes succeed, yellow
+        // when writes stop or fail, blue while the window is not ready.
         uint32_t slotColor=red;
         if(native_h103_slot_state==3)slotColor=blue;
         else if(native_h103_slot_state==1)slotColor=yellow;
         else if(native_h103_slot_state==2)slotColor=green;
+        else if(native_h103_slot_state==4)slotColor=white;
         fill(60,0,16,16,slotColor);
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
+    }
+    void drawSlotCell() {
+        if(!bootMapping)return;
+        uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
+        uint64_t bytes=bootMapping->getLength();
+        if(!w || !h || bytes<h*4)return;
+        uint64_t stride=bytes/h;if(stride<w*4 || (stride&3))return;
+        volatile uint32_t *base=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
+        if(!base)return;
+        uint32_t color=0xffff0000U;
+        if(native_h103_slot_state==3)color=0xff0000ffU;
+        else if(native_h103_slot_state==1)color=0xffffff00U;
+        else if(native_h103_slot_state==2)color=0xff00ff00U;
+        else if(native_h103_slot_state==4)color=0xffffffffU;
+        uint64_t words=stride/4;
+        for(uint32_t y=0;y<16 && y<h;++y) {
+            volatile uint32_t *row=base+(uint64_t)y*words;
+            for(uint32_t x=60;x<76 && x<w;++x)row[x]=color;
+        }
+        __asm__ volatile("dsb oshst" ::: "memory");
     }
     // H108: independent heartbeat. Paint only the 16x16 cell at (40,0) so a
     // 1 Hz driver can prove the kernel is alive without a full 2x2 redraw and
@@ -386,6 +406,7 @@ public:
             volatile uint32_t *row=base+(uint64_t)y*words;
             for(uint32_t x=0;x<16 && x<w;++x)row[x]=cpuColor;
         }
+        drawSlotCell();
         __asm__ volatile("dsb oshst" ::: "memory");
     }
     bool startDisplay(IOService *provider) {
@@ -835,5 +856,6 @@ extern "C" int native_legacy_test_pattern(void) {return gTestDisplay?gTestDispla
 extern "C" void native_legacy_panic_paint(uint32_t color) {if(gPanicDisplay)gPanicDisplay->panicPaint(color);}
 extern "C" void native_legacy_progress(unsigned step,unsigned total) {if(gPanicDisplay)gPanicDisplay->progress(step,total);}
 extern "C" void native_legacy_heartbeat_cell(void) {sheng_cpufreq_tick();if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
+extern "C" void native_legacy_slot_cell(void) {if(gTestDisplay)gTestDisplay->drawSlotCell();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
