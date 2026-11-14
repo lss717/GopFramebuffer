@@ -119,6 +119,27 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
     }
     static void vsyncFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->vsyncTick();}
+    // H345: the panel progress bar is driven by the display's own timer, not by the UFS watchdog:
+    // it keeps repainting once a second whether or not the log path can write anything.
+    IOTimerEventSource *progressTimer=nullptr;
+    unsigned progressSeconds=0;
+    static void progressFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->progressTick();}
+    void progressTick() {
+        if(!progressTimer)return;
+        progressSeconds++;
+        progress(progressSeconds,900);
+        progressTimer->wakeAtTime(mach_absolute_time()+19200000ULL);
+    }
+    void startProgress() {
+        if(progressTimer||!bootMapping||!primary)return;
+        IOWorkLoop *loop=getWorkLoop();
+        if(!loop)return;
+        IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::progressFired);
+        if(!timer)return;
+        if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
+        progressTimer=timer;progressSeconds=0;
+        timer->wakeAtTime(mach_absolute_time()+19200000ULL);
+    }
     void vsyncTick() {
         vsyncArmed=false;
         if(!vsyncTimer)return;
@@ -372,6 +393,7 @@ public:
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         gTestDisplay=this;
         IOLog("NATIVE_LEGACY: base start ok primary=%u mapping=%p\n",primary,bootMapping);
+        startProgress();
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
