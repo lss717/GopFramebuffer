@@ -186,6 +186,29 @@ public:
         gPanicDisplay=this;   // H315: the panic hook reaches the panel through this
         startVsync();return true;
     }
+    // H343: a progress bar drawn straight into the scanout, independent of the log path.  The
+    // watchdog calls this once a second, so how far the bar got is exactly how long the machine
+    // lived, even when neither the ring nor the console can tell.
+    void progress(unsigned step, unsigned total) {
+        if(!bootMapping || !total) return;
+        uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
+        if(!w||!h)return;
+        PE_Video video={};
+        if(!PE_current_console(&video))return;
+        if(video.v_baseAddr!=bootMapping->getPhysicalAddress()||video.v_depth!=32||video.v_rotate)return;
+        uintptr_t base=(uintptr_t)bootMapping->getVirtualAddress();
+        if(!base)return;
+        volatile uint32_t *row=reinterpret_cast<volatile uint32_t *>(base);
+        uint32_t words=video.v_rowBytes/4;
+        if(words<w)return;
+        uint32_t filled=(uint32_t)(((uint64_t)w*step)/total);
+        if(filled>w)filled=w;
+        for(unsigned y=0;y<6;y++) {
+            volatile uint32_t *line=row+(uint64_t)y*words;
+            for(uint32_t x=0;x<w;x++) line[x]=(x<filled)?0xffffffffU:0xff000000U;
+        }
+        __asm__ volatile("dsb sy":::"memory");
+    }
     // H315: a dying machine gets one full-screen fill of the real scanout.  Nothing here takes a
     // lock, waits or retries: either the panel turns solid or the fill is skipped and the marker
     // block remains the only record.
@@ -788,6 +811,7 @@ extern "C" int native_legacy_test_pattern(void) {return gTestDisplay?gTestDispla
 // H315: panic paint entry.  Absent (weak_import) in builds without the display archive, which is
 // why the caller checks the pointer before using it.
 extern "C" void native_legacy_panic_paint(uint32_t color) {if(gPanicDisplay)gPanicDisplay->panicPaint(color);}
+extern "C" void native_legacy_progress(unsigned step,unsigned total) {if(gPanicDisplay)gPanicDisplay->progress(step,total);}
 extern "C" void native_legacy_heartbeat_cell(void) {sheng_cpufreq_tick();if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
