@@ -43,6 +43,13 @@ extern "C" volatile uint32_t native_cpu_freq_state;
 // H210: resample the OSM state from the 1 Hz heartbeat before repainting.
 extern "C" void sheng_cpufreq_tick(void);
 extern "C" volatile uint32_t native_h103_slot_state;
+// H410: USB CDC live-log status exported by the device-side CheeseburgerUsb
+// driver. started=EP0/CDC bring-up entered, connected=host configured the CDC
+// data endpoints, active=Bulk-IN log frames are completing now. A paused H103
+// disk sink is native_h103_slot_state==5 (cyan), deliberately not a USB colour.
+extern "C" volatile uint32_t native_usb_status_started;
+extern "C" volatile uint32_t native_usb_status_connected;
+extern "C" volatile uint32_t native_usb_status_active;
 extern "C" volatile uint32_t native_a540_accel_state;
 // The surface of a rejected swap, as the validator read it: width, height, format, planes, stride, allocation, descriptor length.
 extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,uint64_t);
@@ -263,7 +270,8 @@ public:
         if(panel*2>w)panel=w/2;
         if(panel*2>h)panel=h/2;
         if(!panel)return 0;
-        // No diagnostic cell uses pure black or cyan. The neutral cell is a
+        // No diagnostic cell uses pure black; cyan marks a paused disk sink.
+        // The neutral cell is a
         // visible dark gray; backboardd uses a deep blue distinct from green.
         const uint32_t black=0xff404040U,red=0xffff0000U,green=0xff00ff00U,
                        blue=0xff0000ffU,deepblue=0xff0080ffU,yellow=0xffffff00U,
@@ -348,7 +356,10 @@ public:
         else if(native_h103_slot_state==1)slotColor=yellow;
         else if(native_h103_slot_state==2)slotColor=green;
         else if(native_h103_slot_state==4)slotColor=white;
+        else if(native_h103_slot_state==5)slotColor=0xff00ffffU;  // H410: disk sink paused, USB healthy
         fill(60,0,16,16,slotColor);
+        // H410: fifth status cell, USB CDC live-log link/transfer state.
+        drawUsbCell();
         __asm__ volatile("dsb oshst" ::: "memory");
         return 1;
     }
@@ -365,10 +376,41 @@ public:
         else if(native_h103_slot_state==1)color=0xffffff00U;
         else if(native_h103_slot_state==2)color=0xff00ff00U;
         else if(native_h103_slot_state==4)color=0xffffffffU;
+        else if(native_h103_slot_state==5)color=0xff00ffffU;  // H410: paused, USB healthy
         uint64_t words=stride/4;
         for(uint32_t y=0;y<16 && y<h;++y) {
             volatile uint32_t *row=base+(uint64_t)y*words;
             for(uint32_t x=60;x<76 && x<w;++x)row[x]=color;
+        }
+        __asm__ volatile("dsb oshst" ::: "memory");
+    }
+    // H410: fifth 16x16 status cell at (80,0), immediately after the original
+    // four. Gray: USB driver not started; yellow: started but the host has not
+    // configured the CDC data endpoints; green: connected and idle; green/white:
+    // Bulk-IN log frames are completing. The alternation runs at the existing
+    // ~1 Hz panel repaint cadence (bounded, no extra timer); the driver's
+    // 500 ms activity window returns the cell to solid green after the last
+    // successful completion.
+    void drawUsbCell() {
+        if(!bootMapping)return;
+        uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
+        uint64_t bytes=bootMapping->getLength();
+        if(!w || !h || bytes<h*4)return;
+        uint64_t stride=bytes/h;if(stride<w*4 || (stride&3))return;
+        volatile uint32_t *base=reinterpret_cast<volatile uint32_t *>(bootMapping->getVirtualAddress());
+        if(!base)return;
+        uint32_t color=0xff404040U;                          // not started
+        if(native_usb_status_started) {
+            if(!native_usb_status_connected)color=0xffffff00U;   // started, not connected
+            else if(native_usb_status_active) {
+                static uint32_t usbBlink;
+                color=(usbBlink++&1U)?0xffffffffU:0xff00ff00U;  // transfer: white/green
+            } else color=0xff00ff00U;                            // connected idle: green
+        }
+        uint64_t words=stride/4;
+        for(uint32_t y=0;y<16 && y<h;++y) {
+            volatile uint32_t *row=base+(uint64_t)y*words;
+            for(uint32_t x=80;x<96 && x<w;++x)row[x]=color;
         }
         __asm__ volatile("dsb oshst" ::: "memory");
     }
@@ -407,6 +449,7 @@ public:
             for(uint32_t x=0;x<16 && x<w;++x)row[x]=cpuColor;
         }
         drawSlotCell();
+        drawUsbCell();
         __asm__ volatile("dsb oshst" ::: "memory");
     }
     bool startDisplay(IOService *provider) {
@@ -857,5 +900,6 @@ extern "C" void native_legacy_panic_paint(uint32_t color) {if(gPanicDisplay)gPan
 extern "C" void native_legacy_progress(unsigned step,unsigned total) {if(gPanicDisplay)gPanicDisplay->progress(step,total);}
 extern "C" void native_legacy_heartbeat_cell(void) {sheng_cpufreq_tick();if(gTestDisplay)gTestDisplay->drawHeartbeatCell();}
 extern "C" void native_legacy_slot_cell(void) {if(gTestDisplay)gTestDisplay->drawSlotCell();}
+extern "C" void native_legacy_usb_cell(void) {if(gTestDisplay)gTestDisplay->drawUsbCell();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
