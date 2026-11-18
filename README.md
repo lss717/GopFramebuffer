@@ -1,7 +1,7 @@
-# GopFramebuffer
+# NativeMobileDisplay
 
-UEFI GOP framebuffer and MobileFramebuffer integration.
+Mobile display driver and GPU scanout hand-off. Validates swaps, retires frames and drives the firmware framebuffer.
 
-CPU and GPU scanout are supported. With `sheng-vsync=<Hz>`, a work-loop timer sends the MobileFramebuffer vsync message to the compositor.
+Current state: the CPU and GPU scanout paths work. The GOP scanout has no vblank interrupt; with `sheng-vsync=<Hz>` a work-loop timer sends the original family's vsync message to the compositor.
 
-Build and interface details: [documentation](https://unixnu.com/drivers/gop-framebuffer). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
+Linked into XNU by `unixnu build kernel`.

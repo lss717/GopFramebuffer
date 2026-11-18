@@ -36,6 +36,20 @@ static inline int native_legacy_surface_bounds(uint32_t width,uint32_t height,
     return allocation>=stride*height && descriptorBytes>=allocation;
 }
 
+// H274: iOS 17 composites the opaque desktop into a two-plane wide-colour surface whose
+// fourcc is 'b3a8' (plane 0 is 32-bit BGRA, plane 1 is 8-bit alpha). The qualified stride
+// accessor reports the row stride of that surface in pixels rather than bytes, so the four
+// bytes of plane 0 per pixel have to be applied before bounding or copying. The alpha plane
+// is irrelevant for an opaque scanout and is left alone.
+static inline int native_legacy_surface_widetype(uint32_t format,uint32_t planes) {
+    return format==0x62336138 && planes==2;
+}
+static inline uint64_t native_legacy_surface_bytestride(uint32_t width,uint32_t format,
+    uint64_t stride) {
+    if (native_legacy_surface_widetype(format,2) && stride<(uint64_t)width*4) return stride*4;
+    return stride;
+}
+
 // The GOP destination is device memory: use aligned scalar pixel stores,
 // never a general memcpy that may issue unaligned or wider device accesses.
 // The source is normal mapped IOSurface memory and may have padded rows.
