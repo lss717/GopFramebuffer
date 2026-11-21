@@ -327,7 +327,7 @@ bool AGXAccelerator::start(IOService *provider) {
     // complete. Nothing here touches GPU registers, firmware or SMMU.
     setProperty("A540Probe", "minimal-no-hardware");
     // H197: the sandbox's iokit-open-user-client check names no class of this driver. The
-    // zzw-native-adreno-sandbox-grant kernel patch lets the service name one process that is
+    // native-adreno-sandbox-grant kernel patch lets the service name one process that is
     // granted its own user client in place of the sandbox verdict; the render server is the one
     // that must open it (H196: backboardd's open was the only one still refused by MACF).
     setProperty("NativeSandboxGrantProcess", "backboardd");
