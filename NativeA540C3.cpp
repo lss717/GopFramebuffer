@@ -271,6 +271,8 @@ static volatile int gC3Started, gC3Done;
 static volatile int gA540Ready;      /* C4-B: set once the self-tests passed */
 static volatile int gA540EngineUp;   /* engine usable (0x66 done, GPMU optional) */
 static uint32_t gA540Fence;          /* monotonic fence payload */
+/* H605: fence visibility latch. [0] submit f, [1] rptr0 after submit, [2] rptr1 after submit, [3] submit done, [4] wait expected f, [5] wait last rptr0, [6] wait last rptr1, [7] wait timeout count. */
+extern "C" { volatile uint32_t native_a540_fence_diag[8]; }
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
 // ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 uses the vendor
@@ -1683,6 +1685,11 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
     for (unsigned ms = 0; ms < 500 && (rd(RBBM_STATUS_REG) & 0x7eu); ++ms)
         spinMs(1);
     spinMs(20);
+    invalidateDcache(c.rptr.cpu, kRptrBytes);
+    native_a540_fence_diag[0] = (uint32_t)f;
+    native_a540_fence_diag[1] = ((volatile uint32_t *)c.rptr.cpu)[0];
+    native_a540_fence_diag[2] = ((volatile uint32_t *)c.rptr.cpu)[1];
+    native_a540_fence_diag[3] = done ? 1u : 0u;
     if (!done)
         return -2;
     *fence = f;
@@ -1701,8 +1708,12 @@ extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns) {
         const uint32_t *s = reinterpret_cast<const uint32_t *>(c.rptr.cpu);
         if (s[0] == (uint32_t)fence && s[1] == 0u)
             return 0;
+        native_a540_fence_diag[4] = (uint32_t)fence;
+        native_a540_fence_diag[5] = s[0];
+        native_a540_fence_diag[6] = s[1];
         spinMs(1);
     }
+    native_a540_fence_diag[7] = native_a540_fence_diag[7] + 1;
     return -1;
 }
 
