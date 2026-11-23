@@ -369,6 +369,8 @@ static volatile uint32_t *gGpuccBase;
 static volatile uint32_t *gRbbmBase;
 
 static uint32_t gpuccRd(uint32_t off) { return gGpuccBase ? osmRead(gGpuccBase, off) : 0xffffffffu; }
+/* H608: read a single GPUCC register on demand (GX/CX GDSC, gfx3d clocks) for the fence stall diagnosis. */
+extern "C" uint32_t sheng_gpucc_peek(uint32_t off) { return gpuccRd(off); }
 static void gpuccWr(uint32_t off, uint32_t value) {
     if (!gGpuccBase) return;
     gGpuccBase[off / 4] = value;

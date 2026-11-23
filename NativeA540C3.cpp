@@ -277,6 +277,9 @@ extern "C" { volatile uint32_t native_a540_fence_diag[8]; }
 extern "C" { volatile uint32_t native_a540_gpu_state[6]; }
 /* H607: post-submit SMMU state. [0] CB0 FSR, [1] CB0 FAR, [2] global FSR, [3] CB0 SCTLR. */
 extern "C" { volatile uint32_t native_a540_smmu_state[4]; }
+/* H608: post-submit GPUCC power/clock state. [0] gx_gdscr, [1] cx_gdscr, [2] gfx3d_branch, [3] gfx3d_rcg. */
+extern "C" { volatile uint32_t native_a540_pwr_state[4]; }
+extern "C" uint32_t sheng_gpucc_peek(uint32_t off);
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
 // ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 uses the vendor
@@ -1709,6 +1712,10 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
     native_a540_smmu_state[1] = h7far;
     native_a540_smmu_state[2] = h7gfsr;
     native_a540_smmu_state[3] = h7sctlr;
+    native_a540_pwr_state[0] = sheng_gpucc_peek(0x1094);
+    native_a540_pwr_state[1] = sheng_gpucc_peek(0x1004);
+    native_a540_pwr_state[2] = sheng_gpucc_peek(0x1098);
+    native_a540_pwr_state[3] = sheng_gpucc_peek(0x1070);
     if (!done)
         return -2;
     *fence = f;
