@@ -279,6 +279,8 @@ extern "C" { volatile uint32_t native_a540_gpu_state[6]; }
 extern "C" { volatile uint32_t native_a540_smmu_state[4]; }
 /* H608: post-submit GPUCC power/clock state. [0] gx_gdscr, [1] cx_gdscr, [2] gfx3d_branch, [3] gfx3d_rcg. */
 extern "C" { volatile uint32_t native_a540_pwr_state[4]; }
+/* H609: heartbeat-driven submit on bo[7]->bo[6], independent of the userspace selftest. [0] submit rc, [1] wait rc, [2] fence, [3] rptr0, [4] target0, [5] run count. */
+extern "C" { volatile uint32_t native_a540_hbsub[6]; }
 extern "C" uint32_t sheng_gpucc_peek(uint32_t off);
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
@@ -1655,6 +1657,31 @@ extern "C" uint32_t native_a540_c3_state(void) {
     return (uint32_t)gC3Started | ((uint32_t)gC3Done << 1) | ((uint32_t)gA540Ready << 2) | ((uint32_t)gA540EngineUp << 3);
 }
 extern "C" uint32_t native_a540_c3_lastput(void) { return gA540LastPut; }
+extern "C" void native_a540_hb_selftest(void) {
+    if (!gC3 || !gA540Ready) return;
+    Ctx &c = *gC3;
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[7].cpu);
+    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(c.bo[6].cpu);
+    const uint64_t tgtIova = kBoBase + 6 * kBoPage;
+    tgt[0] = 0xdeadbeefu;
+    unsigned w = 0;
+    ib[w++] = type7(0x3d, 3); ib[w++] = (uint32_t)tgtIova; ib[w++] = (uint32_t)(tgtIova >> 32); ib[w++] = 0x12345678u;
+    ib[w++] = type7(0x3d, 3); ib[w++] = (uint32_t)(tgtIova + 4); ib[w++] = (uint32_t)((tgtIova + 4) >> 32); ib[w++] = 0x9abcdef0u;
+    ib[w++] = type7(0x3d, 3); ib[w++] = (uint32_t)(tgtIova + 8); ib[w++] = (uint32_t)((tgtIova + 8) >> 32); ib[w++] = 0x55aa55aau;
+    cleanDcache(c.bo[7].cpu, kBoPage);
+    cleanDcache(c.bo[6].cpu, kBoPage);
+    uint64_t f = 0;
+    const int sr = native_a540_submit_bo(7, w, &f);
+    const int wr = sr ? -1 : native_a540_wait_fence(f, 200000000ull);
+    invalidateDcache(c.rptr.cpu, kRptrBytes);
+    invalidateDcache(c.bo[6].cpu, kBoPage);
+    native_a540_hbsub[0] = (uint32_t)sr;
+    native_a540_hbsub[1] = (uint32_t)wr;
+    native_a540_hbsub[2] = (uint32_t)f;
+    native_a540_hbsub[3] = ((volatile uint32_t *)c.rptr.cpu)[0];
+    native_a540_hbsub[4] = tgt[0];
+    native_a540_hbsub[5] = native_a540_hbsub[5] + 1;
+}
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
 }
