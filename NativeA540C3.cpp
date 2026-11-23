@@ -273,6 +273,8 @@ static volatile int gA540EngineUp;   /* engine usable (0x66 done, GPMU optional)
 static uint32_t gA540Fence;          /* monotonic fence payload */
 /* H605: fence visibility latch. [0] submit f, [1] rptr0 after submit, [2] rptr1 after submit, [3] submit done, [4] wait expected f, [5] wait last rptr0, [6] wait last rptr1, [7] wait timeout count. */
 extern "C" { volatile uint32_t native_a540_fence_diag[8]; }
+/* H606: post-submit GPU state. [0] CP_ME_CNTL, [1] RBBM_STATUS, [2] CP_INT_STATUS, [3] CP_RB_RPTR, [4] CP_RB_WPTR, [5] RBBM_INT_STATUS. */
+extern "C" { volatile uint32_t native_a540_gpu_state[6]; }
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
 // ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 uses the vendor
@@ -1690,6 +1692,12 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
     native_a540_fence_diag[1] = ((volatile uint32_t *)c.rptr.cpu)[0];
     native_a540_fence_diag[2] = ((volatile uint32_t *)c.rptr.cpu)[1];
     native_a540_fence_diag[3] = done ? 1u : 0u;
+    native_a540_gpu_state[0] = rd(CP_ME_CNTL_REG);
+    native_a540_gpu_state[1] = rd(RBBM_STATUS_REG);
+    native_a540_gpu_state[2] = rd(CP_INT_STATUS);
+    native_a540_gpu_state[3] = rd(CP_RB_RPTR);
+    native_a540_gpu_state[4] = rd(CP_RB_WPTR);
+    native_a540_gpu_state[5] = rd(RBBM_INT_STATUS);
     if (!done)
         return -2;
     *fence = f;
