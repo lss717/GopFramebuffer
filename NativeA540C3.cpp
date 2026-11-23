@@ -240,6 +240,9 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
            ((opcode & 0x7fu) << 16) | (parity(opcode) << 23);
 }
 
+/* H603: last C3 progress code, re-emitted from the UFS heartbeat (survives ring rotation). */
+static volatile uint32_t gA540LastPut;
+
 struct Ctx {
     void (*record)(uint32_t);
     Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win;
@@ -255,7 +258,7 @@ struct Ctx {
     ArmSmmu4KStreamResult stream_result;
     unsigned step;
 
-    void put(uint32_t v) { if (record) record(v); }
+    void put(uint32_t v) { gA540LastPut = v; if (record) record(v); }
     bool fail(unsigned code, const char *what) {
         put(0xdea00000u | code);
         IOLog("NATIVE_GPU_C3: fail step %u (%s)\n", code, what);
@@ -1639,6 +1642,10 @@ extern "C" uint64_t native_a540_bo_iova(unsigned slot) {
 }
 extern "C" unsigned native_a540_bo_bytes(void) { return (unsigned)kBoPage; }
 extern "C" unsigned native_a540_bo_slots(void) { return kBoSlots; }
+extern "C" uint32_t native_a540_c3_state(void) {
+    return (uint32_t)gC3Started | ((uint32_t)gC3Done << 1) | ((uint32_t)gA540Ready << 2) | ((uint32_t)gA540EngineUp << 3);
+}
+extern "C" uint32_t native_a540_c3_lastput(void) { return gA540LastPut; }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
 }

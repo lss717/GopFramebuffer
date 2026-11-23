@@ -44,6 +44,8 @@ extern "C" { volatile int native_a540_abi_calls = 0; volatile int native_a540_ab
 // counts also go to the heartbeat, which is written from this boot's state only.
 extern "C" { volatile uint32_t native_a540_open_count = 0; volatile uint32_t native_a540_open_type = 0;
              volatile uint32_t native_a540_sel_count = 0; volatile uint32_t native_a540_sel_last = 0; }
+/* H603: [0] BoAlloc fail count, [1] first rc, [2] gpu_ready at first fail, [3] free slots, [4] used mask, [5] last Submit rc, [6] last WaitFence rc, [7] BoAlloc ok count. Re-emitted from the UFS heartbeat. */
+extern "C" { volatile uint32_t native_a540_bo_diag[8]; }
 
 // H195: the class name is the sandbox key: the target's MACF profile admits IOServiceOpen only for
 // the user-client class AGXDeviceUserClient (the same reason NativeAdrenoPublish.cpp uses it), and
@@ -95,6 +97,15 @@ IOReturn accelCopyOut(IOExternalMethodArguments *arguments, const void *data, si
     memcpy(arguments->structureOutput, data, bytes);
     arguments->structureOutputSize = (IOByteCount) bytes;
     return kIOReturnSuccess;
+}
+/* H603: latch the first BoAlloc failure with the slot occupancy the kernel saw. */
+static void noteA540BoFail(volatile uint32_t *diag, const bool *used, unsigned slots, IOReturn rc, int ready) {
+    diag[0] = diag[0] + 1;
+    if (diag[0] == 1) {
+        unsigned freeSlots = 0, mask = 0;
+        for (unsigned i = 0; i < slots && i < 8; ++i) { if (used[i]) mask |= (1u << i); else ++freeSlots; }
+        diag[1] = (uint32_t)rc; diag[2] = (uint32_t)ready; diag[3] = freeSlots; diag[4] = mask;
+    }
 }
 }  // namespace
 
@@ -208,12 +219,12 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
              * plain NotReady makes it give up. Wait for the engine instead. */
             for (unsigned i = 0; i < 2400 && !native_a540_gpu_ready(); ++i)
                 IOSleep(50);   /* up to 120 s */
-            if (!native_a540_gpu_ready()) return kIOReturnNotReady;
+            if (!native_a540_gpu_ready()) { noteA540BoFail(native_a540_bo_diag, boUsed_, native_a540_bo_slots(), kIOReturnNotReady, 0); return kIOReturnNotReady; }
             int slot = -1;
             for (unsigned i = 0; i < native_a540_bo_slots() && i < 8; ++i)
                 if (!boUsed_[i]) { slot = (int)i; break; }
-            if (slot < 0) return kIOReturnNoSpace;
-            boUsed_[slot] = true;
+            if (slot < 0) { noteA540BoFail(native_a540_bo_diag, boUsed_, native_a540_bo_slots(), kIOReturnNoSpace, 1); return kIOReturnNoSpace; }
+            boUsed_[slot] = true; native_a540_bo_diag[7] = native_a540_bo_diag[7] + 1;
             NativeAdrenoAbiBoAllocReply reply = { (uint64_t)(slot + 1) };
             return accelCopyOut(arguments, &reply, sizeof reply);
         }
@@ -264,7 +275,9 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
                 return kIOReturnBadArgument;
             const unsigned words = (unsigned)(sub->buffers[0].bytes / 4);
             uint64_t fence = 0;
-            if (native_a540_submit_bo((unsigned)slot, words, &fence))
+            const int submitRc = native_a540_submit_bo((unsigned)slot, words, &fence);
+            native_a540_bo_diag[5] = submitRc ? (uint32_t)kIOReturnError : 0u;
+            if (submitRc)
                 return kIOReturnError;
             NativeAdrenoAbiSubmitReply reply = { fence };
             return accelCopyOut(arguments, &reply, sizeof reply);
@@ -274,7 +287,9 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
                 return kIOReturnBadArgument;
             const NativeAdrenoAbiWaitFence *w =
                 reinterpret_cast<const NativeAdrenoAbiWaitFence *>(input + 2);
-            if (native_a540_wait_fence(w->fence, w->timeout_ns))
+            const int waitRc = native_a540_wait_fence(w->fence, w->timeout_ns);
+            native_a540_bo_diag[6] = waitRc ? (uint32_t)kIOReturnTimeout : 0u;
+            if (waitRc)
                 return kIOReturnTimeout;
             return kIOReturnSuccess;
         }
