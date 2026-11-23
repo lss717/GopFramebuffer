@@ -281,6 +281,35 @@ extern "C" { volatile uint32_t native_a540_smmu_state[4]; }
 extern "C" { volatile uint32_t native_a540_pwr_state[4]; }
 /* H609: heartbeat-driven submit on bo[7]->bo[6], independent of the userspace selftest. [0] submit rc, [1] wait rc, [2] fence, [3] rptr0, [4] target0, [5] run count. */
 extern "C" { volatile uint32_t native_a540_hbsub[6]; }
+/* H611: real a5xx 2D blit self-test. CP_SET_RENDER_MODE(BLIT2D) plus RB_2D_SRC/DST
+ * plus CP_BLIT(COPY) moves bytes through the render backend, which CP_MEM_WRITE
+ * never exercises. Register numbers are dword addresses taken from Mesa 25.2.8
+ * src/freedreno/registers/adreno/a5xx.xml (RB_2D_SRC_INFO 0x2107, RB_2D_DST_INFO
+ * 0x2110, GRAS_2D_SRC_INFO 0x2181, GRAS_2D_DST_INFO 0x2182) and the opcodes from
+ * adreno_pm4.xml (CP_SET_RENDER_MODE 0x6c, CP_BLIT 0x2c). The a5xx blit needs no
+ * shader. [0] submit rc, [1] wait rc, [2] fence, [3] run count, [4] matching
+ * bytes, [5] first mismatching byte offset (0xffffffff when exact), [6] dst[0],
+ * [7] src[0]. */
+extern "C" { volatile uint32_t native_a540_blit_diag[8]; }
+namespace A5xxBlit {
+constexpr uint32_t CpSetRenderMode = 0x6cu;
+constexpr uint32_t CpBlit          = 0x2cu;
+constexpr uint32_t RenderBlit2d    = 5u;
+constexpr uint32_t RenderEnd2d     = 8u;
+constexpr uint32_t Rb2dSrcInfo     = 0x2107u;
+constexpr uint32_t Rb2dDstInfo     = 0x2110u;
+constexpr uint32_t Gras2dSrcInfo   = 0x2181u;
+constexpr uint32_t Gras2dDstInfo   = 0x2182u;
+/* COLOR_FORMAT = RB5_R8_UNORM (0x03), TILE_MODE = TILE5_LINEAR (0),
+ * COLOR_SWAP = WZYX (0), no UBWC flags, no sRGB. */
+constexpr uint32_t SurfR8Linear    = 0x03u;
+constexpr uint32_t BlitOpCopy      = 1u;
+/* One row of 1024 bytes. RB_2D_*_SIZE stores pitch and array pitch >> 6. */
+constexpr unsigned kBlitBytes      = 1024u;
+constexpr uint32_t kPitchField     = kBlitBytes / 64u;
+constexpr uint32_t kArrayField     = 128u / 64u;
+constexpr uint32_t kSurfSize       = kPitchField | (kArrayField << 16);
+}
 extern "C" uint32_t sheng_gpucc_peek(uint32_t off);
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
@@ -1681,6 +1710,85 @@ extern "C" void native_a540_hb_selftest(void) {
     native_a540_hbsub[3] = ((volatile uint32_t *)c.rptr.cpu)[0];
     native_a540_hbsub[4] = tgt[0];
     native_a540_hbsub[5] = native_a540_hbsub[5] + 1;
+}
+
+/* H611: bo[3] carries the indirect buffer, bo[4] the source pattern and bo[5]
+ * the destination. Slots 0 and 1 belong to the userspace self-test and slots 6
+ * and 7 to the H609 heartbeat submit, so this test cannot disturb either.
+ * The destination starts at zero and the source holds a gradient, so a
+ * read-back that matches can only have been written by the GPU. */
+extern "C" void native_a540_hb_blit_selftest(void) {
+    using namespace A5xxBlit;
+    if (!gC3 || !gA540Ready)
+        return;
+    Ctx &c = *gC3;
+    volatile uint8_t *src = reinterpret_cast<volatile uint8_t *>(c.bo[4].cpu);
+    volatile uint8_t *dst = reinterpret_cast<volatile uint8_t *>(c.bo[5].cpu);
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[3].cpu);
+    const uint64_t srcIova = kBoBase + 4 * kBoPage;
+    const uint64_t dstIova = kBoBase + 5 * kBoPage;
+
+    for (unsigned i = 0; i < kBlitBytes; ++i) {
+        src[i] = static_cast<uint8_t>(i ^ 0xa5u);
+        dst[i] = 0u;
+    }
+
+    unsigned w = 0;
+    ib[w++] = type7(CpSetRenderMode, 1);
+    ib[w++] = RenderBlit2d;
+    ib[w++] = type4(Rb2dSrcInfo, 9);
+    ib[w++] = SurfR8Linear;
+    ib[w++] = static_cast<uint32_t>(srcIova);
+    ib[w++] = static_cast<uint32_t>(srcIova >> 32);
+    ib[w++] = kSurfSize;
+    for (unsigned i = 0; i < 5; ++i)
+        ib[w++] = 0;
+    ib[w++] = type4(Gras2dSrcInfo, 1);
+    ib[w++] = SurfR8Linear;
+    ib[w++] = type4(Rb2dDstInfo, 9);
+    ib[w++] = SurfR8Linear;
+    ib[w++] = static_cast<uint32_t>(dstIova);
+    ib[w++] = static_cast<uint32_t>(dstIova >> 32);
+    ib[w++] = kSurfSize;
+    for (unsigned i = 0; i < 5; ++i)
+        ib[w++] = 0;
+    ib[w++] = type4(Gras2dDstInfo, 1);
+    ib[w++] = SurfR8Linear;
+    ib[w++] = type7(CpBlit, 5);
+    ib[w++] = BlitOpCopy;
+    ib[w++] = 0;                        /* SRC_X1 = 0, SRC_Y1 = 0 */
+    ib[w++] = kBlitBytes - 1u;          /* SRC_X2 = 1023, SRC_Y2 = 0 */
+    ib[w++] = 0;                        /* DST_X1 = 0, DST_Y1 = 0 */
+    ib[w++] = kBlitBytes - 1u;          /* DST_X2 = 1023, DST_Y2 = 0 */
+    ib[w++] = type7(CpSetRenderMode, 1);
+    ib[w++] = RenderEnd2d;
+
+    cleanDcache(c.bo[4].cpu, kBlitBytes);
+    cleanDcache(c.bo[5].cpu, kBlitBytes);
+
+    uint64_t f = 0;
+    const int submitResult = native_a540_submit_bo(3, w, &f);
+    const int waitResult = submitResult ? -1 : native_a540_wait_fence(f, 200000000ull);
+
+    invalidateDcache(c.bo[5].cpu, kBlitBytes);
+    unsigned matched = 0;
+    unsigned firstBad = 0xffffffffu;
+    for (unsigned i = 0; i < kBlitBytes; ++i) {
+        if (dst[i] == src[i]) {
+            ++matched;
+        } else if (firstBad == 0xffffffffu) {
+            firstBad = i;
+        }
+    }
+
+    native_a540_blit_diag[0] = static_cast<uint32_t>(submitResult);
+    native_a540_blit_diag[1] = static_cast<uint32_t>(waitResult);
+    native_a540_blit_diag[2] = static_cast<uint32_t>(f);
+    native_a540_blit_diag[3] = native_a540_blit_diag[3] + 1u;
+    native_a540_blit_diag[4] = matched;
+    native_a540_blit_diag[5] = firstBad;
+    native_a540_blit_diag[6] = dst[0];
+    native_a540_blit_diag[7] = src[0];
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
