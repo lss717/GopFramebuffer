@@ -275,6 +275,8 @@ static uint32_t gA540Fence;          /* monotonic fence payload */
 extern "C" { volatile uint32_t native_a540_fence_diag[8]; }
 /* H606: post-submit GPU state. [0] CP_ME_CNTL, [1] RBBM_STATUS, [2] CP_INT_STATUS, [3] CP_RB_RPTR, [4] CP_RB_WPTR, [5] RBBM_INT_STATUS. */
 extern "C" { volatile uint32_t native_a540_gpu_state[6]; }
+/* H607: post-submit SMMU state. [0] CB0 FSR, [1] CB0 FAR, [2] global FSR, [3] CB0 SCTLR. */
+extern "C" { volatile uint32_t native_a540_smmu_state[4]; }
 
 // The sheng ArmSmmu4K kit encodes an ARM MMU-500 context and refuses when
 // ID0 bit30 / ID2 bit12 are clear. The msm8998 qcom,smmu-v2 uses the vendor
@@ -1698,6 +1700,15 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
     native_a540_gpu_state[3] = rd(CP_RB_RPTR);
     native_a540_gpu_state[4] = rd(CP_RB_WPTR);
     native_a540_gpu_state[5] = rd(RBBM_INT_STATUS);
+    uint32_t h7fsr = 0, h7far = 0, h7gfsr = 0, h7sctlr = 0;
+    c.io.read32(c.io.cookie, 0x8058, &h7fsr);
+    c.io.read32(c.io.cookie, 0x8060, &h7far);
+    c.io.read32(c.io.cookie, 0x48, &h7gfsr);
+    c.io.read32(c.io.cookie, 0x8000, &h7sctlr);
+    native_a540_smmu_state[0] = h7fsr;
+    native_a540_smmu_state[1] = h7far;
+    native_a540_smmu_state[2] = h7gfsr;
+    native_a540_smmu_state[3] = h7sctlr;
     if (!done)
         return -2;
     *fence = f;
