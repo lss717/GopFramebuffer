@@ -1729,14 +1729,14 @@ static void c3_thread(void *, wait_result_t) {
                   "depth=%u display=%llu -> iova %llx\n",
                   (unsigned long long)c->panelPhys, (unsigned long long)c->panelBytes,
                   c->panelWidth, c->panelHeight, (unsigned long long)rowBytes,
-                  c->panelDepth, (unsigned long long)consoleVideo.v_display,
+                  (unsigned)c->panelDepth, (unsigned long long)consoleVideo.v_display,
                   (unsigned long long)kPanelIova);
         } else {
             IOLog("NATIVE_GPU_C3: H617 console panel rejected (ok=%d base=%llx %ux%u "
                   "row=%llu depth=%u rotate=%u)\n", consoleOk,
-                  (unsigned long long)consoleVideo.v_baseAddr, consoleVideo.v_width,
-                  consoleVideo.v_height, (unsigned long long)consoleVideo.v_rowBytes,
-                  consoleVideo.v_depth, consoleVideo.v_rotate);
+                  (unsigned long long)consoleVideo.v_baseAddr, (unsigned)consoleVideo.v_width,
+                  (unsigned)consoleVideo.v_height, (unsigned long long)consoleVideo.v_rowBytes,
+                  (unsigned)consoleVideo.v_depth, (unsigned)consoleVideo.v_rotate);
         }
     }
     /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
