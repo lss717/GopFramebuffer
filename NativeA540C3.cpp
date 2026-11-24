@@ -77,6 +77,10 @@ constexpr uint64_t kSurfDstIova = 0x3100000ULL;
  * length, geometry and row bytes are taken from the platform console at run
  * time, never hard-coded. */
 constexpr uint64_t kPanelIova   = 0x4000000ULL;
+/* H618: the visible test rectangle placed away from the status row area. */
+constexpr uint32_t kPanelOriginX = 64u;
+constexpr uint32_t kPanelOriginY = 200u;
+constexpr uint64_t kPanelSrcOffset = 2048;   /* second image inside surfSrc */
 constexpr uint32_t kSurfWidth      = 1080u;
 constexpr uint32_t kSurfHeight     = 1920u;
 constexpr uint32_t kSurfRowBytes   = 4352u;   /* plane 0 row stride in bytes */
@@ -288,6 +292,9 @@ struct Ctx {
     uint32_t panelRowBytes;
     uint32_t panelDepth;
     bool panelReady;                /* H617: the console answered and every check passed */
+    GpuWindow panelWindow;          /* H618: uncached CPU view of the panel */
+    bool panelWindowReady;
+    uint32_t panelSentinel[4];      /* H618: panel values just outside the rectangle */
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
@@ -348,8 +355,12 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * [1] every validation check passed, [2] the page table was built with the
  * panel range, [3] base address low, [4] base address high, [5] length,
  * [6] width, [7] height, [8] row bytes, [9] depth, [10] v_display flag,
- * [11] the IOVA chosen for it. */
-extern "C" { volatile uint32_t native_a540_panel_diag[12]; }
+ * [11] the IOVA chosen for it. H618 adds the panel copy: [12] run count,
+ * [13] submit rc, [14] wait rc, [15] fence, [16] matching pixels out of
+ * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
+ * (0xffffffff when all match), [18] the CPU window mapping,
+ * [19] sentinel pixels outside the rectangle that changed. */
+extern "C" { volatile uint32_t native_a540_panel_diag[20]; }
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -1693,8 +1704,8 @@ static void c3_thread(void *, wait_result_t) {
      * response, and a rejected response simply leaves the panel unmapped. */
     {
         PE_Video consoleVideo = {};
-        const bool consoleOk = PE_current_console(&consoleVideo);
-        native_a540_panel_diag[0] = consoleOk ? 1u : 0u;
+        const bool consoleAnswered = PE_current_console(&consoleVideo);
+        native_a540_panel_diag[0] = consoleAnswered ? 1u : 0u;
         native_a540_panel_diag[6] = consoleVideo.v_width;
         native_a540_panel_diag[7] = consoleVideo.v_height;
         native_a540_panel_diag[8] = (uint32_t)consoleVideo.v_rowBytes;
@@ -1705,8 +1716,7 @@ static void c3_thread(void *, wait_result_t) {
         const uint64_t rowBytes = consoleVideo.v_rowBytes;
         const uint64_t span = rowBytes * consoleVideo.v_height;
         native_a540_panel_diag[5] = (uint32_t)span;
-        const bool plausible = consoleOk
-            && consoleVideo.v_baseAddr
+        const bool plausible = consoleVideo.v_baseAddr
             && consoleVideo.v_depth == 32
             && consoleVideo.v_rotate == 0
             && consoleVideo.v_width && consoleVideo.v_height
@@ -1725,6 +1735,13 @@ static void c3_thread(void *, wait_result_t) {
             c->panelReady = true;
             native_a540_panel_diag[1] = 1u;
             native_a540_panel_diag[11] = (uint32_t)kPanelIova;
+            /* H618: an uncached CPU view of the panel, used only to read pixels
+             * back. Device memory, so no cache maintenance is needed and the
+             * reads observe the same bytes the GPU wrote. */
+            c->panelWindowReady = mapWindow(c->panelPhys, c->panelBytes, &c->panelWindow);
+            if (!c->panelWindowReady)
+                IOLog("NATIVE_GPU_C3: H618 panel CPU window failed for base=%llx len=%llu\n",
+                      (unsigned long long)c->panelPhys, (unsigned long long)c->panelBytes);
             IOLog("NATIVE_GPU_C3: H617 console panel base=%llx len=%llu %ux%u row=%llu "
                   "depth=%u display=%llu -> iova %llx\n",
                   (unsigned long long)c->panelPhys, (unsigned long long)c->panelBytes,
@@ -1733,7 +1750,7 @@ static void c3_thread(void *, wait_result_t) {
                   (unsigned long long)kPanelIova);
         } else {
             IOLog("NATIVE_GPU_C3: H617 console panel rejected (ok=%d base=%llx %ux%u "
-                  "row=%llu depth=%u rotate=%u)\n", consoleOk,
+                  "row=%llu depth=%u rotate=%u)\n", consoleAnswered,
                   (unsigned long long)consoleVideo.v_baseAddr, (unsigned)consoleVideo.v_width,
                   (unsigned)consoleVideo.v_height, (unsigned long long)consoleVideo.v_rowBytes,
                   (unsigned)consoleVideo.v_depth, (unsigned)consoleVideo.v_rotate);
@@ -2059,6 +2076,146 @@ extern "C" void native_a540_hb_surface_selftest(void) {
     native_a540_surface_diag[10] = rowMask;
     native_a540_surface_diag[11] = badGot;
     native_a540_surface_diag[12] = firstBadRowMatched;
+}
+/* H618: a bright, position- and row-coded pattern. Red rises left to right,
+ * blue rises top to bottom, green is constant and alpha is opaque, so a
+ * photograph can tell which row and column landed where. */
+static uint32_t panelPattern(unsigned x, unsigned y) {
+    return 0xff000000u | ((x * 4u) << 16) | (0x80u << 8) | (y * 32u);
+}
+
+/* H618: the register setup Mesa issues before every a5xx 2D blit. H612 through
+ * H615 omitted it and still passed, which means they relied on values the C3
+ * firmware happened to leave behind. Stating them removes that dependence. */
+static void a5xxBlitSetup(volatile uint32_t *ib, unsigned &w) {
+    using namespace A5xxBlit;
+    static const struct { uint32_t reg; uint32_t value; } setup[] = {
+        { 0xe141u, 0x00000008u },   /* RB_RENDER_CNTL */
+        { 0x2100u, 0x86000000u },   /* RB_2D_BLIT_CNTL */
+        { 0x2180u, 0x86000000u },   /* GRAS_2D_BLIT_CNTL */
+        { 0x2184u, 0x00000009u },   /* UNKNOWN_2184 */
+        { 0xe140u, 0x00020000u },   /* RB_CNTL: BYPASS (bit 17) */
+        { 0x0cc6u, 0x00000004u },   /* RB_MODE_CNTL */
+        { 0x0ec2u, 0x0000000cu },   /* SP_MODE_CNTL */
+        { 0x0f02u, 0x00000344u },   /* TPL1_MODE_CNTL */
+        { 0x0e06u, 0x00000002u },   /* HLSQ_MODE_CNTL */
+        { 0xe000u, 0x00000181u },   /* GRAS_CL_CNTL */
+    };
+    for (unsigned i = 0; i < sizeof(setup) / sizeof(setup[0]); ++i) {
+        ib[w++] = type4(setup[i].reg, 1);
+        ib[w++] = setup[i].value;
+    }
+}
+
+/* H618: copy the visible 64x8 image from the surface source into the panel.
+ * The panel row is 4320 bytes, which the RB_2D_*_SIZE PITCH field cannot express
+ * because it is stored shifted right by six, so each destination row is emitted
+ * as its own one-row blit. A one-row blit never steps rows, so the pitch field
+ * only has to cover the row, and the destination start address is rounded down
+ * to a 64-byte boundary with the difference folded into the X coordinate, which
+ * is the same technique Mesa states and uses for buffer blits. */
+extern "C" void native_a540_hb_panel_selftest(void) {
+    using namespace A5xxBlit;
+    if (!gC3 || !gA540Ready || !gC3->panelReady || !gC3->surfaceReady)
+        return;
+    Ctx &c = *gC3;
+    volatile uint32_t *src = reinterpret_cast<volatile uint32_t *>(
+        static_cast<char *>(c.surfSrc.cpu) + kPanelSrcOffset);
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[2].cpu);
+    const uint64_t srcIova = kSurfSrcIova + kPanelSrcOffset;
+    const uint64_t panelBase = c.panelPhys;
+    const uint32_t rowBytes = c.panelRowBytes;
+    static const uint32_t probeX[4] = { kPanelOriginX - 1u, kPanelOriginX + kPatWidth,
+                                        kPanelOriginX - 1u, kPanelOriginX + kPatWidth };
+    static const uint32_t probeY[4] = { kPanelOriginY - 1u, kPanelOriginY - 1u,
+                                        kPanelOriginY + kPatHeight, kPanelOriginY + kPatHeight };
+
+    for (unsigned y = 0; y < kPatHeight; ++y)
+        for (unsigned x = 0; x < kPatWidth; ++x)
+            src[y * kPatRowBytes / 4 + x] = panelPattern(x, y);
+
+    unsigned w = 0;
+    a5xxBlitSetup(ib, w);
+    for (unsigned y = 0; y < kPatHeight; ++y) {
+        const uint64_t dstByte = panelBase + (uint64_t)(kPanelOriginY + y) * rowBytes
+                              + (uint64_t)kPanelOriginX * 4u;
+        const uint64_t dstAligned = dstByte & ~UINT64_C(63);
+        const uint32_t shiftPixels = (uint32_t)((dstByte - dstAligned) / 4u);
+        const uint64_t srcRow = srcIova + (uint64_t)y * kPatRowBytes;
+        ib[w++] = type7(CpSetRenderMode, 1);
+        ib[w++] = RenderBlit2d;
+        ib[w++] = type4(Rb2dSrcInfo, 9);
+        ib[w++] = SurfRgba8Linear;
+        ib[w++] = (uint32_t)(srcRow & 0xffffffffu);
+        ib[w++] = (uint32_t)(srcRow >> 32);
+        ib[w++] = (kPatRowBytes >> 6) | (((kPatRowBytes * kPatHeight) >> 6) << 16);
+        for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+        ib[w++] = type4(Gras2dSrcInfo, 1);
+        ib[w++] = SurfRgba8Linear;
+        ib[w++] = type4(Rb2dDstInfo, 9);
+        ib[w++] = SurfRgba8Linear;
+        ib[w++] = (uint32_t)(dstAligned & 0xffffffffu);
+        ib[w++] = (uint32_t)(dstAligned >> 32);
+        ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);
+        for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+        ib[w++] = type4(Gras2dDstInfo, 1);
+        ib[w++] = SurfRgba8Linear;
+        ib[w++] = type7(CpBlit, 5);
+        ib[w++] = BlitOpCopy;
+        ib[w++] = 0u;
+        ib[w++] = (kPatWidth - 1u);
+        ib[w++] = shiftPixels;
+        ib[w++] = shiftPixels + kPatWidth - 1u;
+        ib[w++] = type7(CpSetRenderMode, 1);
+        ib[w++] = RenderEnd2d;
+    }
+    if (c.panelWindowReady) {
+        for (unsigned i = 0; i < 4; ++i) {
+            const uint32_t index = (probeY[i] * rowBytes) / 4u + probeX[i];
+            c.panelSentinel[i] = (index < c.panelBytes / 4u) ? c.panelWindow.base[index] : 0u;
+        }
+    }
+
+    cleanDcache(c.surfSrc.cpu, c.surfSrc.bytes);
+
+    uint64_t f = 0;
+    const int submitResult = native_a540_submit_bo(2, w, &f);
+    const int waitResult = submitResult ? -1 : native_a540_wait_fence(f, 200000000ull);
+
+    native_a540_panel_diag[12] = native_a540_panel_diag[12] + 1u;
+    native_a540_panel_diag[13] = (uint32_t)submitResult;
+    native_a540_panel_diag[14] = (uint32_t)waitResult;
+    native_a540_panel_diag[15] = (uint32_t)f;
+    native_a540_panel_diag[18] = c.panelWindowReady ? 1u : 0u;
+    if (waitResult || !c.panelWindowReady)
+        return;
+
+    /* The panel is device memory mapped uncached, so these reads reach the same
+     * place the GPU wrote and need no cache maintenance either way. */
+    volatile uint32_t *panel = c.panelWindow.base;
+    unsigned matched = 0;
+    unsigned firstBad = 0xffffffffu;
+    for (unsigned y = 0; y < kPatHeight; ++y) {
+        const uint32_t rowWords = ((kPanelOriginY + y) * rowBytes) / 4u;
+        for (unsigned x = 0; x < kPatWidth; ++x) {
+            const uint32_t index = rowWords + kPanelOriginX + x;
+            if (panel[index] == panelPattern(x, y))
+                ++matched;
+            else if (firstBad == 0xffffffffu)
+                firstBad = index;
+        }
+    }
+    /* Sentinels one pixel outside every edge must be untouched. They are read
+     * before the copy, so a change is attributable to this copy alone. */
+    unsigned sentinelChanged = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t index = (probeY[i] * rowBytes) / 4u + probeX[i];
+        if (index < c.panelBytes / 4u && panel[index] != c.panelSentinel[i])
+            ++sentinelChanged;
+    }
+    native_a540_panel_diag[16] = matched;
+    native_a540_panel_diag[17] = firstBad;
+    native_a540_panel_diag[19] = sentinelChanged;
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
