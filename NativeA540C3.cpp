@@ -376,7 +376,10 @@ extern "C" { volatile uint32_t native_a540_panel_diag[80]; }
  * [66] console scroll calls     [67] console glyph/clear/cursor calls
  * [68] console text rows       [69] console text columns
  * [70] last scroll region top  [71] last scroll region bottom
- * [72] glyph height in panel rows  [73] text rows the console copied this beat */
+ * [72] glyph height in panel rows  [73] text rows the console copied this beat
+ * [74] vc_paint_char calls  [75] vc_clear_screen calls  [76] cursor flips
+ * [77] the H630 console control ran  [78] last gc_enable() argument
+ * Decay slots 56..62 start each cycle at 0xffffffff, meaning not reached yet. */
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -2165,9 +2168,9 @@ static const uint32_t kRectColor[kRectCount] = {
  * writes, and it was not among the writers the display driver counts. These
  * counters come from video_console.c (console-panel-write-accounting.patch) and
  * are sampled once per beat so the change can be attributed to a beat. */
-extern "C" { extern volatile unsigned long long video_console_panel_counts[12]; }
+extern "C" { extern volatile unsigned long long video_console_panel_counts[16]; }
 static volatile uint32_t gPanelBeatsSinceWrite = 0xffffffffu;
-static unsigned long long gPanelConsoleLast[12];
+static unsigned long long gPanelConsoleLast[16];
 static uint32_t gPanelLastTransitions = 0;
 static uint64_t gPanelProbe[kRectCount * 4];
 static bool gPanelProbeReady = false;
@@ -2406,6 +2409,10 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     }
     native_a540_panel_diag[36] = finalOk;
     native_a540_panel_diag[37] = finalTotal;
+    /* H630: start a fresh decay row. H629 left the previous cycle's later
+     * offsets in these slots, so a printed row could mix two writes. */
+    for (unsigned i = 56; i <= 62; ++i)
+        native_a540_panel_diag[i] = 0xffffffffu;
     /* H629: the write just happened, so the following beats measure the decay. */
     gPanelBeatsSinceWrite = 0u;
 }
@@ -2550,6 +2557,11 @@ extern "C" void native_a540_hb_panel_watch(void) {
 
         native_a540_panel_diag[66] = (uint32_t)scrollCalls;
         native_a540_panel_diag[67] = (uint32_t)drawCalls;
+        native_a540_panel_diag[74] = (uint32_t)vc[4];
+        native_a540_panel_diag[75] = (uint32_t)vc[5];
+        native_a540_panel_diag[76] = (uint32_t)vc[6];
+        native_a540_panel_diag[77] = (uint32_t)vc[12];
+        native_a540_panel_diag[78] = (uint32_t)vc[13];
         native_a540_panel_diag[68] = (uint32_t)vc[9];
         native_a540_panel_diag[69] = (uint32_t)vc[10];
         native_a540_panel_diag[70] = (uint32_t)vc[7];
@@ -2558,7 +2570,7 @@ extern "C" void native_a540_hb_panel_watch(void) {
         native_a540_panel_diag[73] = (uint32_t)rowsDelta;
 
         for (unsigned i = 0; i < 12; ++i)
-            gPanelConsoleLast[i] = video_console_panel_counts[i];
+            gPanelConsoleLast[i] = vc[i];
     }
 
     if (gPanelBeatsSinceWrite != 0xffffffffu) {
