@@ -77,9 +77,8 @@ constexpr uint64_t kSurfDstIova = 0x3100000ULL;
  * length, geometry and row bytes are taken from the platform console at run
  * time, never hard-coded. */
 constexpr uint64_t kPanelIova   = 0x4000000ULL;
-/* H618: the visible test rectangle placed away from the status row area. */
-constexpr uint32_t kPanelOriginX = 64u;
-constexpr uint32_t kPanelOriginY = 200u;
+/* H622: the single interior rectangle of H618 to H621 is replaced by the
+ * kRectX/kRectY table below, which covers odd and even rows and all four edges. */
 constexpr uint64_t kPanelSrcOffset = 4096;   /* H620: second image inside surfSrc */
 constexpr uint32_t kSurfWidth      = 1080u;
 constexpr uint32_t kSurfHeight     = 1920u;
