@@ -2325,13 +2325,14 @@ static void caseWriteOffscreen(Ctx &c, uint32_t srcRow, uint64_t dstOffset,
 {
     using namespace A5xxBlit;
     volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.caseIb.cpu);
-    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(
-        static_cast<char *>(c.surfDst.cpu) + dstOffset);
+    char *tgtBase = static_cast<char *>(c.surfDst.cpu) + dstOffset;
+    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(tgtBase);
     /* Fill the target row with the sentinel and make sure the GPU sees the
      * memory, not a cache line this CPU left behind. Only the 256 bytes this
-     * operation touches are cleaned. */
+     * operation touches are cleaned. The cache calls take the plain pointer,
+     * because the volatile-qualified one will not convert. */
     for (unsigned i = 0; i < kPatWidth; ++i) tgt[i] = kCaseSentinel;
-    cleanDcache(tgt, 256u);
+    cleanDcache(tgtBase, 256u);
     const uint64_t dstByte = kSurfDstIova + dstOffset;
     const uint64_t dstAligned = dstByte & ~UINT64_C(63);
     const uint32_t shift = (uint32_t)((dstByte - dstAligned) / 4u);
@@ -2365,7 +2366,7 @@ static void caseWriteOffscreen(Ctx &c, uint32_t srcRow, uint64_t dstOffset,
     uint64_t fence = 0;
     *submitRc = submit_ib_at(c, c.caseIb.cpu, kCaseIbIova, w, &fence);
     *waitRc = *submitRc ? -1 : native_a540_wait_fence(fence, 200000000ull);
-    invalidateDcache(tgt, 256u);
+    invalidateDcache(tgtBase, 256u);
     unsigned done = 0, kept = 0, missing = 0xffffffffu;
     for (unsigned i = 0; i < kPatWidth; ++i) {
         const uint32_t v = tgt[i];
@@ -2902,7 +2903,6 @@ extern "C" void native_a540_hb_panel_selftest(void) {
         native_a540_panel_diag[148] = (uint32_t)sRc;
         native_a540_panel_diag[149] = (uint32_t)wRc;
         {
-            volatile uint32_t *panel = c.panelWindow.base;
             unsigned agree = 0, firstDiff = 0xffffffffu;
             for (unsigned i = 0; i < kPatWidth; ++i) {
                 const uint64_t index = ((uint64_t)goodRow * rowBytes) / 4u
@@ -2920,7 +2920,6 @@ extern "C" void native_a540_hb_panel_selftest(void) {
         for (unsigned k = 0; k < 2; ++k) {
             const uint32_t row = kRectY[1] + 2u + k;
             caseReadPanelRow(c, row, gpuVals, &sRc, &wRc);
-            volatile uint32_t *panel = c.panelWindow.base;
             unsigned agree = 0, firstDiff = 0xffffffffu;
             uint32_t firstGpu = 0, firstCpu = 0;
             for (unsigned i = 0; i < kPatWidth; ++i) {
