@@ -68,7 +68,7 @@ constexpr size_t   kBoPage    = 0x1000;
  * validator accepts for 'b3a8': plane 0 is 1080x1920 BGRA at a 4352-byte row
  * (the qualified stride accessor reports 1088 pixels and bytestride() multiplies
  * by four), and plane 1 is the 8-bit alpha at 1088 bytes per row. plane 0 is
- * 4352*1920 = 8,359,680 and plane 1 is 1088*1920 = 2,088,960, so the whole
+ * 4352*1920 = 8,355,840 and plane 1 is 1088*1920 = 2,088,960, so the whole
  * surface is 10,444,800 bytes, exactly 2550 pages. */
 constexpr uint64_t kSurfSrcIova = 0x3000000ULL;
 constexpr uint64_t kSurfDstIova = 0x3100000ULL;
@@ -76,8 +76,8 @@ constexpr uint32_t kSurfWidth      = 1080u;
 constexpr uint32_t kSurfHeight     = 1920u;
 constexpr uint32_t kSurfRowBytes   = 4352u;   /* plane 0 row stride in bytes */
 constexpr uint32_t kSurfAlphaRow   = 1088u;   /* plane 1 row stride in bytes */
-constexpr uint64_t kSurfPlane0     = UINT64_C(4352) * 1920;
-constexpr uint64_t kSurfPlane1     = UINT64_C(1088) * 1920;
+constexpr uint64_t kSurfPlane0     = UINT64_C(kSurfRowBytes) * kSurfHeight;
+constexpr uint64_t kSurfPlane1     = UINT64_C(kSurfAlphaRow) * kSurfHeight;
 constexpr uint64_t kSurfBytes      = kSurfPlane0 + kSurfPlane1;
 /* The copied rectangle is deliberately offset so a wrong row stride or a
  * missing padding gap cannot pass: 64x8 pixels placed at destination (1,3). */
