@@ -2169,7 +2169,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     ib[w++] = SurfRgba8Linear;
     ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
     ib[w++] = (uint32_t)(kSurfDstIova >> 32);
-    ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);
+    ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);   /* H621: 4352, the value H615 proved */
     for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
     ib[w++] = type4(Gras2dDstInfo, 1);
     ib[w++] = SurfRgba8Linear;
@@ -2228,7 +2228,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
         ib[w++] = SurfRgba8Linear;
         ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
         ib[w++] = (uint32_t)(kSurfDstIova >> 32);
-        ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);
+        ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);   /* H621: 4352, the value H615 proved */
         for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
         ib[w++] = type4(Gras2dSrcInfo, 1);
         ib[w++] = SurfRgba8Linear;
@@ -2236,7 +2236,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
         ib[w++] = SurfRgba8Linear;
         ib[w++] = (uint32_t)(dstAligned & 0xffffffffu);
         ib[w++] = (uint32_t)(dstAligned >> 32);
-        ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);
+        ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);   /* H619 proved this destination form */
         for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
         ib[w++] = type4(Gras2dDstInfo, 1);
         ib[w++] = SurfRgba8Linear;
