@@ -63,6 +63,29 @@ constexpr size_t kRptrBytes  = 0x1000;
 constexpr unsigned kBoSlots   = 8;          /* C4-B: pool of user-visible BOs */
 constexpr uint64_t kBoBase    = 0x2000000ULL;
 constexpr size_t   kBoPage    = 0x1000;
+/* H612: Stage 2 needs a destination that is a real desktop surface rather than a
+ * slot from the fixed 4 KiB test pool. The geometry is the one the display
+ * validator accepts for 'b3a8': plane 0 is 1080x1920 BGRA at a 4352-byte row
+ * (the qualified stride accessor reports 1088 pixels and bytestride() multiplies
+ * by four), and plane 1 is the 8-bit alpha at 1088 bytes per row. plane 0 is
+ * 4352*1920 = 8,359,680 and plane 1 is 1088*1920 = 2,088,960, so the whole
+ * surface is 10,444,800 bytes, exactly 2550 pages. */
+constexpr uint64_t kSurfSrcIova = 0x3000000ULL;
+constexpr uint64_t kSurfDstIova = 0x3100000ULL;
+constexpr uint32_t kSurfWidth      = 1080u;
+constexpr uint32_t kSurfHeight     = 1920u;
+constexpr uint32_t kSurfRowBytes   = 4352u;   /* plane 0 row stride in bytes */
+constexpr uint32_t kSurfAlphaRow   = 1088u;   /* plane 1 row stride in bytes */
+constexpr uint64_t kSurfPlane0     = UINT64_C(4352) * 1920;
+constexpr uint64_t kSurfPlane1     = UINT64_C(1088) * 1920;
+constexpr uint64_t kSurfBytes      = kSurfPlane0 + kSurfPlane1;
+/* The copied rectangle is deliberately offset so a wrong row stride or a
+ * missing padding gap cannot pass: 64x8 pixels placed at destination (1,3). */
+constexpr uint32_t kPatWidth       = 64u;
+constexpr uint32_t kPatHeight      = 8u;
+constexpr uint32_t kPatRowBytes    = kPatWidth * 4u;
+constexpr uint32_t kDstOriginX     = 1u;
+constexpr uint32_t kDstOriginY     = 3u;
 #define kIbIova  (kBoBase)
 #define kTgtIova (kBoBase + kBoPage)
 
@@ -247,6 +270,9 @@ struct Ctx {
     void (*record)(uint32_t);
     Alloc tables, ring, pm4, pfp, gpmu, rptr, zapHeader, zapImage, win;
     Alloc bo[kBoSlots];
+    Alloc surfSrc;                  /* H612: pattern source, real 2D geometry */
+    Alloc surfDst;                  /* H612: the desktop-sized destination surface */
+    bool surfaceReady;              /* H612: both allocations succeeded */
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
@@ -291,6 +317,13 @@ extern "C" { volatile uint32_t native_a540_hbsub[6]; }
  * bytes, [5] first mismatching byte offset (0xffffffff when exact), [6] dst[0],
  * [7] src[0]. */
 extern "C" { volatile uint32_t native_a540_blit_diag[8]; }
+/* H612: real-size surface through the static GPU page table. [0] submit rc,
+ * [1] wait rc, [2] fence, [3] run count, [4] matching pixels out of
+ * kPatWidth*kPatHeight, [5] first failing destination pixel index
+ * (0xffffffff when all match), [6] source allocation succeeded,
+ * [7] destination allocation succeeded, [8] plane 0 row padding still clear
+ * after the copy, [9] alpha plane still clear after the copy. */
+extern "C" { volatile uint32_t native_a540_surface_diag[10]; }
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -303,6 +336,10 @@ constexpr uint32_t Gras2dDstInfo   = 0x2182u;
 /* COLOR_FORMAT = RB5_R8_UNORM (0x03), TILE_MODE = TILE5_LINEAR (0),
  * COLOR_SWAP = WZYX (0), no UBWC flags, no sRGB. */
 constexpr uint32_t SurfR8Linear    = 0x03u;
+/* H612: 32-bit format for the real surface test. Source and destination carry
+ * the same format and the same swap, so the blit moves bytes unchanged, which is
+ * what the read-back comparison relies on. */
+constexpr uint32_t SurfRgba8Linear = 0x30u;   /* RB5_R8G8B8A8_UNORM, linear, WZYX */
 constexpr uint32_t BlitOpCopy      = 1u;
 /* One row of 1024 bytes. RB_2D_*_SIZE stores pitch and array pitch >> 6. */
 constexpr unsigned kBlitBytes      = 1024u;
@@ -439,7 +476,7 @@ static bool smmu_setup(Ctx &c) {
 
     /* ArmSmmu4KBuild requires ascending, non-overlapping IOVAs: bring-up
      * buffers, then the BO pool, then the trusted window. */
-    ArmSmmu4KRange r[6 + kBoSlots];
+    ArmSmmu4KRange r[8 + kBoSlots];
     size_t nr = 0;
     r[nr++] = { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     r[nr++] = { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 };
@@ -449,6 +486,14 @@ static bool smmu_setup(Ctx &c) {
     for (unsigned i = 0; i < kBoSlots; ++i)
         r[nr++] = { kBoBase + i * kBoPage, c.bo[i].phys, kBoPage,
                     ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    /* H612: the surface pair sits above the BO pool and below the trusted
+     * window, so the ascending order the builder requires still holds. */
+    if (c.surfaceReady) {
+        r[nr++] = { kSurfSrcIova, c.surfSrc.phys, c.surfSrc.bytes,
+                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+        r[nr++] = { kSurfDstIova, c.surfDst.phys, c.surfDst.bytes,
+                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    }
     r[nr++] = { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     if (ArmSmmu4KBuild(&c.cfg, r, nr, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
@@ -1582,6 +1627,22 @@ static void c3_thread(void *, wait_result_t) {
     for (unsigned i = 0; i < kBoSlots; ++i) {
         if (!c->bo[i].init(kBoPage)) { c->put(0xdea0003au); gC3Done = 1; return; }
     }
+    /* H612: a contiguous allocation of the full desktop surface is the thing
+     * being tested, so failure is recorded and the surface test is skipped
+     * rather than made fatal. Everything else must behave exactly as H611. */
+    c->surfaceReady = false;
+    {
+        const size_t srcTotal = (kPatRowBytes * kPatHeight + 0xfff) & ~UINT64_C(0xfff);
+        const bool srcOk = c->surfSrc.init(srcTotal < 0x1000 ? 0x1000 : srcTotal);
+        const bool dstOk = srcOk && c->surfDst.init(kSurfBytes);
+        native_a540_surface_diag[6] = srcOk ? 1u : 0u;
+        native_a540_surface_diag[7] = dstOk ? 1u : 0u;
+        if (dstOk)
+            c->surfaceReady = true;
+        else
+            IOLog("NATIVE_GPU_C3: H612 surface allocation failed (src=%d dst=%d "
+                  "dstBytes=%llu)\n", srcOk, dstOk, (unsigned long long)kSurfBytes);
+    }
     /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
      * window inside the kernel window and appends zap-base=<phys>. Map the
      * metadata at +0 and the .b02 image at +1 MiB. */
@@ -1789,6 +1850,106 @@ extern "C" void native_a540_hb_blit_selftest(void) {
     native_a540_blit_diag[5] = firstBad;
     native_a540_blit_diag[6] = dst[0];
     native_a540_blit_diag[7] = src[0];
+}
+
+/* H612: blit a distinguishable 64x8 pattern into a desktop-sized surface that
+ * came from a normal allocation and is mapped by the C3 page table, then read
+ * the destination back and check three separate things: the copied pixels, the
+ * untouched padding between the 4320 bytes of visible row and the 4352-byte
+ * stride, and the alpha plane beyond plane 0. The destination starts zeroed and
+ * every pattern pixel carries 0xff in its top byte, so a match cannot come from
+ * the CPU having written it. */
+extern "C" void native_a540_hb_surface_selftest(void) {
+    using namespace A5xxBlit;
+    if (!gC3 || !gA540Ready || !gC3->surfaceReady)
+        return;
+    Ctx &c = *gC3;
+    volatile uint32_t *pat = reinterpret_cast<volatile uint32_t *>(c.surfSrc.cpu);
+    volatile uint32_t *surf = reinterpret_cast<volatile uint32_t *>(c.surfDst.cpu);
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[2].cpu);
+
+    for (unsigned y = 0; y < kPatHeight; ++y)
+        for (unsigned x = 0; x < kPatWidth; ++x)
+            pat[y * kPatRowBytes / 4 + x] =
+                0xff000000u | (y << 16) | (x << 8);
+    /* Leave the rest of the source page defined so an over-wide copy is visible. */
+    for (unsigned i = kPatHeight * kPatRowBytes / 4; i < c.surfSrc.bytes / 4; ++i)
+        pat[i] = 0u;
+
+    const unsigned dstRowWords = kSurfRowBytes / 4;
+    for (unsigned i = 0; i < c.surfDst.bytes / 4; ++i)
+        surf[i] = 0u;
+
+    unsigned w = 0;
+    ib[w++] = type7(CpSetRenderMode, 1);
+    ib[w++] = RenderBlit2d;
+    ib[w++] = type4(Rb2dSrcInfo, 9);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = static_cast<uint32_t>(kSurfSrcIova);
+    ib[w++] = 0u;
+    ib[w++] = (kPatRowBytes >> 6) | ((128u >> 6) << 16);
+    for (unsigned i = 0; i < 5; ++i)
+        ib[w++] = 0;
+    ib[w++] = type4(Gras2dSrcInfo, 1);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = type4(Rb2dDstInfo, 9);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = static_cast<uint32_t>(kSurfDstIova);
+    ib[w++] = 0u;
+    ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);
+    for (unsigned i = 0; i < 5; ++i)
+        ib[w++] = 0;
+    ib[w++] = type4(Gras2dDstInfo, 1);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = type7(CpBlit, 5);
+    ib[w++] = BlitOpCopy;
+    ib[w++] = 0u;                                   /* SRC_X1 = 0, SRC_Y1 = 0 */
+    ib[w++] = (kPatWidth - 1u) | ((kPatHeight - 1u) << 16);
+    ib[w++] = kDstOriginX | (kDstOriginY << 16);    /* DST_X1, DST_Y1 */
+    ib[w++] = (kDstOriginX + kPatWidth - 1u) | ((kDstOriginY + kPatHeight - 1u) << 16);
+    ib[w++] = type7(CpSetRenderMode, 1);
+    ib[w++] = RenderEnd2d;
+
+    cleanDcache(c.surfSrc.cpu, c.surfSrc.bytes);
+    cleanDcache(c.surfDst.cpu, c.surfDst.bytes);
+
+    uint64_t f = 0;
+    const int submitResult = native_a540_submit_bo(2, w, &f);
+    const int waitResult = submitResult ? -1 : native_a540_wait_fence(f, 200000000ull);
+
+    /* The fence has completed, so the GPU is done with the destination and the
+     * CPU may take ownership of the lines. */
+    invalidateDcache(c.surfDst.cpu, c.surfDst.bytes);
+
+    unsigned matched = 0, firstBad = 0xffffffffu;
+    for (unsigned y = 0; y < kPatHeight; ++y) {
+        for (unsigned x = 0; x < kPatWidth; ++x) {
+            const uint32_t want = 0xff000000u | (y << 16) | (x << 8);
+            const unsigned index = (kDstOriginY + y) * dstRowWords + kDstOriginX + x;
+            if (surf[index] == want)
+                ++matched;
+            else if (firstBad == 0xffffffffu)
+                firstBad = index;
+        }
+    }
+    /* Padding inside plane 0 that the copy must not have touched. */
+    unsigned paddingClean = 1;
+    for (unsigned y = 0; y < kSurfHeight; ++y)
+        for (unsigned i = kSurfWidth; i < dstRowWords; ++i)
+            if (surf[y * dstRowWords + i]) paddingClean = 0;
+    /* The alpha plane begins after plane 0 and is outside the copy. */
+    unsigned alphaClean = 1;
+    for (unsigned i = kSurfPlane0 / 4; i < c.surfDst.bytes / 4; ++i)
+        if (surf[i]) alphaClean = 0;
+
+    native_a540_surface_diag[0] = static_cast<uint32_t>(submitResult);
+    native_a540_surface_diag[1] = static_cast<uint32_t>(waitResult);
+    native_a540_surface_diag[2] = static_cast<uint32_t>(f);
+    native_a540_surface_diag[3] = native_a540_surface_diag[3] + 1u;
+    native_a540_surface_diag[4] = matched;
+    native_a540_surface_diag[5] = firstBad;
+    native_a540_surface_diag[8] = paddingClean ? 1u : 0u;
+    native_a540_surface_diag[9] = alphaClean ? 1u : 0u;
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
