@@ -360,7 +360,7 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
  * (0xffffffff when all match), [18] the CPU window mapping,
  * [19] sentinel pixels outside the rectangle that changed. */
-extern "C" { volatile uint32_t native_a540_panel_diag[32]; }
+extern "C" { volatile uint32_t native_a540_panel_diag[40]; }
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -1689,7 +1689,7 @@ static void c3_thread(void *, wait_result_t) {
         /* H620: two images, the H615 pattern and the bright panel pattern, each
          * 2048 bytes, plus a page of slack so a source address plus its declared
          * layer stride cannot land outside the mapping. */
-        const bool srcOk = c->surfSrc.init(2u * 0x1000);
+        const bool srcOk = c->surfSrc.init(4u * 0x1000);   /* H622: four bright tiles */
         const bool dstOk = srcOk && c->surfDst.init(kSurfBytes);
         native_a540_surface_diag[6] = srcOk ? 1u : 0u;
         native_a540_surface_diag[7] = dstOk ? 1u : 0u;
@@ -2109,170 +2109,187 @@ static void a5xxBlitSetup(volatile uint32_t *ib, unsigned &w) {
     }
 }
 
-/* H618: copy the visible 64x8 image from the surface source into the panel.
- * The panel row is 4320 bytes, which the RB_2D_*_SIZE PITCH field cannot express
- * because it is stored shifted right by six, so each destination row is emitted
- * as its own one-row blit. A one-row blit never steps rows, so the pitch field
- * only has to cover the row, and the destination start address is rounded down
- * to a 64-byte boundary with the difference folded into the X coordinate, which
- * is the same technique Mesa states and uses for buffer blits. */
-/* H620: two chained GPU blits so the panel receives pixels a GPU produced,
- * plus fault accounting that can tell a new fault from a latched one.
+/* H622: four rectangles that cover the cases a single interior rectangle cannot.
  *
- * Step A copies the bright CPU pattern into the real desktop surface with the
- * blit shape H615 validated, so the panel's source is a GPU output rather than
- * the independent pattern buffer H619 read from. Step B copies that surface
- * region to the panel as eight one-row blits, because the 4320-byte panel row
- * cannot be expressed by a PITCH field stored shifted right by six.
+ * Destination rows 0 and 1912 are even, so (y*4320 + x*4) is already on a 64-byte
+ * boundary and the folded shift is zero. Rows 1 and 1913 are odd, where the same
+ * expression is 32 bytes past a boundary and the shift is eight pixels. Copying
+ * both kinds in one run is what shows whether the rounding and the folded X are
+ * actually correct rather than accidentally right on aligned rows.
  *
- * Between the two steps CB0_FSR is read, written back to clear it under the
- * MMU-500 write-one-to-clear rule, and re-read. A non-zero FSR afterwards is
- * then a fault raised by this run, not one latched by an earlier candidate. */
+ * The rectangles also sit on the left edge (x 0..63), the right edge
+ * (x 1016..1079, the last 64 columns), the top edge (y 0..7) and the bottom edge
+ * (y 1912..1919). Each is filled by its own GPU blit from its own tile of the
+ * surface, and each tile of the surface was itself produced by a GPU blit in
+ * step A, so every pixel written to the panel originates from a GPU write. */
+static const uint32_t kRectX[4] = { 0u, 1016u, 0u, 1016u };
+static const uint32_t kRectY[4] = { 0u, 1u, 1912u, 1912u };
+static const uint32_t kTileY[4] = { 16u, 24u, 32u, 40u };   /* surface rows per tile */
+
 extern "C" void native_a540_hb_panel_selftest(void) {
     using namespace A5xxBlit;
     if (!gC3 || !gA540Ready || !gC3->panelReady || !gC3->surfaceReady)
         return;
     Ctx &c = *gC3;
     volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[2].cpu);
-    volatile uint32_t *pat = reinterpret_cast<volatile uint32_t *>(
-        static_cast<char *>(c.surfSrc.cpu) + kPanelSrcOffset);
-    const uint64_t patIova = kSurfSrcIova + kPanelSrcOffset;
+    volatile uint32_t *surface = reinterpret_cast<volatile uint32_t *>(c.surfDst.cpu);
+    volatile uint32_t *panel = c.panelWindow.base;
     const uint32_t rowBytes = c.panelRowBytes;
-    const unsigned surfaceX = 16u, surfaceY = 16u;
     const unsigned surfaceWords = kSurfRowBytes / 4u;
-    static const uint32_t probeX[4] = { kPanelOriginX - 1u, kPanelOriginX + kPatWidth,
-                                        kPanelOriginX - 1u, kPanelOriginX + kPatWidth };
-    static const uint32_t probeY[4] = { kPanelOriginY - 1u, kPanelOriginY - 1u,
-                                        kPanelOriginY + kPatHeight, kPanelOriginY + kPatHeight };
+    const unsigned patWords = kPatRowBytes / 4u;
 
-    for (unsigned y = 0; y < kPatHeight; ++y)
-        for (unsigned x = 0; x < kPatWidth; ++x)
-            pat[y * kPatRowBytes / 4 + x] = panelPattern(x, y);
+    /* Four bright tiles in the source buffer, one per rectangle. */
+    for (unsigned tile = 0; tile < 4; ++tile) {
+        volatile uint32_t *pat = reinterpret_cast<volatile uint32_t *>(
+            static_cast<char *>(c.surfSrc.cpu) + kPanelSrcOffset + tile * 2048u);
+        for (unsigned y = 0; y < kPatHeight; ++y)
+            for (unsigned x = 0; x < kPatWidth; ++x)
+                pat[y * patWords + x] = panelPattern(x, y) | (tile << 1);
+    }
     cleanDcache(c.surfSrc.cpu, c.surfSrc.bytes);
 
-    /* Step A: pattern image to the surface, one 2D blit. Both pitches are
-     * multiples of 64, so the field is exact and nothing is shrunk to hide an
-     * out-of-range access. */
+    /* Step A: each tile into its own band of the real surface. */
     unsigned w = 0;
     a5xxBlitSetup(ib, w);
-    ib[w++] = type7(CpSetRenderMode, 1);
-    ib[w++] = RenderBlit2d;
-    ib[w++] = type4(Rb2dSrcInfo, 9);
-    ib[w++] = SurfRgba8Linear;
-    ib[w++] = (uint32_t)(patIova & 0xffffffffu);
-    ib[w++] = (uint32_t)(patIova >> 32);
-    ib[w++] = (kPatRowBytes >> 6) | (((kPatRowBytes * kPatHeight) >> 6) << 16);
-    for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
-    ib[w++] = type4(Gras2dSrcInfo, 1);
-    ib[w++] = SurfRgba8Linear;
-    ib[w++] = type4(Rb2dDstInfo, 9);
-    ib[w++] = SurfRgba8Linear;
-    ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
-    ib[w++] = (uint32_t)(kSurfDstIova >> 32);
-    ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);   /* H621: 4352, the value H615 proved */
-    for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
-    ib[w++] = type4(Gras2dDstInfo, 1);
-    ib[w++] = SurfRgba8Linear;
-    ib[w++] = type7(CpBlit, 5);
-    ib[w++] = BlitOpCopy;
-    ib[w++] = 0u;
-    ib[w++] = (kPatWidth - 1u) | ((kPatHeight - 1u) << 16);
-    ib[w++] = surfaceX | (surfaceY << 16);
-    ib[w++] = (surfaceX + kPatWidth - 1u) | ((surfaceY + kPatHeight - 1u) << 16);
-    ib[w++] = type7(CpSetRenderMode, 1);
-    ib[w++] = RenderEnd2d;
-
+    for (unsigned tile = 0; tile < 4; ++tile) {
+        const uint64_t patIova = kSurfSrcIova + kPanelSrcOffset + tile * 2048u;
+        ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderBlit2d;
+        ib[w++] = type4(Rb2dSrcInfo, 9);
+        ib[w++] = SurfRgba8Linear;
+        ib[w++] = (uint32_t)(patIova & 0xffffffffu);
+        ib[w++] = (uint32_t)(patIova >> 32);
+        ib[w++] = (kPatRowBytes >> 6) | (((kPatRowBytes * kPatHeight) >> 6) << 16);
+        for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+        ib[w++] = type4(Gras2dSrcInfo, 1); ib[w++] = SurfRgba8Linear;
+        ib[w++] = type4(Rb2dDstInfo, 9);
+        ib[w++] = SurfRgba8Linear;
+        ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
+        ib[w++] = (uint32_t)(kSurfDstIova >> 32);
+        ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);
+        for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+        ib[w++] = type4(Gras2dDstInfo, 1); ib[w++] = SurfRgba8Linear;
+        ib[w++] = type7(CpBlit, 5);
+        ib[w++] = BlitOpCopy;
+        ib[w++] = 0u;
+        ib[w++] = (kPatWidth - 1u) | ((kPatHeight - 1u) << 16);
+        ib[w++] = 16u | (kTileY[tile] << 16);
+        ib[w++] = (16u + kPatWidth - 1u) | ((kTileY[tile] + kPatHeight - 1u) << 16);
+        ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderEnd2d;
+    }
     uint64_t fenceA = 0;
     const int submitA = native_a540_submit_bo(2, w, &fenceA);
     const int waitA = submitA ? -1 : native_a540_wait_fence(fenceA, 200000000ull);
-
-    /* The fence has completed, so the surface lines may be taken back by the
-     * CPU. */
     invalidateDcache(c.surfDst.cpu, c.surfDst.bytes);
 
-    unsigned matchedA = 0, firstBadA = 0xffffffffu;
-    volatile uint32_t *surface = reinterpret_cast<volatile uint32_t *>(c.surfDst.cpu);
-    if (!waitA) {
+    unsigned matchedA = 0, firstBadA = 0xffffffffu, tileOk = 0;
+    for (unsigned tile = 0; tile < 4; ++tile) {
+        unsigned good = 0;
         for (unsigned y = 0; y < kPatHeight; ++y)
             for (unsigned x = 0; x < kPatWidth; ++x) {
-                const uint32_t index = (surfaceY + y) * surfaceWords + surfaceX + x;
-                if (surface[index] == panelPattern(x, y)) ++matchedA;
+                const uint32_t index = (kTileY[tile] + y) * surfaceWords + 16u + x;
+                const uint32_t want = panelPattern(x, y) | (tile << 1);
+                if (surface[index] == want) { ++good; ++matchedA; }
                 else if (firstBadA == 0xffffffffu) firstBadA = index;
             }
+        if (good == kPatWidth * kPatHeight) tileOk |= (1u << tile);
     }
 
-    /* Fault accounting for the panel step only. */
+    /* Fault accounting for the panel step. */
     uint32_t fsrBefore = 0, farBefore = 0, fsrCleared = 0;
     c.io.read32(c.io.cookie, 0x8058, &fsrBefore);
     c.io.read32(c.io.cookie, 0x8060, &farBefore);
     c.io.write32(c.io.cookie, 0x8058, fsrBefore);
     c.io.read32(c.io.cookie, 0x8058, &fsrCleared);
 
+    /* Sentinels just outside every rectangle, where in bounds. */
+    uint32_t sentinel[16];
+    for (unsigned i = 0; i < 16; ++i) sentinel[i] = 0u;
     if (c.panelWindowReady) {
-        for (unsigned i = 0; i < 4; ++i) {
-            const uint32_t index = (probeY[i] * rowBytes) / 4u + probeX[i];
-            c.panelSentinel[i] = (index < c.panelBytes / 4u) ? c.panelWindow.base[index] : 0u;
+        for (unsigned r = 0; r < 4; ++r) {
+            const uint32_t xs[4] = { kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth,
+                                     kRectX[r], kRectX[r] + kPatWidth / 2u };
+            const uint32_t ys[4] = { kRectY[r] ? kRectY[r] - 1u : 0u, kRectY[r] + kPatHeight,
+                                     kRectY[r] + kPatHeight, kRectY[r] };
+            for (unsigned i = 0; i < 4; ++i) {
+                const uint64_t off = ((uint64_t)ys[i] * rowBytes) / 4u + xs[i];
+                if (xs[i] < c.panelWidth && ys[i] < c.panelHeight && off < c.panelBytes / 4u)
+                    sentinel[r * 4u + i] = panel[off];
+                else
+                    sentinel[r * 4u + i] = 0xffffffffu;   /* outside the panel, not checked */
+            }
         }
     }
 
-    w = 0;
-    a5xxBlitSetup(ib, w);
-    for (unsigned y = 0; y < kPatHeight; ++y) {
-        const uint64_t dstByte = kPanelIova + (uint64_t)(kPanelOriginY + y) * rowBytes
-                              + (uint64_t)kPanelOriginX * 4u;
-        const uint64_t dstAligned = dstByte & ~UINT64_C(63);
-        const uint32_t shiftPixels = (uint32_t)((dstByte - dstAligned) / 4u);
-        ib[w++] = type7(CpSetRenderMode, 1);
-        ib[w++] = RenderBlit2d;
-        ib[w++] = type4(Rb2dSrcInfo, 9);
-        ib[w++] = SurfRgba8Linear;
-        ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
-        ib[w++] = (uint32_t)(kSurfDstIova >> 32);
-        ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);   /* H621: 4352, the value H615 proved */
-        for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
-        ib[w++] = type4(Gras2dSrcInfo, 1);
-        ib[w++] = SurfRgba8Linear;
-        ib[w++] = type4(Rb2dDstInfo, 9);
-        ib[w++] = SurfRgba8Linear;
-        ib[w++] = (uint32_t)(dstAligned & 0xffffffffu);
-        ib[w++] = (uint32_t)(dstAligned >> 32);
-        ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);   /* H619 proved this destination form */
-        for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
-        ib[w++] = type4(Gras2dDstInfo, 1);
-        ib[w++] = SurfRgba8Linear;
-        ib[w++] = type7(CpBlit, 5);
-        ib[w++] = BlitOpCopy;
-        ib[w++] = surfaceX | ((surfaceY + y) << 16);
-        ib[w++] = (surfaceX + kPatWidth - 1u) | ((surfaceY + y) << 16);
-        ib[w++] = shiftPixels;
-        ib[w++] = shiftPixels + kPatWidth - 1u;
-        ib[w++] = type7(CpSetRenderMode, 1);
-        ib[w++] = RenderEnd2d;
-    }
-
+    /* Step B: one submission per rectangle, eight one-row blits each. */
+    unsigned matchedB = 0, firstBadB = 0xffffffffu, rectOk = 0, submitOk = 0;
+    int submitB = -1, waitB = -1;
     uint64_t fenceB = 0;
-    const int submitB = native_a540_submit_bo(2, w, &fenceB);
-    const int waitB = submitB ? -1 : native_a540_wait_fence(fenceB, 200000000ull);
+    for (unsigned r = 0; r < 4 && c.panelWindowReady; ++r) {
+        w = 0;
+        a5xxBlitSetup(ib, w);
+        for (unsigned y = 0; y < kPatHeight; ++y) {
+            const uint64_t dstByte = kPanelIova + (uint64_t)(kRectY[r] + y) * rowBytes
+                                  + (uint64_t)kRectX[r] * 4u;
+            const uint64_t dstAligned = dstByte & ~UINT64_C(63);
+            const uint32_t shiftPixels = (uint32_t)((dstByte - dstAligned) / 4u);
+            ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderBlit2d;
+            ib[w++] = type4(Rb2dSrcInfo, 9);
+            ib[w++] = SurfRgba8Linear;
+            ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
+            ib[w++] = (uint32_t)(kSurfDstIova >> 32);
+            ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);
+            for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+            ib[w++] = type4(Gras2dSrcInfo, 1); ib[w++] = SurfRgba8Linear;
+            ib[w++] = type4(Rb2dDstInfo, 9);
+            ib[w++] = SurfRgba8Linear;
+            ib[w++] = (uint32_t)(dstAligned & 0xffffffffu);
+            ib[w++] = (uint32_t)(dstAligned >> 32);
+            ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);
+            for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+            ib[w++] = type4(Gras2dDstInfo, 1); ib[w++] = SurfRgba8Linear;
+            ib[w++] = type7(CpBlit, 5);
+            ib[w++] = BlitOpCopy;
+            ib[w++] = 16u | ((kTileY[r] + y) << 16);
+            ib[w++] = (16u + kPatWidth - 1u) | ((kTileY[r] + y) << 16);
+            ib[w++] = shiftPixels;
+            ib[w++] = shiftPixels + kPatWidth - 1u;
+            ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderEnd2d;
+        }
+        fenceB = 0;
+        submitB = native_a540_submit_bo(2, w, &fenceB);
+        if (submitB) break;
+        waitB = native_a540_wait_fence(fenceB, 200000000ull);
+        if (waitB) break;
+        submitOk |= (1u << r);
+
+        unsigned good = 0;
+        for (unsigned y = 0; y < kPatHeight; ++y)
+            for (unsigned x = 0; x < kPatWidth; ++x) {
+                const uint64_t index = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u
+                                     + kRectX[r] + x;
+                const uint32_t want = panelPattern(x, y) | (r << 1);
+                if (panel[index] == want) { ++good; ++matchedB; }
+                else if (firstBadB == 0xffffffffu) firstBadB = (unsigned)index;
+            }
+        if (good == kPatWidth * kPatHeight) rectOk |= (1u << r);
+    }
 
     uint32_t fsrAfter = 0, farAfter = 0;
     c.io.read32(c.io.cookie, 0x8058, &fsrAfter);
     c.io.read32(c.io.cookie, 0x8060, &farAfter);
 
-    unsigned matchedB = 0, firstBadB = 0xffffffffu, sentinelChanged = 0;
-    if (!waitB && c.panelWindowReady) {
-        volatile uint32_t *panel = c.panelWindow.base;
-        for (unsigned y = 0; y < kPatHeight; ++y) {
-            const uint32_t rowWords = ((kPanelOriginY + y) * rowBytes) / 4u;
-            for (unsigned x = 0; x < kPatWidth; ++x) {
-                const uint32_t index = rowWords + kPanelOriginX + x;
-                if (panel[index] == panelPattern(x, y)) ++matchedB;
-                else if (firstBadB == 0xffffffffu) firstBadB = index;
+    unsigned sentinelChanged = 0;
+    if (c.panelWindowReady) {
+        for (unsigned r = 0; r < 4; ++r) {
+            const uint32_t xs[4] = { kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth,
+                                     kRectX[r], kRectX[r] + kPatWidth / 2u };
+            const uint32_t ys[4] = { kRectY[r] ? kRectY[r] - 1u : 0u, kRectY[r] + kPatHeight,
+                                     kRectY[r] + kPatHeight, kRectY[r] };
+            for (unsigned i = 0; i < 4; ++i) {
+                if (sentinel[r * 4u + i] == 0xffffffffu) continue;
+                const uint64_t off = ((uint64_t)ys[i] * rowBytes) / 4u + xs[i];
+                if (panel[off] != sentinel[r * 4u + i]) ++sentinelChanged;
             }
-        }
-        for (unsigned i = 0; i < 4; ++i) {
-            const uint32_t index = (probeY[i] * rowBytes) / 4u + probeX[i];
-            if (index < c.panelBytes / 4u && panel[index] != c.panelSentinel[i])
-                ++sentinelChanged;
         }
     }
 
@@ -2280,7 +2297,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     native_a540_panel_diag[13] = (uint32_t)submitB;
     native_a540_panel_diag[14] = (uint32_t)waitB;
     native_a540_panel_diag[15] = (uint32_t)fenceB;
-    native_a540_panel_diag[16] = matchedB;
+    native_a540_panel_diag[16] = rectOk;
     native_a540_panel_diag[17] = firstBadB;
     native_a540_panel_diag[18] = c.panelWindowReady ? 1u : 0u;
     native_a540_panel_diag[19] = sentinelChanged;
@@ -2294,6 +2311,9 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     native_a540_panel_diag[27] = fsrCleared;
     native_a540_panel_diag[28] = fsrAfter;
     native_a540_panel_diag[29] = farAfter;
+    native_a540_panel_diag[30] = matchedB;
+    native_a540_panel_diag[31] = tileOk;
+    native_a540_panel_diag[32] = submitOk;
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
