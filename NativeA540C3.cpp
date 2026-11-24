@@ -359,7 +359,7 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
  * (0xffffffff when all match), [18] the CPU window mapping,
  * [19] sentinel pixels outside the rectangle that changed. */
-extern "C" { volatile uint32_t native_a540_panel_diag[40]; }
+extern "C" { volatile uint32_t native_a540_panel_diag[48]; }
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -2379,6 +2379,44 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     native_a540_panel_diag[36] = finalOk;
     native_a540_panel_diag[37] = finalTotal;
 }
+/* H628: watch the panel blocks every beat instead of only at the thirtieth
+ * beat when the test redraws them. H627 proved the content is already gone by
+ * the next run and that none of the four instrumented display writers did it,
+ * so the open question is when the loss happens. Sampling at one hertz turns
+ * "somewhere in the thirty seconds between runs" into a specific beat, which
+ * can then be correlated with whatever else runs on that cadence. The count is
+ * of pixels still holding the colour this test wrote, so a drop is a change and
+ * not a read artefact. Observation only: nothing here writes the panel. */
+extern "C" void native_a540_hb_panel_watch(void) {
+    if (!gC3 || !gC3->panelReady || !gC3->surfaceReady || !gC3->panelWindowReady)
+        return;
+    Ctx &c = *gC3;
+    volatile uint32_t *panel = c.panelWindow.base;
+    const uint32_t rowBytes = c.panelRowBytes;
+    unsigned mask = 0, total = 0;
+    for (unsigned r = 0; r < kRectCount; ++r) {
+        unsigned good = 0;
+        for (unsigned y = 0; y < kPatHeight; ++y) {
+            const uint64_t rowWords = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u;
+            for (unsigned x = 0; x < kPatWidth; ++x)
+                if (panel[rowWords + kRectX[r] + x] == kRectColor[r]) ++good;
+        }
+        total += good;
+        if (good == kPatWidth * kPatHeight) mask |= (1u << r);
+    }
+
+    native_a540_panel_diag[38] = native_a540_panel_diag[38] + 1u;
+    native_a540_panel_diag[40] = mask;
+    if (total != native_a540_panel_diag[39]) {
+        /* A change between beats. Remember the previous value, the new one and
+         * when it happened, and count the transition. */
+        native_a540_panel_diag[41] = native_a540_panel_diag[41] + 1u;
+        native_a540_panel_diag[42] = native_a540_panel_diag[39];   /* value before */
+        native_a540_panel_diag[43] = native_a540_panel_diag[38];   /* sample index */
+    }
+    native_a540_panel_diag[39] = total;
+}
+
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
 }
