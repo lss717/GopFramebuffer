@@ -86,6 +86,20 @@ class NativeLegacyDisplay;
 static NativeLegacyDisplay *gTestDisplay;
 // H315: set once the framebuffer is started, so the panic hook can paint without the registry.
 static NativeLegacyDisplay *gPanicDisplay;
+/* H625: who wrote the scanout, how often, at what time and over which rows.
+ * A test block that disappears between runs needs an attributed writer rather
+ * than a guess. The source audit leaves only four entry points besides the
+ * test blit itself: the H343 progress bar, the H315 panic fill, the blank
+ * screen fill and the swap copy. Each slot holds count, uptime seconds of the
+ * last write, first row and last row. */
+extern "C" { volatile uint64_t native_legacy_panel_writes[4][4]; }
+static void panelWriteRecord(unsigned id, uint32_t firstRow, uint32_t lastRow) {
+    volatile uint64_t *entry = native_legacy_panel_writes[id];
+    entry[0] = entry[0] + 1;
+    entry[1] = mach_absolute_time() / 19200000000ull;
+    entry[2] = firstRow;
+    entry[3] = lastRow;
+}
 
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
@@ -240,6 +254,7 @@ public:
             for(uint32_t x=0;x<w;x++) line[x]=(x<filled)?0xffffffffU:0xff000000U;
         }
         __asm__ volatile("dsb sy":::"memory");
+        panelWriteRecord(0,0,5);   /* H625: the progress bar occupies rows 0..5 */
     }
     // H315: a dying machine gets one full-screen fill of the real scanout.  Nothing here takes a
     // lock, waits or retries: either the panel turns solid or the fill is skipped and the marker
@@ -259,6 +274,7 @@ public:
         for(uintptr_t a=base&~static_cast<uintptr_t>(63);a<end;a+=64)
             __asm__ volatile("dc civac, %0"::"r"(a):"memory");
         __asm__ volatile("dsb sy":::"memory");
+        panelWriteRecord(1,0,h-1);   /* H625: a panic fill covers the whole panel */
     }
     int drawTestPattern() {
         if(!bootMapping) return 0;
@@ -599,6 +615,7 @@ public:
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
+            panelWriteRecord(2,0,bh-1);   /* H625: blank-screen fill */
             shadowValid=false;
             transferred=true;
             native_legacy_frame_observed(1,0,0,0,0,0);
@@ -689,6 +706,7 @@ public:
             stored=length;
         }
         __asm__ volatile("dsb sy" ::: "memory");
+        panelWriteRecord(3,0,height-1);   /* H625: swap copy reached the panel */
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
             native_legacy_copy_timing_observed(copyEnd-copyStart,stored);
             /* H272r: the total time from kick entry to copy end, so the 99 s can be
