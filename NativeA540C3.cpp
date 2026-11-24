@@ -583,8 +583,20 @@ static bool smmu_setup(Ctx &c) {
     }
 
     /* ArmSmmu4KBuild requires ascending, non-overlapping IOVAs: bring-up
-     * buffers, then the BO pool, then the trusted window. */
-    ArmSmmu4KRange r[9 + kBoSlots];
+     * buffers, then the BO pool, then the trusted window.  The bound is the
+     * number of ranges outside the BO pool: ring, pm4, pfp, gpmu and rptr, the
+     * two surfaces (H612), the panel (H617), the case indirect buffer (H633)
+     * and the trusted window.  H633 added the case range without raising this
+     * bound, which put the final range past the end of the array; counting the
+     * entries by name here keeps the bound and the list from drifting apart. */
+    constexpr unsigned kBringUpRanges = 5;
+    constexpr unsigned kSurfaceRanges = 2;
+    constexpr unsigned kPanelRanges = 1;
+    constexpr unsigned kCaseRanges = 1;
+    constexpr unsigned kWindowRanges = 1;
+    constexpr unsigned kFixedRanges = kBringUpRanges + kSurfaceRanges + kPanelRanges
+                                      + kCaseRanges + kWindowRanges;
+    ArmSmmu4KRange r[kFixedRanges + kBoSlots];
     size_t nr = 0;
     r[nr++] = { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     r[nr++] = { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 };
@@ -614,6 +626,11 @@ static bool smmu_setup(Ctx &c) {
         r[nr++] = { kCaseIbIova, c.caseIb.phys, c.caseIb.bytes,
                     ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     r[nr++] = { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    /* The bound is what keeps a future range from being written past the end
+     * of the stack array, as H633 did; failing here is loud instead of
+     * corrupting whatever the compiler placed next to it. */
+    if (nr > sizeof(r) / sizeof(r[0]))
+        return c.fail(4, "range table overflow");
     if (ArmSmmu4KBuild(&c.cfg, r, nr, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
         return c.fail(4, "smmu build");
