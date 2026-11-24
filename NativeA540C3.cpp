@@ -77,6 +77,18 @@ constexpr uint64_t kSurfDstIova = 0x3100000ULL;
  * length, geometry and row bytes are taken from the platform console at run
  * time, never hard-coded. */
 constexpr uint64_t kPanelIova   = 0x4000000ULL;
+/* H633: a normal contiguous buffer plus an indirect buffer of its own, so the
+ * read-back and off-screen cases share nothing with the panel test except the
+ * ring. 0x5000000 sits above the panel range, which ends at
+ * 0x4000000 + 8,294,400 = 0x47EA000, and well below the fixed win entry at
+ * 0xE9000000, so the ascending order the page-table builder requires holds. */
+constexpr uint64_t kCaseIova    = 0x5000000ULL;
+constexpr size_t   kCaseBytes   = 0x200000;      /* 2 MiB, covers the offsets used */
+constexpr uint64_t kCaseIbIova  = 0x5200000ULL;
+constexpr size_t   kCaseIbBytes = 0x1000;
+/* A value no writer in this tree produces, so a target still holding it after
+ * an operation was not written by that operation. */
+constexpr uint32_t kCaseSentinel = 0xA5A5A5A5u;
 /* H622: the single interior rectangle of H618 to H621 is replaced by the
  * kRectX/kRectY table below, which covers odd and even rows and all four edges. */
 constexpr uint64_t kPanelSrcOffset = 4096;   /* H620: second image inside surfSrc */
@@ -296,6 +308,9 @@ struct Ctx {
     bool panelReady;                /* H617: the console answered and every check passed */
     GpuWindow panelWindow;          /* H618: uncached CPU view of the panel */
     bool panelWindowReady;
+    Alloc caseBuf;                  /* H633: a normal allocation used as a target */
+    Alloc caseIb;                   /* H633: an indirect buffer only these cases use */
+    bool caseReady;                 /* H633: both allocations succeeded */
     uint32_t panelSentinel[4];      /* H618: panel values just outside the rectangle */
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
@@ -362,7 +377,7 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
  * (0xffffffff when all match), [18] the CPU window mapping,
  * [19] sentinel pixels outside the rectangle that changed. */
-extern "C" { volatile uint32_t native_a540_panel_diag[160]; }
+extern "C" { volatile uint32_t native_a540_panel_diag[180]; }
 /* One build tag for every panel line, so a capture cannot mix rounds. H629 and
  * H631 each carried the round number in more than one IOLog and H631 shipped
  * with the watch line still saying H630. */
@@ -585,6 +600,14 @@ static bool smmu_setup(Ctx &c) {
     if (c.panelReady)
         r[nr++] = { kPanelIova, c.panelPhys, c.panelBytes,
                     ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    /* H633: read and write, because the cases use the buffer as a destination
+     * and, for the read-back, the panel as a source. */
+    if (c.caseReady) {
+        r[nr++] = { kCaseIova, c.caseBuf.phys, c.caseBuf.bytes,
+                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+        r[nr++] = { kCaseIbIova, c.caseIb.phys, c.caseIb.bytes,
+                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    }
     r[nr++] = { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     if (ArmSmmu4KBuild(&c.cfg, r, nr, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
@@ -1496,6 +1519,11 @@ static bool bo_submit_test(Ctx &c) {
  */
 extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence);
 extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns);
+/* H633: declared here so the panel selftest, which is earlier in the file, can
+ * run cases through the same submission implementation. */
+static int submit_ib_at(Ctx &c, void *ibCpu, uint64_t ibIova, unsigned words,
+                        uint64_t *fence);
+extern "C" uint64_t native_a540_gpu_fence(void);
 
 static bool fill32_test(Ctx &c) {
     /* H236fi: one 1024-dword IB (exactly one page) does not run, 256 dwords do,
@@ -1737,6 +1765,20 @@ static void c3_thread(void *, wait_result_t) {
         else
             IOLog("NATIVE_GPU_C3: H612 surface allocation failed (src=%d dst=%d "
                   "dstBytes=%llu)\n", srcOk, dstOk, (unsigned long long)kSurfBytes);
+    }
+    /* H633: recorded separately, and their absence only disables the cases.
+     * Nothing about the panel test may change because they exist. */
+    c->caseReady = false;
+    {
+        const bool bufOk = c->caseBuf.init(kCaseBytes);
+        const bool ibOk  = bufOk && c->caseIb.init(kCaseIbBytes);
+        native_a540_panel_diag[146] = bufOk ? 1u : 0u;
+        native_a540_panel_diag[147] = ibOk ? 1u : 0u;
+        if (ibOk)
+            c->caseReady = true;
+        else
+            IOLog("NATIVE_GPU_C3: H633 case buffers unavailable (buf=%d ib=%d)\n",
+                  bufOk, ibOk);
     }
     /* H617: ask the platform console what display it handed us, at C3 time.
      * The same call and the same checks the display driver applies later, so
@@ -2194,6 +2236,124 @@ static unsigned long long gPanelConsoleLast[16];
 static uint32_t gPanelLastTransitions = 0;
 static uint64_t gPanelProbe[kRectCount * 4];
 static bool gPanelProbeReady = false;
+
+/* H633: three controlled operations, each its own submission on the case
+ * buffer's own indirect buffer, so none of them touches bo[2] or shares an
+ * indirect buffer with the panel test.
+ *
+ * caseReadPanelRow copies sixty-four pixels of one panel row into the case
+ * buffer with the panel as the source. R1 runs it on a row the panel test is
+ * known to write correctly, so a failure there is a failure of this read path
+ * and not evidence about the missing rows; that is what makes R1 a control.
+ * R2 runs it on the two rows that never change. Comparing what the GPU read
+ * against what the CPU reads from the same addresses says whether the two
+ * agree on what is in those bytes. It does not say why they differ, and it
+ * does not say the original write happened or did not happen.
+ *
+ * caseWriteOffscreen runs the same command construction the panel test uses,
+ * with the same source rows, the same shift and the same declared pitch, but
+ * into the case buffer at the same byte offset the panel row has. The target
+ * is first filled with a value no writer in this tree produces, so a column
+ * still holding it afterwards was not written by this operation. C2g is the
+ * control: the same construction aimed at the offset of a row the panel test
+ * gets right. */
+static void caseReadPanelRow(Ctx &c, uint32_t panelRow, uint32_t *gpuVals,
+                             int *submitRc, int *waitRc)
+{
+    using namespace A5xxBlit;
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.caseIb.cpu);
+    const uint64_t srcByte = kPanelIova
+        + (uint64_t)panelRow * c.panelRowBytes + (uint64_t)kRectX[0] * 4u;
+    const uint64_t srcAligned = srcByte & ~UINT64_C(63);
+    const uint32_t shift = (uint32_t)((srcByte - srcAligned) / 4u);
+    unsigned w = 0;
+    a5xxBlitSetup(ib, w);
+    ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderBlit2d;
+    ib[w++] = type4(Rb2dSrcInfo, 9);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = (uint32_t)(srcAligned & 0xffffffffu);
+    ib[w++] = (uint32_t)(srcAligned >> 32);
+    ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);
+    for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+    ib[w++] = type4(Gras2dSrcInfo, 1); ib[w++] = SurfRgba8Linear;
+    ib[w++] = type4(Rb2dDstInfo, 9);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = (uint32_t)(kCaseIova & 0xffffffffu);
+    ib[w++] = (uint32_t)(kCaseIova >> 32);
+    /* The destination is one row of sixty-four pixels starting at the buffer
+     * base, so its declared pitch only has to be at least that wide. */
+    ib[w++] = (256u >> 6) | ((256u >> 6) << 16);
+    for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+    ib[w++] = type4(Gras2dDstInfo, 1); ib[w++] = SurfRgba8Linear;
+    ib[w++] = type7(CpBlit, 5);
+    ib[w++] = BlitOpCopy;
+    ib[w++] = shift;                                   /* SRC_X1, SRC_Y1 = 0 */
+    ib[w++] = (shift + kPatWidth - 1u);                /* SRC_X2, SRC_Y2 = 0 */
+    ib[w++] = 0u;                                      /* DST_X1 = 0 */
+    ib[w++] = kPatWidth - 1u;                          /* DST_X2 = 63 */
+    ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderEnd2d;
+    uint64_t fence = 0;
+    *submitRc = submit_ib_at(c, c.caseIb.cpu, kCaseIbIova, w, &fence);
+    *waitRc = *submitRc ? -1 : native_a540_wait_fence(fence, 200000000ull);
+    invalidateDcache(c.caseBuf.cpu, kCaseBytes);
+    volatile uint32_t *dst = reinterpret_cast<volatile uint32_t *>(c.caseBuf.cpu);
+    for (unsigned i = 0; i < kPatWidth; ++i) gpuVals[i] = dst[i];
+}
+
+static void caseWriteOffscreen(Ctx &c, uint32_t srcRow, uint64_t dstOffset,
+                               unsigned *landed, unsigned *stillSentinel,
+                               unsigned *firstMissing, int *submitRc, int *waitRc)
+{
+    using namespace A5xxBlit;
+    volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.caseIb.cpu);
+    volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(
+        static_cast<char *>(c.caseBuf.cpu) + dstOffset);
+    /* Fill the target row with the sentinel and make sure the GPU sees the
+     * memory, not a cache line this CPU left behind. */
+    for (unsigned i = 0; i < kPatWidth; ++i) tgt[i] = kCaseSentinel;
+    cleanDcache(c.caseBuf.cpu, kCaseBytes);
+    const uint64_t dstByte = kCaseIova + dstOffset;
+    const uint64_t dstAligned = dstByte & ~UINT64_C(63);
+    const uint32_t shift = (uint32_t)((dstByte - dstAligned) / 4u);
+    unsigned w = 0;
+    a5xxBlitSetup(ib, w);
+    ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderBlit2d;
+    ib[w++] = type4(Rb2dSrcInfo, 9);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = (uint32_t)(kSurfDstIova & 0xffffffffu);
+    ib[w++] = (uint32_t)(kSurfDstIova >> 32);
+    ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);
+    for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+    ib[w++] = type4(Gras2dSrcInfo, 1); ib[w++] = SurfRgba8Linear;
+    ib[w++] = type4(Rb2dDstInfo, 9);
+    ib[w++] = SurfRgba8Linear;
+    ib[w++] = (uint32_t)(dstAligned & 0xffffffffu);
+    ib[w++] = (uint32_t)(dstAligned >> 32);
+    /* The same declared pitch the panel test states for the panel, which is
+     * the surface stride and not the panel stride, kept identical on purpose
+     * so this differs from the failing case only in the kind of memory. */
+    ib[w++] = (kSurfRowBytes >> 6) | ((64u >> 6) << 16);
+    for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
+    ib[w++] = type4(Gras2dDstInfo, 1); ib[w++] = SurfRgba8Linear;
+    ib[w++] = type7(CpBlit, 5);
+    ib[w++] = BlitOpCopy;
+    ib[w++] = 16u | (srcRow << 16);
+    ib[w++] = (16u + kPatWidth - 1u) | (srcRow << 16);
+    ib[w++] = shift;
+    ib[w++] = shift + kPatWidth - 1u;
+    ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderEnd2d;
+    uint64_t fence = 0;
+    *submitRc = submit_ib_at(c, c.caseIb.cpu, kCaseIbIova, w, &fence);
+    *waitRc = *submitRc ? -1 : native_a540_wait_fence(fence, 200000000ull);
+    invalidateDcache(c.caseBuf.cpu, kCaseBytes);
+    unsigned done = 0, kept = 0, missing = 0xffffffffu;
+    for (unsigned i = 0; i < kPatWidth; ++i) {
+        const uint32_t v = tgt[i];
+        if (v == kCaseSentinel) { ++kept; if (missing == 0xffffffffu) missing = i; }
+        else ++done;
+    }
+    *landed = done; *stillSentinel = kept; *firstMissing = missing;
+}
 
 /* H632 case state. gPanelPreWrite holds every test pixel as it stood before
  * this run's blits, so the post-blit pass can say, column by column, whether
@@ -2694,6 +2854,104 @@ extern "C" void native_a540_hb_panel_selftest(void) {
                 native_a540_panel_diag[i] = 0xffffffffu;
         }
     }
+    /* H633: run the cases last, after the panel test has finished its own
+     * read-backs, so they cannot alter what the panel test reports. Each is
+     * recorded with its own submit and wait codes. If the case buffers were
+     * not allocated, or the panel window is missing, nothing here runs and
+     * every field is left at the not-run value.
+     *
+     * Index layout, so nothing overlaps:
+     *   146,147 allocation flags          148..152 R1 control read-back
+     *   153..158 R2 panel row 386         159..164 R2 panel row 387
+     *   165..169 C2g off-screen control   170..174 C2 off-screen failing offset
+     *   175..178 ring and fence before and after the cases
+     * R2 fields are submit, wait, agreeing columns, first differing column, the
+     * GPU value and the CPU value there. C2 fields are submit, wait, columns
+     * that no longer hold the sentinel, columns that still do, first such
+     * column. R1 additionally records whether its own comparison came out
+     * clean, which is what licenses reading anything at all out of R2. */
+    if (c.caseReady && c.panelWindowReady) {
+        uint32_t gpuVals[kPatWidth], cpuVals[kPatWidth];
+        int sRc = 0, wRc = 0;
+        const uint32_t goodRow = kRectY[1];   /* block 1 row 0, known correct */
+        native_a540_panel_diag[175] = rd(CP_RB_RPTR);
+        native_a540_panel_diag[176] = (uint32_t)native_a540_gpu_fence();
+
+        /* R1, the control: read a row the panel test writes correctly. */
+        caseReadPanelRow(c, goodRow, gpuVals, &sRc, &wRc);
+        native_a540_panel_diag[148] = (uint32_t)sRc;
+        native_a540_panel_diag[149] = (uint32_t)wRc;
+        {
+            volatile uint32_t *panel = c.panelWindow.base;
+            unsigned agree = 0, firstDiff = 0xffffffffu;
+            for (unsigned i = 0; i < kPatWidth; ++i) {
+                const uint64_t index = ((uint64_t)goodRow * rowBytes) / 4u
+                                     + kRectX[0] + i;
+                cpuVals[i] = panel[index];
+                if (gpuVals[i] == cpuVals[i]) ++agree;
+                else if (firstDiff == 0xffffffffu) firstDiff = i;
+            }
+            native_a540_panel_diag[150] = agree;
+            native_a540_panel_diag[151] = firstDiff;
+            native_a540_panel_diag[152] = agree == kPatWidth ? 1u : 0u;   /* read path usable */
+        }
+
+        /* R2: the two rows that never change, same read path. */
+        for (unsigned k = 0; k < 2; ++k) {
+            const uint32_t row = kRectY[1] + 2u + k;
+            caseReadPanelRow(c, row, gpuVals, &sRc, &wRc);
+            volatile uint32_t *panel = c.panelWindow.base;
+            unsigned agree = 0, firstDiff = 0xffffffffu;
+            uint32_t firstGpu = 0, firstCpu = 0;
+            for (unsigned i = 0; i < kPatWidth; ++i) {
+                const uint64_t index = ((uint64_t)row * rowBytes) / 4u + kRectX[0] + i;
+                cpuVals[i] = panel[index];
+                if (gpuVals[i] == cpuVals[i]) ++agree;
+                else if (firstDiff == 0xffffffffu) {
+                    firstDiff = i; firstGpu = gpuVals[i]; firstCpu = cpuVals[i];
+                }
+            }
+            const unsigned base = 153u + k * 6u;
+            native_a540_panel_diag[base + 0u] = (uint32_t)sRc;
+            native_a540_panel_diag[base + 1u] = (uint32_t)wRc;
+            native_a540_panel_diag[base + 2u] = agree;
+            native_a540_panel_diag[base + 3u] = firstDiff;
+            native_a540_panel_diag[base + 4u] = firstGpu;
+            native_a540_panel_diag[base + 5u] = firstCpu;
+        }
+
+        /* C2g, the control for the off-screen write: the source row of a panel
+         * row the test gets right, aimed at that row's own offset. */
+        {
+            unsigned landed = 0, kept = 0, missing = 0;
+            const uint64_t off = (uint64_t)kRectY[1] * rowBytes + (uint64_t)kRectX[0] * 4u;
+            caseWriteOffscreen(c, kTileY[1], off, &landed, &kept, &missing, &sRc, &wRc);
+            native_a540_panel_diag[165] = (uint32_t)sRc;
+            native_a540_panel_diag[166] = (uint32_t)wRc;
+            native_a540_panel_diag[167] = landed;
+            native_a540_panel_diag[168] = kept;
+            native_a540_panel_diag[169] = missing;
+        }
+        /* C2: the source row of the first failing panel row, aimed at that
+         * row's own offset, same shift, same declared pitch. */
+        {
+            unsigned landed = 0, kept = 0, missing = 0;
+            const uint64_t off = (uint64_t)(kRectY[1] + 2u) * rowBytes
+                               + (uint64_t)kRectX[0] * 4u;
+            caseWriteOffscreen(c, kTileY[1] + 2u, off, &landed, &kept, &missing, &sRc, &wRc);
+            native_a540_panel_diag[170] = (uint32_t)sRc;
+            native_a540_panel_diag[171] = (uint32_t)wRc;
+            native_a540_panel_diag[172] = landed;
+            native_a540_panel_diag[173] = kept;
+            native_a540_panel_diag[174] = missing;
+        }
+
+        /* Isolation evidence rather than assumption: the ring position and the
+         * fence counter moved only by the submissions this function made. */
+        native_a540_panel_diag[177] = rd(CP_RB_RPTR);
+        native_a540_panel_diag[178] = (uint32_t)native_a540_gpu_fence();
+    }
+
     /* H630: start a fresh decay row. H629 left the previous cycle's later
      * offsets in these slots, so a printed row could mix two writes. */
     for (unsigned i = 56; i <= 62; ++i)
@@ -2879,13 +3137,16 @@ extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
 }
 
-extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence) {
-    if (!gC3 || !gA540EngineUp || slot >= kBoSlots || !fence || !words || words > kBoPage / 4)
-        return -1;
-    Ctx &c = *gC3;
+/* H633: the ring and fence half of a submission, shared by the bo[] slots and
+ * the case buffer's own indirect buffer. One copy is deliberate: the ring wrap
+ * H632 had to fix existed as three separate linear submissions, so a second
+ * implementation of this path is exactly how that class of defect appears. */
+static int submit_ib_at(Ctx &c, void *ibCpu, uint64_t ibIova, unsigned words,
+                        uint64_t *fence)
+{
     /* The caller writes the IB through its own mapping; flush those physical
      * lines so the GPU-side read cannot come from a stale cache line. */
-    cleanDcache(c.bo[slot].cpu, kBoPage);
+    cleanDcache(ibCpu, kBoPage);
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
     /* H632: the ring is a circular buffer and the CP wraps its read pointer
      * inside it, but this path wrote ring[n++] with no wrap and no capacity
@@ -2902,11 +3163,10 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
     constexpr unsigned kRingSubmissionWords = 10u;
     unsigned n = rd(CP_RB_RPTR) % kRingDwords;
     const unsigned start = n;
-    const uint64_t iova = kBoBase + slot * kBoPage;
     auto emit = [&](uint32_t v) { ring[n] = v; n = (n + 1) % kRingDwords; };
     emit(type7(0x3f /*CP_INDIRECT_BUFFER_PFE*/, 3));
-    emit((uint32_t)iova);
-    emit((uint32_t)(iova >> 32));
+    emit((uint32_t)ibIova);
+    emit((uint32_t)(ibIova >> 32));
     emit(words);
     const uint64_t f = ++gA540Fence;
     emit(type7(0x46 /*CP_EVENT_WRITE*/, 4));
@@ -2961,6 +3221,12 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
         return -2;
     *fence = f;
     return 0;
+}
+
+extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence) {
+    if (!gC3 || !gA540EngineUp || slot >= kBoSlots || !fence || !words || words > kBoPage / 4)
+        return -1;
+    return submit_ib_at(*gC3, gC3->bo[slot].cpu, kBoBase + slot * kBoPage, words, fence);
 }
 
 extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns) {
