@@ -2540,9 +2540,12 @@ extern "C" void native_a540_hb_panel_watch(void) {
         const bool consoleWrote = scrollDelta || drawDelta;
         const bool panelChanged =
             native_a540_panel_diag[41] != gPanelLastTransitions;
-        if (consoleWrote) native_a540_panel_diag[63] += 1u;
-        if (consoleWrote && panelChanged) native_a540_panel_diag[64] += 1u;
-        if (!consoleWrote && panelChanged) native_a540_panel_diag[65] += 1u;
+        if (consoleWrote)
+            native_a540_panel_diag[63] = native_a540_panel_diag[63] + 1u;
+        if (consoleWrote && panelChanged)
+            native_a540_panel_diag[64] = native_a540_panel_diag[64] + 1u;
+        if (!consoleWrote && panelChanged)
+            native_a540_panel_diag[65] = native_a540_panel_diag[65] + 1u;
         gPanelLastTransitions = native_a540_panel_diag[41];
 
         native_a540_panel_diag[66] = (uint32_t)scrollCalls;
@@ -2559,7 +2562,8 @@ extern "C" void native_a540_hb_panel_watch(void) {
     }
 
     if (gPanelBeatsSinceWrite != 0xffffffffu) {
-        gPanelBeatsSinceWrite++;
+        /* volatile, so no ++ */
+        gPanelBeatsSinceWrite = gPanelBeatsSinceWrite + 1u;
         native_a540_panel_diag[55] = gPanelBeatsSinceWrite;
         switch (gPanelBeatsSinceWrite) {
             case 1:  native_a540_panel_diag[56] = total; break;

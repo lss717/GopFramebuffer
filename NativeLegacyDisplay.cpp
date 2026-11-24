@@ -105,9 +105,18 @@ extern "C" { volatile uint64_t native_legacy_panel_writes[4][4]; }
  * 5 slot cell, 6 USB cell, 7 heartbeat cell. The kernel text console is counted
  * where it writes, in video_console.c. */
 extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]; }
-static inline void panelEnter(unsigned id) { native_legacy_panel_activity[id][0]++; }
-static inline void panelEarly(unsigned id) { native_legacy_panel_activity[id][1]++; }
-static inline void panelPixels(unsigned id, uint64_t n) { native_legacy_panel_activity[id][2] += n; }
+/* volatile counters: ++ and -- on a volatile object are deprecated and this
+ * archive builds with -Werror, so every update is written as an explicit read
+ * and add, the same form panelWriteRecord above uses. */
+static inline void panelEnter(unsigned id) {
+    native_legacy_panel_activity[id][0] = native_legacy_panel_activity[id][0] + 1;
+}
+static inline void panelEarly(unsigned id) {
+    native_legacy_panel_activity[id][1] = native_legacy_panel_activity[id][1] + 1;
+}
+static inline void panelPixels(unsigned id, uint64_t n) {
+    native_legacy_panel_activity[id][2] = native_legacy_panel_activity[id][2] + n;
+}
 static void panelWriteRecord(unsigned id, uint32_t firstRow, uint32_t lastRow) {
     volatile uint64_t *entry = native_legacy_panel_writes[id];
     entry[0] = entry[0] + 1;
