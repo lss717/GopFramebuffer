@@ -379,7 +379,8 @@ extern "C" { volatile uint32_t native_a540_panel_diag[112]; }
  * [72] glyph height in panel rows  [73] text rows the console copied this beat
  * [74] vc_paint_char calls  [75] vc_clear_screen calls  [76] cursor flips
  * [77] the H630 console control ran  [78] last gc_enable() argument
- * Decay slots 56..62 start each cycle at 0xffffffff, meaning not reached yet. */
+ * Decay slots 56..62 start each cycle at 0xffffffff, meaning not reached yet.
+ *
  * H631, for the first block that is still short after the console is off:
  * [79] block [80] row within it [104] column of the first bad pixel
  * [81..82] destination byte address [83..84] the 64-byte aligned address sent
