@@ -104,21 +104,26 @@ extern "C" { volatile uint64_t native_legacy_panel_writes[4][4]; }
  * Writers: 0 progress, 1 panic fill, 2 blank fill, 3 swap copy, 4 2x2 pattern,
  * 5 slot cell, 6 USB cell, 7 heartbeat cell. The kernel text console is counted
  * where it writes, in video_console.c. */
-/* aligned(16): the accessors below reach elements through a 12-bit addend, and
- * the linker rejects an LDR/STR target that is not 8-byte aligned. */
+/* The definition is explicit rather than tentative, and the accessors below go
+ * through a row pointer, both so the linker never has to resolve an 8-byte
+ * LDR/STR against a symbol whose placement it chose itself. This is the same
+ * shape panelWriteRecord uses for native_legacy_panel_writes. */
 extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]
-    __attribute__((aligned(16))); }
+    __attribute__((aligned(16))) = {}; }
 /* volatile counters: ++ and -- on a volatile object are deprecated and this
  * archive builds with -Werror, so every update is written as an explicit read
  * and add, the same form panelWriteRecord above uses. */
 static inline void panelEnter(unsigned id) {
-    native_legacy_panel_activity[id][0] = native_legacy_panel_activity[id][0] + 1;
+    volatile uint64_t *row = native_legacy_panel_activity[id];
+    row[0] = row[0] + 1;
 }
 static inline void panelEarly(unsigned id) {
-    native_legacy_panel_activity[id][1] = native_legacy_panel_activity[id][1] + 1;
+    volatile uint64_t *row = native_legacy_panel_activity[id];
+    row[1] = row[1] + 1;
 }
 static inline void panelPixels(unsigned id, uint64_t n) {
-    native_legacy_panel_activity[id][2] = native_legacy_panel_activity[id][2] + n;
+    volatile uint64_t *row = native_legacy_panel_activity[id];
+    row[2] = row[2] + n;
 }
 static void panelWriteRecord(unsigned id, uint32_t firstRow, uint32_t lastRow) {
     volatile uint64_t *entry = native_legacy_panel_writes[id];
