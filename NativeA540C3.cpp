@@ -2078,12 +2078,6 @@ extern "C" void native_a540_hb_surface_selftest(void) {
     native_a540_surface_diag[11] = badGot;
     native_a540_surface_diag[12] = firstBadRowMatched;
 }
-/* H618: a bright, position- and row-coded pattern. Red rises left to right,
- * blue rises top to bottom, green is constant and alpha is opaque, so a
- * photograph can tell which row and column landed where. */
-static uint32_t panelPattern(unsigned x, unsigned y) {
-    return 0xff000000u | ((x * 4u) << 16) | (0x80u << 8) | (y * 32u);
-}
 
 /* H618: the register setup Mesa issues before every a5xx 2D blit. H612 through
  * H615 omitted it and still passed, which means they relied on values the C3
@@ -2121,9 +2115,26 @@ static void a5xxBlitSetup(volatile uint32_t *ib, unsigned &w) {
  * (y 1912..1919). Each is filled by its own GPU blit from its own tile of the
  * surface, and each tile of the surface was itself produced by a GPU blit in
  * step A, so every pixel written to the panel originates from a GPU write. */
-static const uint32_t kRectX[4] = { 0u, 1016u, 0u, 1016u };
-static const uint32_t kRectY[4] = { 0u, 1u, 1912u, 1912u };
-static const uint32_t kTileY[4] = { 16u, 24u, 32u, 40u };   /* surface rows per tile */
+/* H623: the user reported that the two bottom rectangles written in H622 were
+ * not visible on the panel even though the bottom-right one read back pixel for
+ * pixel correct from the framebuffer. Framebuffer content and visible output
+ * are therefore not the same claim, and the vertical extent that actually
+ * reaches the screen is unknown. Six solid-colour blocks are spread down one
+ * column so a single run maps the visible height. The colours are distinct by
+ * channel rather than by two low bits, which H622 could not be seen to
+ * distinguish. BGRA words. */
+constexpr unsigned kRectCount = 6u;
+static const uint32_t kRectX[kRectCount] = { 480u, 480u, 480u, 480u, 480u, 480u };
+static const uint32_t kRectY[kRectCount] = { 0u, 384u, 768u, 1152u, 1536u, 1912u };
+static const uint32_t kTileY[kRectCount] = { 16u, 32u, 48u, 64u, 80u, 96u };
+static const uint32_t kRectColor[kRectCount] = {
+    0xff0000ffu,   /* red     */
+    0xff00ff00u,   /* green   */
+    0xffff0000u,   /* blue    */
+    0xff00ffffu,   /* yellow  */
+    0xffffff00u,   /* cyan    */
+    0xffff00ffu,   /* magenta */
+};
 
 extern "C" void native_a540_hb_panel_selftest(void) {
     using namespace A5xxBlit;
@@ -2138,19 +2149,19 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     const unsigned patWords = kPatRowBytes / 4u;
 
     /* Four bright tiles in the source buffer, one per rectangle. */
-    for (unsigned tile = 0; tile < 4; ++tile) {
+    for (unsigned tile = 0; tile < kRectCount; ++tile) {
         volatile uint32_t *pat = reinterpret_cast<volatile uint32_t *>(
             static_cast<char *>(c.surfSrc.cpu) + kPanelSrcOffset + tile * 2048u);
         for (unsigned y = 0; y < kPatHeight; ++y)
             for (unsigned x = 0; x < kPatWidth; ++x)
-                pat[y * patWords + x] = panelPattern(x, y) | (tile << 1);
+                pat[y * patWords + x] = kRectColor[tile];
     }
     cleanDcache(c.surfSrc.cpu, c.surfSrc.bytes);
 
     /* Step A: each tile into its own band of the real surface. */
     unsigned w = 0;
     a5xxBlitSetup(ib, w);
-    for (unsigned tile = 0; tile < 4; ++tile) {
+    for (unsigned tile = 0; tile < kRectCount; ++tile) {
         const uint64_t patIova = kSurfSrcIova + kPanelSrcOffset + tile * 2048u;
         ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderBlit2d;
         ib[w++] = type4(Rb2dSrcInfo, 9);
@@ -2181,12 +2192,12 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     invalidateDcache(c.surfDst.cpu, c.surfDst.bytes);
 
     unsigned matchedA = 0, firstBadA = 0xffffffffu, tileOk = 0;
-    for (unsigned tile = 0; tile < 4; ++tile) {
+    for (unsigned tile = 0; tile < kRectCount; ++tile) {
         unsigned good = 0;
         for (unsigned y = 0; y < kPatHeight; ++y)
             for (unsigned x = 0; x < kPatWidth; ++x) {
                 const uint32_t index = (kTileY[tile] + y) * surfaceWords + 16u + x;
-                const uint32_t want = panelPattern(x, y) | (tile << 1);
+                const uint32_t want = kRectColor[tile];
                 if (surface[index] == want) { ++good; ++matchedA; }
                 else if (firstBadA == 0xffffffffu) firstBadA = index;
             }
@@ -2201,10 +2212,10 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     c.io.read32(c.io.cookie, 0x8058, &fsrCleared);
 
     /* Sentinels just outside every rectangle, where in bounds. */
-    uint32_t sentinel[16];
+    uint32_t sentinel[4 * kRectCount];
     for (unsigned i = 0; i < 16; ++i) sentinel[i] = 0u;
     if (c.panelWindowReady) {
-        for (unsigned r = 0; r < 4; ++r) {
+        for (unsigned r = 0; r < kRectCount; ++r) {
             const uint32_t xs[4] = { kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth,
                                      kRectX[r], kRectX[r] + kPatWidth / 2u };
             const uint32_t ys[4] = { kRectY[r] ? kRectY[r] - 1u : 0u, kRectY[r] + kPatHeight,
@@ -2223,7 +2234,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     unsigned matchedB = 0, firstBadB = 0xffffffffu, rectOk = 0, submitOk = 0;
     int submitB = -1, waitB = -1;
     uint64_t fenceB = 0;
-    for (unsigned r = 0; r < 4 && c.panelWindowReady; ++r) {
+    for (unsigned r = 0; r < kRectCount && c.panelWindowReady; ++r) {
         w = 0;
         a5xxBlitSetup(ib, w);
         for (unsigned y = 0; y < kPatHeight; ++y) {
@@ -2266,7 +2277,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
             for (unsigned x = 0; x < kPatWidth; ++x) {
                 const uint64_t index = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u
                                      + kRectX[r] + x;
-                const uint32_t want = panelPattern(x, y) | (r << 1);
+                const uint32_t want = kRectColor[r];
                 if (panel[index] == want) { ++good; ++matchedB; }
                 else if (firstBadB == 0xffffffffu) firstBadB = (unsigned)index;
             }
@@ -2279,7 +2290,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
 
     unsigned sentinelChanged = 0;
     if (c.panelWindowReady) {
-        for (unsigned r = 0; r < 4; ++r) {
+        for (unsigned r = 0; r < kRectCount; ++r) {
             const uint32_t xs[4] = { kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth,
                                      kRectX[r], kRectX[r] + kPatWidth / 2u };
             const uint32_t ys[4] = { kRectY[r] ? kRectY[r] - 1u : 0u, kRectY[r] + kPatHeight,
