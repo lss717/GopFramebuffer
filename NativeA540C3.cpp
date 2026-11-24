@@ -1519,11 +1519,6 @@ static bool bo_submit_test(Ctx &c) {
  */
 extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence);
 extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns);
-/* H633: declared here so the panel selftest, which is earlier in the file, can
- * run cases through the same submission implementation. */
-static int submit_ib_at(Ctx &c, void *ibCpu, uint64_t ibIova, unsigned words,
-                        uint64_t *fence);
-extern "C" uint64_t native_a540_gpu_fence(void);
 
 static bool fill32_test(Ctx &c) {
     /* H236fi: one 1024-dword IB (exactly one page) does not run, 256 dwords do,
@@ -1725,6 +1720,17 @@ static bool submit_probe(Ctx &c) {
 }
 
 } // namespace
+
+/* H633: submit_ib_at is static, so its declaration has to sit in the same scope
+ * as its definition. The first version of this declaration was placed inside
+ * the anonymous namespace above, which gave the compiler two distinct internal
+ * linkage functions and made every call ambiguous. */
+static int submit_ib_at(Ctx &c, void *ibCpu, uint64_t ibIova, unsigned words,
+                        uint64_t *fence);
+/* H633: also declared outside the namespace, next to its use, because the
+ * panel selftest reads the fence counter to show these submissions are
+ * isolated. extern "C" so the definition further down is the same entity. */
+extern "C" uint64_t native_a540_gpu_fence(void);
 
 
 static void c3_thread(void *, wait_result_t) {
