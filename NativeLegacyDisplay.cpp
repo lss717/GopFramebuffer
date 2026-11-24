@@ -104,7 +104,10 @@ extern "C" { volatile uint64_t native_legacy_panel_writes[4][4]; }
  * Writers: 0 progress, 1 panic fill, 2 blank fill, 3 swap copy, 4 2x2 pattern,
  * 5 slot cell, 6 USB cell, 7 heartbeat cell. The kernel text console is counted
  * where it writes, in video_console.c. */
-extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]; }
+/* aligned(16): the accessors below reach elements through a 12-bit addend, and
+ * the linker rejects an LDR/STR target that is not 8-byte aligned. */
+extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]
+    __attribute__((aligned(16))); }
 /* volatile counters: ++ and -- on a volatile object are deprecated and this
  * archive builds with -Werror, so every update is written as an explicit read
  * and add, the same form panelWriteRecord above uses. */
