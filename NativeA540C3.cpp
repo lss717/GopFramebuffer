@@ -2125,7 +2125,7 @@ static void a5xxBlitSetup(volatile uint32_t *ib, unsigned &w) {
  * distinguish. BGRA words. */
 constexpr unsigned kRectCount = 6u;
 static const uint32_t kRectX[kRectCount] = { 480u, 480u, 480u, 480u, 480u, 480u };
-static const uint32_t kRectY[kRectCount] = { 0u, 384u, 768u, 1152u, 1536u, 1912u };
+static const uint32_t kRectY[kRectCount] = { 64u, 448u, 832u, 1216u, 1600u, 1912u };  /* H624: off y 0..5, which the H343 progress bar overwrites once a second */
 static const uint32_t kTileY[kRectCount] = { 16u, 32u, 48u, 64u, 80u, 96u };
 static const uint32_t kRectColor[kRectCount] = {
     0xff0000ffu,   /* red     */
@@ -2157,6 +2157,27 @@ extern "C" void native_a540_hb_panel_selftest(void) {
                 pat[y * patWords + x] = kRectColor[tile];
     }
     cleanDcache(c.surfSrc.cpu, c.surfSrc.bytes);
+
+    /* H624: before anything is written this run, look at what the previous run
+     * left in the panel blocks. The blit cadence is every thirtieth beat, so if
+     * the pixels no longer hold the colours this test wrote, something else
+     * overwrote them in between. H623 could not tell this apart because its
+     * read-back ran immediately after the fence, which only proves the write
+     * landed, not that it stayed. */
+    unsigned carry = 0, carryTotal = 0;
+    if (c.panelWindowReady) {
+        for (unsigned r = 0; r < kRectCount; ++r) {
+            unsigned good = 0;
+            for (unsigned y = 0; y < kPatHeight; ++y)
+                for (unsigned x = 0; x < kPatWidth; ++x) {
+                    const uint64_t index = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u
+                                         + kRectX[r] + x;
+                    if (panel[index] == kRectColor[r]) ++good;
+                }
+            carryTotal += good;
+            if (good == kPatWidth * kPatHeight) carry |= (1u << r);
+        }
+    }
 
     /* Step A: each tile into its own band of the real surface. */
     unsigned w = 0;
@@ -2324,6 +2345,9 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     native_a540_panel_diag[30] = matchedB;
     native_a540_panel_diag[31] = tileOk;
     native_a540_panel_diag[32] = submitOk;
+    native_a540_panel_diag[33] = carry;          /* H624: blocks still holding the previous run */
+    native_a540_panel_diag[34] = carryTotal;       /* H624: pixels of 3072 that survived the gap */
+    native_a540_panel_diag[35] = kRectCount * kPatWidth * kPatHeight;
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
