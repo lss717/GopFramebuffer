@@ -77,15 +77,24 @@ constexpr uint64_t kSurfDstIova = 0x3100000ULL;
  * length, geometry and row bytes are taken from the platform console at run
  * time, never hard-coded. */
 constexpr uint64_t kPanelIova   = 0x4000000ULL;
-/* H633: a normal contiguous buffer plus an indirect buffer of its own, so the
- * read-back and off-screen cases share nothing with the panel test except the
- * ring. 0x5000000 sits above the panel range, which ends at
- * 0x4000000 + 8,294,400 = 0x47EA000, and well below the fixed win entry at
- * 0xE9000000, so the ascending order the page-table builder requires holds. */
-constexpr uint64_t kCaseIova    = 0x5000000ULL;
-constexpr size_t   kCaseBytes   = 0x200000;      /* 2 MiB, covers the offsets used */
-constexpr uint64_t kCaseIbIova  = 0x5200000ULL;
+/* H633: an indirect buffer of its own, so the cases never share bo[2] with the
+ * panel test. The first version also allocated a 2 MiB contiguous buffer for
+ * the cases to write into; that allocation ran on the C3 thread, blocked it,
+ * and the persistent log stopped at 72.7 s, exactly where the accelerator
+ * probe starts C3, so the session died before the panel test ever ran. The
+ * cases now use regions of the surface buffer that was already allocated for
+ * another reason, and only this page is new. 0x5000000 sits above the panel
+ * range, which ends at 0x4000000 + 8,294,400 = 0x47EA000, and below the fixed
+ * win entry at 0xE9000000, so the ascending order the builder requires holds. */
 constexpr size_t   kCaseIbBytes = 0x1000;
+constexpr uint64_t kCaseIbIova  = 0x5000000ULL;
+/* Where the read-back case puts the sixty-four columns it copies out of the
+ * panel. The off-screen case uses the byte offset of the panel row it is
+ * comparing against, computed from the run-time row bytes rather than
+ * repeated here. All of them land inside the 10,444,800 byte surface buffer,
+ * and Step A only ever writes rows 16..103 of columns 16..79, so none of
+ * them touches anything the panel test reads or writes. */
+constexpr uint64_t kCaseDstOffset = 2000000;
 /* A value no writer in this tree produces, so a target still holding it after
  * an operation was not written by that operation. */
 constexpr uint32_t kCaseSentinel = 0xA5A5A5A5u;
@@ -308,9 +317,8 @@ struct Ctx {
     bool panelReady;                /* H617: the console answered and every check passed */
     GpuWindow panelWindow;          /* H618: uncached CPU view of the panel */
     bool panelWindowReady;
-    Alloc caseBuf;                  /* H633: a normal allocation used as a target */
     Alloc caseIb;                   /* H633: an indirect buffer only these cases use */
-    bool caseReady;                 /* H633: both allocations succeeded */
+    bool caseReady;                 /* H633: that allocation succeeded */
     uint32_t panelSentinel[4];      /* H618: panel values just outside the rectangle */
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
@@ -602,12 +610,9 @@ static bool smmu_setup(Ctx &c) {
                     ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     /* H633: read and write, because the cases use the buffer as a destination
      * and, for the read-back, the panel as a source. */
-    if (c.caseReady) {
-        r[nr++] = { kCaseIova, c.caseBuf.phys, c.caseBuf.bytes,
-                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
+    if (c.caseReady)
         r[nr++] = { kCaseIbIova, c.caseIb.phys, c.caseIb.bytes,
                     ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
-    }
     r[nr++] = { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     if (ArmSmmu4KBuild(&c.cfg, r, nr, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
@@ -1772,19 +1777,19 @@ static void c3_thread(void *, wait_result_t) {
             IOLog("NATIVE_GPU_C3: H612 surface allocation failed (src=%d dst=%d "
                   "dstBytes=%llu)\n", srcOk, dstOk, (unsigned long long)kSurfBytes);
     }
-    /* H633: recorded separately, and their absence only disables the cases.
-     * Nothing about the panel test may change because they exist. */
+    /* H633: one page, the same size and allocator the eight bo slots already
+     * use successfully. Its absence only disables the cases. */
     c->caseReady = false;
     {
-        const bool bufOk = c->caseBuf.init(kCaseBytes);
-        const bool ibOk  = bufOk && c->caseIb.init(kCaseIbBytes);
-        native_a540_panel_diag[146] = bufOk ? 1u : 0u;
+        const bool ibOk = c->caseIb.init(kCaseIbBytes);
+        /* Both have to hold: the cases need their own indirect buffer and they
+         * write into the surface buffer, so surfaceReady is a precondition. */
+        native_a540_panel_diag[146] = c->surfaceReady ? 1u : 0u;
         native_a540_panel_diag[147] = ibOk ? 1u : 0u;
         if (ibOk)
             c->caseReady = true;
         else
-            IOLog("NATIVE_GPU_C3: H633 case buffers unavailable (buf=%d ib=%d)\n",
-                  bufOk, ibOk);
+            IOLog("NATIVE_GPU_C3: H633 case indirect buffer unavailable\n");
     }
     /* H617: ask the platform console what display it handed us, at C3 time.
      * The same call and the same checks the display driver applies later, so
@@ -2279,15 +2284,22 @@ static void caseReadPanelRow(Ctx &c, uint32_t panelRow, uint32_t *gpuVals,
     ib[w++] = SurfRgba8Linear;
     ib[w++] = (uint32_t)(srcAligned & 0xffffffffu);
     ib[w++] = (uint32_t)(srcAligned >> 32);
+    /* Only row zero of the source is read, so this stride is never exercised.
+     * It states the surface stride because that is the value the panel test
+     * uses when this same buffer is its destination. */
     ib[w++] = (kSurfRowBytes >> 6) | ((kSurfRowBytes >> 6) << 16);
     for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
     ib[w++] = type4(Gras2dSrcInfo, 1); ib[w++] = SurfRgba8Linear;
     ib[w++] = type4(Rb2dDstInfo, 9);
     ib[w++] = SurfRgba8Linear;
-    ib[w++] = (uint32_t)(kCaseIova & 0xffffffffu);
-    ib[w++] = (uint32_t)(kCaseIova >> 32);
-    /* The destination is one row of sixty-four pixels starting at the buffer
-     * base, so its declared pitch only has to be at least that wide. */
+    /* The target is an untouched region of the surface buffer, which was
+     * allocated for the panel test anyway. Step A only ever writes rows 16..103
+     * of columns 16..79, so this offset is outside anything the panel test
+     * reads or writes. */
+    ib[w++] = (uint32_t)((kSurfDstIova + kCaseDstOffset) & 0xffffffffu);
+    ib[w++] = (uint32_t)((kSurfDstIova + kCaseDstOffset) >> 32);
+    /* One row of sixty-four pixels, so the declared pitch only has to be at
+     * least that wide. */
     ib[w++] = (256u >> 6) | ((256u >> 6) << 16);
     for (unsigned i = 0; i < 5; ++i) ib[w++] = 0;
     ib[w++] = type4(Gras2dDstInfo, 1); ib[w++] = SurfRgba8Linear;
@@ -2301,8 +2313,9 @@ static void caseReadPanelRow(Ctx &c, uint32_t panelRow, uint32_t *gpuVals,
     uint64_t fence = 0;
     *submitRc = submit_ib_at(c, c.caseIb.cpu, kCaseIbIova, w, &fence);
     *waitRc = *submitRc ? -1 : native_a540_wait_fence(fence, 200000000ull);
-    invalidateDcache(c.caseBuf.cpu, kCaseBytes);
-    volatile uint32_t *dst = reinterpret_cast<volatile uint32_t *>(c.caseBuf.cpu);
+    invalidateDcache(static_cast<char *>(c.surfDst.cpu) + kCaseDstOffset, 256u);
+    volatile uint32_t *dst = reinterpret_cast<volatile uint32_t *>(
+        static_cast<char *>(c.surfDst.cpu) + kCaseDstOffset);
     for (unsigned i = 0; i < kPatWidth; ++i) gpuVals[i] = dst[i];
 }
 
@@ -2313,12 +2326,13 @@ static void caseWriteOffscreen(Ctx &c, uint32_t srcRow, uint64_t dstOffset,
     using namespace A5xxBlit;
     volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.caseIb.cpu);
     volatile uint32_t *tgt = reinterpret_cast<volatile uint32_t *>(
-        static_cast<char *>(c.caseBuf.cpu) + dstOffset);
+        static_cast<char *>(c.surfDst.cpu) + dstOffset);
     /* Fill the target row with the sentinel and make sure the GPU sees the
-     * memory, not a cache line this CPU left behind. */
+     * memory, not a cache line this CPU left behind. Only the 256 bytes this
+     * operation touches are cleaned. */
     for (unsigned i = 0; i < kPatWidth; ++i) tgt[i] = kCaseSentinel;
-    cleanDcache(c.caseBuf.cpu, kCaseBytes);
-    const uint64_t dstByte = kCaseIova + dstOffset;
+    cleanDcache(tgt, 256u);
+    const uint64_t dstByte = kSurfDstIova + dstOffset;
     const uint64_t dstAligned = dstByte & ~UINT64_C(63);
     const uint32_t shift = (uint32_t)((dstByte - dstAligned) / 4u);
     unsigned w = 0;
@@ -2351,7 +2365,7 @@ static void caseWriteOffscreen(Ctx &c, uint32_t srcRow, uint64_t dstOffset,
     uint64_t fence = 0;
     *submitRc = submit_ib_at(c, c.caseIb.cpu, kCaseIbIova, w, &fence);
     *waitRc = *submitRc ? -1 : native_a540_wait_fence(fence, 200000000ull);
-    invalidateDcache(c.caseBuf.cpu, kCaseBytes);
+    invalidateDcache(tgt, 256u);
     unsigned done = 0, kept = 0, missing = 0xffffffffu;
     for (unsigned i = 0; i < kPatWidth; ++i) {
         const uint32_t v = tgt[i];
