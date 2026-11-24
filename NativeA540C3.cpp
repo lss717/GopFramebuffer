@@ -2524,15 +2524,16 @@ extern "C" void native_a540_hb_panel_watch(void) {
      * ties the loss to the console or separates them. A beat where the panel
      * changed with no console write is the measurement still missing. */
     {
-        const unsigned long long scrollCalls =
-            video_console_panel_counts[0] + video_console_panel_counts[1];
-        const unsigned long long drawCalls =
-            video_console_panel_counts[4] + video_console_panel_counts[5]
-            + video_console_panel_counts[6];
+        /* Indexed through one pointer so every access is a register offset.
+         * A constant index folds into an 8-byte LDR whose addend the linker
+         * checks against the symbol's own alignment, and that symbol lives in
+         * __DATA,__common. */
+        volatile unsigned long long *vc = video_console_panel_counts;
+        const unsigned long long scrollCalls = vc[0] + vc[1];
+        const unsigned long long drawCalls = vc[4] + vc[5] + vc[6];
         const unsigned long long scrollDelta =
             scrollCalls - gPanelConsoleLast[0] - gPanelConsoleLast[1];
-        const unsigned long long rowsDelta =
-            video_console_panel_counts[2] - gPanelConsoleLast[2];
+        const unsigned long long rowsDelta = vc[2] - gPanelConsoleLast[2];
         const unsigned long long drawDelta =
             drawCalls - gPanelConsoleLast[4] - gPanelConsoleLast[5]
             - gPanelConsoleLast[6];
@@ -2549,11 +2550,11 @@ extern "C" void native_a540_hb_panel_watch(void) {
 
         native_a540_panel_diag[66] = (uint32_t)scrollCalls;
         native_a540_panel_diag[67] = (uint32_t)drawCalls;
-        native_a540_panel_diag[68] = (uint32_t)video_console_panel_counts[9];
-        native_a540_panel_diag[69] = (uint32_t)video_console_panel_counts[10];
-        native_a540_panel_diag[70] = (uint32_t)video_console_panel_counts[7];
-        native_a540_panel_diag[71] = (uint32_t)video_console_panel_counts[8];
-        native_a540_panel_diag[72] = (uint32_t)video_console_panel_counts[11];
+        native_a540_panel_diag[68] = (uint32_t)vc[9];
+        native_a540_panel_diag[69] = (uint32_t)vc[10];
+        native_a540_panel_diag[70] = (uint32_t)vc[7];
+        native_a540_panel_diag[71] = (uint32_t)vc[8];
+        native_a540_panel_diag[72] = (uint32_t)vc[11];
         native_a540_panel_diag[73] = (uint32_t)rowsDelta;
 
         for (unsigned i = 0; i < 12; ++i)

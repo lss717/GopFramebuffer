@@ -104,24 +104,26 @@ extern "C" { volatile uint64_t native_legacy_panel_writes[4][4]; }
  * Writers: 0 progress, 1 panic fill, 2 blank fill, 3 swap copy, 4 2x2 pattern,
  * 5 slot cell, 6 USB cell, 7 heartbeat cell. The kernel text console is counted
  * where it writes, in video_console.c. */
-/* The definition is explicit rather than tentative, and the accessors below go
- * through a row pointer, both so the linker never has to resolve an 8-byte
- * LDR/STR against a symbol whose placement it chose itself. This is the same
- * shape panelWriteRecord uses for native_legacy_panel_writes. */
-extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]
-    __attribute__((aligned(16))) = {}; }
-/* volatile counters: ++ and -- on a volatile object are deprecated and this
- * archive builds with -Werror, so every update is written as an explicit read
- * and add, the same form panelWriteRecord above uses. */
-static inline void panelEnter(unsigned id) {
+/* The array lands in __DATA,__common, where the compiler chooses the
+ * placement and the linker only guarantees the alignment the object file
+ * records. With a constant writer index, clang folds the access into
+ * "LDR xN, [page base, #lo12:_native_legacy_panel_activity]" and the linker
+ * then rejects the symbol for not being 8-byte aligned. Keeping these three
+ * helpers real noinline functions, and indexing from a row pointer, is the
+ * shape panelWriteRecord below already has and links: the index stays in a
+ * register, so no addend against the symbol ever reaches the link.
+ * volatile counters: ++ and -- on a volatile object are deprecated and this
+ * archive builds with -Werror, so every update is an explicit read and add. */
+extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]; }
+__attribute__((noinline)) static void panelEnter(unsigned id) {
     volatile uint64_t *row = native_legacy_panel_activity[id];
     row[0] = row[0] + 1;
 }
-static inline void panelEarly(unsigned id) {
+__attribute__((noinline)) static void panelEarly(unsigned id) {
     volatile uint64_t *row = native_legacy_panel_activity[id];
     row[1] = row[1] + 1;
 }
-static inline void panelPixels(unsigned id, uint64_t n) {
+__attribute__((noinline)) static void panelPixels(unsigned id, uint64_t n) {
     volatile uint64_t *row = native_legacy_panel_activity[id];
     row[2] = row[2] + n;
 }
