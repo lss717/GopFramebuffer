@@ -61,6 +61,10 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+/* H616: the scanout target as the display driver holds it. [0] physical address,
+ * [1] length, [2] width, [3] height, [4] row bytes, [5] v_baseAddr,
+ * [6] physical segment count, [7] primary, [8] length of the first segment. */
+extern "C" { volatile uint64_t native_legacy_scanout[10]; }
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
@@ -877,9 +881,40 @@ public:
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+                /* H616: what the scanout target actually is, before anything tries to
+                 * map it for the GPU. The log line below read the mapping variable
+                 * after it had been moved into bootMapping, so it printed zero on
+                 * every successful start. The segment walk answers whether the
+                 * framebuffer is one contiguous range or scattered pages, which
+                 * decides whether a single page-table range could describe it. */
+                if(valid && bootMapping) {
+                    native_legacy_scanout[0]=(uint64_t)bootMapping->getPhysicalAddress();
+                    native_legacy_scanout[1]=(uint64_t)bootMapping->getLength();
+                    native_legacy_scanout[2]=(uint64_t)video.v_width;
+                    native_legacy_scanout[3]=(uint64_t)video.v_height;
+                    native_legacy_scanout[4]=(uint64_t)video.v_rowBytes;
+                    native_legacy_scanout[5]=(uint64_t)video.v_baseAddr;
+                    native_legacy_scanout[7]=primary?1u:0u;
+                    uint32_t segments=0;
+                    IOByteCount firstLength=0;
+                    for(IOByteCount at=0; at<bootMapping->getLength() && segments<4096u; ++segments) {
+                        IOByteCount pieceLength=0;
+                        const IOByteCount segment=bootMapping->getPhysicalSegment(at,&pieceLength,0);
+                        if(!segment || !pieceLength) break;
+                        if(!segments) firstLength=pieceLength;
+                        at+=pieceLength;
+                    }
+                    native_legacy_scanout[6]=(uint64_t)segments;
+                    native_legacy_scanout[8]=(uint64_t)firstLength;
+                    IOLog("NATIVE_LEGACY: scanout phys=%llx len=%llu %ux%u rowbytes=%u base=%llx segments=%u first=%llu primary=%u\n",
+                          (unsigned long long)native_legacy_scanout[0],(unsigned long long)native_legacy_scanout[1],
+                          (unsigned)video.v_width,(unsigned)video.v_height,(unsigned)video.v_rowBytes,
+                          (unsigned long long)video.v_baseAddr,(unsigned)segments,
+                          (unsigned long long)firstLength,(unsigned)native_legacy_scanout[7]);
+                }
             }
         }
-        IOLog("NATIVE_LEGACY: startHardware valid=%d phys=%llx len=%llu\n",valid,mapping?(unsigned long long)mapping->getPhysicalAddress():0,mapping?(unsigned long long)mapping->getLength():0);
+        IOLog("NATIVE_LEGACY: startHardware valid=%d phys=%llx len=%llu\n",valid, bootMapping?(unsigned long long)bootMapping->getPhysicalAddress():0, bootMapping?(unsigned long long)bootMapping->getLength():0);
         OSSafeReleaseNULL(mapping);return valid;
     }
 #define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
