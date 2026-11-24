@@ -2406,7 +2406,6 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     }
     native_a540_panel_diag[36] = finalOk;
     native_a540_panel_diag[37] = finalTotal;
-}
     /* H629: the write just happened, so the following beats measure the decay. */
     gPanelBeatsSinceWrite = 0u;
 }
