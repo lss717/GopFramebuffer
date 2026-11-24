@@ -72,6 +72,11 @@ constexpr size_t   kBoPage    = 0x1000;
  * surface is 10,444,800 bytes, exactly 2550 pages. */
 constexpr uint64_t kSurfSrcIova = 0x3000000ULL;
 constexpr uint64_t kSurfDstIova = 0x3100000ULL;
+/* H617: the scanout target gets its own aperture above the surface pair and
+ * below the trusted window. The address is chosen here, the physical base,
+ * length, geometry and row bytes are taken from the platform console at run
+ * time, never hard-coded. */
+constexpr uint64_t kPanelIova   = 0x4000000ULL;
 constexpr uint32_t kSurfWidth      = 1080u;
 constexpr uint32_t kSurfHeight     = 1920u;
 constexpr uint32_t kSurfRowBytes   = 4352u;   /* plane 0 row stride in bytes */
@@ -276,6 +281,13 @@ struct Ctx {
     Alloc surfSrc;                  /* H612: pattern source, real 2D geometry */
     Alloc surfDst;                  /* H612: the desktop-sized destination surface */
     bool surfaceReady;              /* H612: both allocations succeeded */
+    uint64_t panelPhys;             /* H617: console base address, as reported */
+    uint64_t panelBytes;            /* H617: row bytes times height */
+    uint32_t panelWidth;
+    uint32_t panelHeight;
+    uint32_t panelRowBytes;
+    uint32_t panelDepth;
+    bool panelReady;                /* H617: the console answered and every check passed */
     GpuWindow zapHeaderWindow, zapImageWindow;
     ArmSmmu4KMmio smmu_mmio;
     ArmSmmu4KIo io;
@@ -331,6 +343,13 @@ extern "C" { volatile uint32_t native_a540_blit_diag[8]; }
  * destination pixel, [12] how many pixels matched inside that first failing
  * row, which separates a whole missing row from a column-step error. */
 extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
+/* H617: what the platform console reported at C3 time and whether it was
+ * accepted into the GPU page table. [0] PE_current_console returned success,
+ * [1] every validation check passed, [2] the page table was built with the
+ * panel range, [3] base address low, [4] base address high, [5] length,
+ * [6] width, [7] height, [8] row bytes, [9] depth, [10] v_display flag,
+ * [11] the IOVA chosen for it. */
+extern "C" { volatile uint32_t native_a540_panel_diag[12]; }
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -480,10 +499,19 @@ static bool smmu_setup(Ctx &c) {
     c.cfg.output_bits = 36;
     c.cfg.table_physical = c.tables.phys;
     c.cfg.leaf_budget = 0x80000000ULL / 4096;
+    /* H617: the panel span is charged against the same leaf budget, so a
+     * geometry the budget cannot cover must be refused here rather than
+     * silently truncating the table. */
+    if (c.panelReady && c.panelBytes / 4096 > (uint64_t)c.cfg.leaf_budget) {
+        IOLog("NATIVE_GPU_C3: H617 panel span %llu exceeds the leaf budget\n",
+              (unsigned long long)c.panelBytes);
+        c.panelReady = false;
+        native_a540_panel_diag[1] = 0u;
+    }
 
     /* ArmSmmu4KBuild requires ascending, non-overlapping IOVAs: bring-up
      * buffers, then the BO pool, then the trusted window. */
-    ArmSmmu4KRange r[8 + kBoSlots];
+    ArmSmmu4KRange r[9 + kBoSlots];
     size_t nr = 0;
     r[nr++] = { kRingIova, c.ring.phys, kRingBytes, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     r[nr++] = { kPm4Iova, c.pm4.phys, (c.pm4.bytes + 0xfff) & ~UINT64_C(0xfff), ArmSmmu4KRead, 0, 3 };
@@ -501,10 +529,18 @@ static bool smmu_setup(Ctx &c) {
         r[nr++] = { kSurfDstIova, c.surfDst.phys, c.surfDst.bytes,
                     ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     }
+    /* H617: the scanout target, described by the platform console rather than a
+     * literal, and only when every check passed. One contiguous physical range,
+     * as the H616 segment walk established, so a single range describes it. */
+    if (c.panelReady)
+        r[nr++] = { kPanelIova, c.panelPhys, c.panelBytes,
+                    ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     r[nr++] = { 0xE9000000ULL, c.win.phys, 0x1000, ArmSmmu4KRead | ArmSmmu4KWrite, 0, 3 };
     if (ArmSmmu4KBuild(&c.cfg, r, nr, reinterpret_cast<uint64_t *>(c.tables.cpu),
                        c.tables.bytes / 4096, &c.tables_result) != ArmSmmu4KSuccess)
         return c.fail(4, "smmu build");
+    if (c.panelReady)
+        native_a540_panel_diag[2] = 1u;   /* H617: the table was built with the panel range */
     cleanDcache(c.tables.cpu, c.tables.bytes);
 
     memset(&c.ccfg, 0, sizeof(c.ccfg));
@@ -1649,6 +1685,59 @@ static void c3_thread(void *, wait_result_t) {
         else
             IOLog("NATIVE_GPU_C3: H612 surface allocation failed (src=%d dst=%d "
                   "dstBytes=%llu)\n", srcOk, dstOk, (unsigned long long)kSurfBytes);
+    }
+    /* H617: ask the platform console what display it handed us, at C3 time.
+     * The same call and the same checks the display driver applies later, so
+     * the two cannot disagree about the target. Nothing here trusts a literal
+     * address: base, length, geometry, row bytes and depth all come from the
+     * response, and a rejected response simply leaves the panel unmapped. */
+    {
+        PE_Video consoleVideo = {};
+        const bool consoleOk = PE_current_console(&consoleVideo);
+        native_a540_panel_diag[0] = consoleOk ? 1u : 0u;
+        native_a540_panel_diag[6] = consoleVideo.v_width;
+        native_a540_panel_diag[7] = consoleVideo.v_height;
+        native_a540_panel_diag[8] = (uint32_t)consoleVideo.v_rowBytes;
+        native_a540_panel_diag[9] = consoleVideo.v_depth;
+        native_a540_panel_diag[10] = (uint32_t)consoleVideo.v_display;
+        native_a540_panel_diag[3] = (uint32_t)(consoleVideo.v_baseAddr & 0xffffffffu);
+        native_a540_panel_diag[4] = (uint32_t)(consoleVideo.v_baseAddr >> 32);
+        const uint64_t rowBytes = consoleVideo.v_rowBytes;
+        const uint64_t span = rowBytes * consoleVideo.v_height;
+        native_a540_panel_diag[5] = (uint32_t)span;
+        const bool plausible = consoleOk
+            && consoleVideo.v_baseAddr
+            && consoleVideo.v_depth == 32
+            && consoleVideo.v_rotate == 0
+            && consoleVideo.v_width && consoleVideo.v_height
+            && consoleVideo.v_width <= 16384 && consoleVideo.v_height <= 16384
+            && rowBytes >= (uint64_t)consoleVideo.v_width * 4
+            && rowBytes <= UINT64_MAX / consoleVideo.v_height
+            && span >= (uint64_t)consoleVideo.v_width * consoleVideo.v_height * 4
+            && kPanelIova + span <= 0xE9000000ULL;
+        if (plausible) {
+            c->panelPhys = consoleVideo.v_baseAddr;
+            c->panelBytes = (span + 0xfff) & ~UINT64_C(0xfff);
+            c->panelWidth = consoleVideo.v_width;
+            c->panelHeight = consoleVideo.v_height;
+            c->panelRowBytes = (uint32_t)rowBytes;
+            c->panelDepth = consoleVideo.v_depth;
+            c->panelReady = true;
+            native_a540_panel_diag[1] = 1u;
+            native_a540_panel_diag[11] = (uint32_t)kPanelIova;
+            IOLog("NATIVE_GPU_C3: H617 console panel base=%llx len=%llu %ux%u row=%llu "
+                  "depth=%u display=%llu -> iova %llx\n",
+                  (unsigned long long)c->panelPhys, (unsigned long long)c->panelBytes,
+                  c->panelWidth, c->panelHeight, (unsigned long long)rowBytes,
+                  c->panelDepth, (unsigned long long)consoleVideo.v_display,
+                  (unsigned long long)kPanelIova);
+        } else {
+            IOLog("NATIVE_GPU_C3: H617 console panel rejected (ok=%d base=%llx %ux%u "
+                  "row=%llu depth=%u rotate=%u)\n", consoleOk,
+                  (unsigned long long)consoleVideo.v_baseAddr, consoleVideo.v_width,
+                  consoleVideo.v_height, (unsigned long long)consoleVideo.v_rowBytes,
+                  consoleVideo.v_depth, consoleVideo.v_rotate);
+        }
     }
     /* H236bi: DarwinBoot reserves a 2 MiB, below-4G, 1 MiB-aligned ZAP
      * window inside the kernel window and appends zap-base=<phys>. Map the
