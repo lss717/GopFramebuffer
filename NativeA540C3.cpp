@@ -2125,15 +2125,23 @@ static void a5xxBlitSetup(volatile uint32_t *ib, unsigned &w) {
  * distinguish. BGRA words. */
 constexpr unsigned kRectCount = 6u;
 static const uint32_t kRectX[kRectCount] = { 480u, 480u, 480u, 480u, 480u, 480u };
-static const uint32_t kRectY[kRectCount] = { 64u, 448u, 832u, 1216u, 1600u, 1912u };  /* H624: off y 0..5, which the H343 progress bar overwrites once a second */
+/* H626: the first block returns to y 0. H624 moved it off rows 0..5 to dodge
+ * the H343 progress bar, but H625 counted that writer at zero for the whole
+ * session, so the offset had no basis. The last block now leaves 32 rows of
+ * margin instead of ending on the final row. */
+static const uint32_t kRectY[kRectCount] = { 0u, 384u, 768u, 1152u, 1536u, 1880u };
 static const uint32_t kTileY[kRectCount] = { 16u, 32u, 48u, 64u, 80u, 96u };
 static const uint32_t kRectColor[kRectCount] = {
-    0xff0000ffu,   /* red     */
-    0xff00ff00u,   /* green   */
-    0xffff0000u,   /* blue    */
-    0xff00ffffu,   /* yellow  */
-    0xffffff00u,   /* cyan    */
-    0xffff00ffu,   /* magenta */
+    /* H626: the names in H623 to H625 were wrong. The panel is BGRA in little
+     * endian order, so byte 0 is blue and byte 2 is red, and four of the six
+     * labels were wrong in pairs. The measured numbers were unaffected because
+     * the read-back compares against these same constants. */
+    0xff0000ffu,   /* blue    B=255 */
+    0xff00ff00u,   /* green   G=255 */
+    0xffff0000u,   /* red     R=255 */
+    0xff00ffffu,   /* cyan    G=255 B=255 */
+    0xffffff00u,   /* yellow  R=255 G=255 */
+    0xffff00ffu,   /* magenta R=255 B=255 */
 };
 
 extern "C" void native_a540_hb_panel_selftest(void) {
@@ -2348,6 +2356,28 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     native_a540_panel_diag[33] = carry;          /* H624: blocks still holding the previous run */
     native_a540_panel_diag[34] = carryTotal;       /* H624: pixels of 3072 that survived the gap */
     native_a540_panel_diag[35] = kRectCount * kPatWidth * kPatHeight;
+    /* H626: the per-block read-back above runs immediately after that block's
+     * own submission, so a later block damaging an earlier one is invisible in
+     * match=2944/3072 and only surfaces as carry=0 in the next run. This pass
+     * re-reads every block after all six have been written, which is the
+     * measurement that either attributes the loss to the test itself or rules
+     * it out. */
+    unsigned finalOk = 0, finalTotal = 0;
+    if (c.panelWindowReady) {
+        for (unsigned r = 0; r < kRectCount; ++r) {
+            unsigned good = 0;
+            for (unsigned y = 0; y < kPatHeight; ++y)
+                for (unsigned x = 0; x < kPatWidth; ++x) {
+                    const uint64_t index = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u
+                                         + kRectX[r] + x;
+                    if (panel[index] == kRectColor[r]) ++good;
+                }
+            finalTotal += good;
+            if (good == kPatWidth * kPatHeight) finalOk |= (1u << r);
+        }
+    }
+    native_a540_panel_diag[36] = finalOk;
+    native_a540_panel_diag[37] = finalTotal;
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
