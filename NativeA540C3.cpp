@@ -76,8 +76,8 @@ constexpr uint32_t kSurfWidth      = 1080u;
 constexpr uint32_t kSurfHeight     = 1920u;
 constexpr uint32_t kSurfRowBytes   = 4352u;   /* plane 0 row stride in bytes */
 constexpr uint32_t kSurfAlphaRow   = 1088u;   /* plane 1 row stride in bytes */
-constexpr uint64_t kSurfPlane0     = UINT64_C(kSurfRowBytes) * kSurfHeight;
-constexpr uint64_t kSurfPlane1     = UINT64_C(kSurfAlphaRow) * kSurfHeight;
+constexpr uint64_t kSurfPlane0     = static_cast<uint64_t>(kSurfRowBytes) * kSurfHeight;
+constexpr uint64_t kSurfPlane1     = static_cast<uint64_t>(kSurfAlphaRow) * kSurfHeight;
 constexpr uint64_t kSurfBytes      = kSurfPlane0 + kSurfPlane1;
 /* The copied rectangle is deliberately offset so a wrong row stride or a
  * missing padding gap cannot pass: 64x8 pixels placed at destination (1,3). */
