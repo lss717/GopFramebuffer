@@ -93,6 +93,21 @@ static NativeLegacyDisplay *gPanicDisplay;
  * screen fill and the swap copy. Each slot holds count, uptime seconds of the
  * last write, first row and last row. */
 extern "C" { volatile uint64_t native_legacy_panel_writes[4][4]; }
+/* H629: the H625 counters above only fire on the success path, so they answer
+ * "did this writer finish a write" and nothing else. That matters because
+ * progress() and panicPaint() stop at the PE_current_console convention check
+ * on this platform, which fills the struct and returns false: their count stayed
+ * zero whether the function was never called or was called and stopped there.
+ * A second gap is that the diagnostic cell writers were not in the list at all.
+ * These three counters are per writer: how often it was entered, how often it
+ * stopped at a guard before writing, and how many pixels it actually wrote.
+ * Writers: 0 progress, 1 panic fill, 2 blank fill, 3 swap copy, 4 2x2 pattern,
+ * 5 slot cell, 6 USB cell, 7 heartbeat cell. The kernel text console is counted
+ * where it writes, in video_console.c. */
+extern "C" { volatile uint64_t native_legacy_panel_activity[8][3]; }
+static inline void panelEnter(unsigned id) { native_legacy_panel_activity[id][0]++; }
+static inline void panelEarly(unsigned id) { native_legacy_panel_activity[id][1]++; }
+static inline void panelPixels(unsigned id, uint64_t n) { native_legacy_panel_activity[id][2] += n; }
 static void panelWriteRecord(unsigned id, uint32_t firstRow, uint32_t lastRow) {
     volatile uint64_t *entry = native_legacy_panel_writes[id];
     entry[0] = entry[0] + 1;
@@ -236,17 +251,18 @@ public:
     // watchdog calls this once a second, so how far the bar got is exactly how long the machine
     // lived, even when neither the ring nor the console can tell.
     void progress(unsigned step, unsigned total) {
-        if(!bootMapping || !total) return;
+        panelEnter(0);
+        if(!bootMapping || !total) { panelEarly(0); return; }
         uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
-        if(!w||!h)return;
+        if(!w||!h){ panelEarly(0); return; }
         PE_Video video={};
-        if(!PE_current_console(&video))return;
-        if(video.v_baseAddr!=bootMapping->getPhysicalAddress()||video.v_depth!=32||video.v_rotate)return;
+        if(!PE_current_console(&video)){ panelEarly(0); return; }
+        if(video.v_baseAddr!=bootMapping->getPhysicalAddress()||video.v_depth!=32||video.v_rotate){ panelEarly(0); return; }
         uintptr_t base=(uintptr_t)bootMapping->getVirtualAddress();
-        if(!base)return;
+        if(!base){ panelEarly(0); return; }
         volatile uint32_t *row=reinterpret_cast<volatile uint32_t *>(base);
         uint32_t words=video.v_rowBytes/4;
-        if(words<w)return;
+        if(words<w){ panelEarly(0); return; }
         uint32_t filled=(uint32_t)(((uint64_t)w*step)/total);
         if(filled>w)filled=w;
         for(unsigned y=0;y<6;y++) {
@@ -254,30 +270,34 @@ public:
             for(uint32_t x=0;x<w;x++) line[x]=(x<filled)?0xffffffffU:0xff000000U;
         }
         __asm__ volatile("dsb sy":::"memory");
+        panelPixels(0, 6ull * w);
         panelWriteRecord(0,0,5);   /* H625: the progress bar occupies rows 0..5 */
     }
     // H315: a dying machine gets one full-screen fill of the real scanout.  Nothing here takes a
     // lock, waits or retries: either the panel turns solid or the fill is skipped and the marker
     // block remains the only record.
     void panicPaint(uint32_t color) {
-        if(!bootMapping) return;
+        panelEnter(1);
+        if(!bootMapping) { panelEarly(1); return; }
         uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
-        if(!w||!h)return;
+        if(!w||!h){ panelEarly(1); return; }
         PE_Video video={};
-        if(!PE_current_console(&video))return;
-        if(video.v_baseAddr!=bootMapping->getPhysicalAddress()||video.v_depth!=32||video.v_rotate)return;
-        if(video.v_width!=w||video.v_height!=h)return;
+        if(!PE_current_console(&video)){ panelEarly(1); return; }
+        if(video.v_baseAddr!=bootMapping->getPhysicalAddress()||video.v_depth!=32||video.v_rotate){ panelEarly(1); return; }
+        if(video.v_width!=w||video.v_height!=h){ panelEarly(1); return; }
         if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
-            bootMapping->getLength(),video.v_rowBytes,w,h,color))return;
+            bootMapping->getLength(),video.v_rowBytes,w,h,color)){ panelEarly(1); return; }
         uintptr_t base=static_cast<uintptr_t>(bootMapping->getVirtualAddress());
         uintptr_t end=base+static_cast<uintptr_t>(video.v_rowBytes)*h;
         for(uintptr_t a=base&~static_cast<uintptr_t>(63);a<end;a+=64)
             __asm__ volatile("dc civac, %0"::"r"(a):"memory");
         __asm__ volatile("dsb sy":::"memory");
+        panelPixels(1, (uint64_t)w * h);
         panelWriteRecord(1,0,h-1);   /* H625: a panic fill covers the whole panel */
     }
     int drawTestPattern() {
-        if(!bootMapping) return 0;
+        panelEnter(4);
+        if(!bootMapping) { panelEarly(4); return 0; }
         uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
         uint64_t bytes=bootMapping->getLength();
         if(!w || !h || !bytes || bytes<h*4)return 0;
@@ -381,10 +401,14 @@ public:
         // H410: fifth status cell, USB CDC live-log link/transfer state.
         drawUsbCell();
         __asm__ volatile("dsb oshst" ::: "memory");
+        /* Four 128x128 cells (two half-height ones make one whole) and four 16x16
+         * status cells. The USB cell is counted as its own writer. */
+        panelPixels(4, 4ull * panel * panel + 4ull * 16 * 16);
         return 1;
     }
     void drawSlotCell() {
-        if(!bootMapping)return;
+        panelEnter(5);
+        if(!bootMapping){ panelEarly(5); return; }
         uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
         uint64_t bytes=bootMapping->getLength();
         if(!w || !h || bytes<h*4)return;
@@ -412,7 +436,8 @@ public:
     // 500 ms activity window returns the cell to solid green after the last
     // successful completion.
     void drawUsbCell() {
-        if(!bootMapping)return;
+        panelEnter(6);
+        if(!bootMapping){ panelEarly(6); return; }
         uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
         uint64_t bytes=bootMapping->getLength();
         if(!w || !h || bytes<h*4)return;
@@ -439,7 +464,8 @@ public:
     // without touching any lock the display family may hold during a client
     // swap. The framebuffer mapping is uncached device memory.
     void drawHeartbeatCell() {
-        if(!bootMapping)return;
+        panelEnter(7);
+        if(!bootMapping){ panelEarly(7); return; }
         uint32_t w=0,h=0;getDisplayDimensions(&w,&h);
         uint64_t bytes=bootMapping->getLength();
         if(!w || !h || bytes<h*4)return;
@@ -600,6 +626,7 @@ public:
         OSObject *surface=nullptr;
         memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+2624,sizeof(surface));
         if(!surface) {
+            panelEnter(2);
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
             PE_Video blank={};
             uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
@@ -607,14 +634,15 @@ public:
             if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
                blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
                !native_legacy_surface_bounds(bw,bh,blank.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
-                native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
+                { panelEarly(2); native_legacy_transfer_observed(kIOReturnNotReady,request,0); return; }
             }
-            if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            if(!native_legacy_prepare_scanout()) {panelEarly(2); native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
+            panelPixels(2, (uint64_t)bw * bh);
             panelWriteRecord(2,0,bh-1);   /* H625: blank-screen fill */
             shadowValid=false;
             transferred=true;
@@ -624,6 +652,7 @@ public:
             finishTransfer(request);
             return;
         }
+        panelEnter(3);
         uint64_t kickStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(kickStart));
         if(!surface->metaCast("IOSurface"))return;
         IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
@@ -706,6 +735,7 @@ public:
             stored=length;
         }
         __asm__ volatile("dsb sy" ::: "memory");
+        panelPixels(3, stored == UINT64_MAX ? 0ull : (uint64_t)width * height);
         panelWriteRecord(3,0,height-1);   /* H625: swap copy reached the panel */
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));
             native_legacy_copy_timing_observed(copyEnd-copyStart,stored);

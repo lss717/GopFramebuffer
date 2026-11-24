@@ -359,7 +359,24 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
  * (0xffffffff when all match), [18] the CPU window mapping,
  * [19] sentinel pixels outside the rectangle that changed. */
-extern "C" { volatile uint32_t native_a540_panel_diag[48]; }
+extern "C" { volatile uint32_t native_a540_panel_diag[80]; }
+/* H629 adds, on top of the indices documented above:
+ * [38] watch samples          [39] pixels still holding their block colour
+ * [40] blocks fully intact    [41] watch transitions
+ * [42] total before the last transition       [43] sample of the last transition
+ * [44] blocks 0-2 counts, 10 bits each        [45] blocks 3-5 counts, 10 bits each
+ * [46] black [47] white [48] dark grey [49] another block's own test colour
+ * [50] none of the above      [51] first such value  [52] where it was found
+ * [53] probe pixels that disagreed between two reads in one beat
+ * [54] probe pixels checked that way
+ * [55] beats since the last blit
+ * [56..62] total at beats 1, 2, 3, 5, 10, 20, 29 after the last blit
+ * [63] beats the console wrote  [64] console wrote and panel changed
+ * [65] panel changed with no console write
+ * [66] console scroll calls     [67] console glyph/clear/cursor calls
+ * [68] console text rows       [69] console text columns
+ * [70] last scroll region top  [71] last scroll region bottom
+ * [72] glyph height in panel rows  [73] text rows the console copied this beat */
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -2144,6 +2161,17 @@ static const uint32_t kRectColor[kRectCount] = {
     0xffff00ffu,   /* magenta R=255 B=255 */
 };
 
+/* H629: the kernel text console draws into the same framebuffer the panel test
+ * writes, and it was not among the writers the display driver counts. These
+ * counters come from video_console.c (console-panel-write-accounting.patch) and
+ * are sampled once per beat so the change can be attributed to a beat. */
+extern "C" { extern volatile unsigned long long video_console_panel_counts[12]; }
+static volatile uint32_t gPanelBeatsSinceWrite = 0xffffffffu;
+static unsigned long long gPanelConsoleLast[12];
+static uint32_t gPanelLastTransitions = 0;
+static uint64_t gPanelProbe[kRectCount * 4];
+static bool gPanelProbeReady = false;
+
 extern "C" void native_a540_hb_panel_selftest(void) {
     using namespace A5xxBlit;
     if (!gC3 || !gA540Ready || !gC3->panelReady || !gC3->surfaceReady)
@@ -2379,42 +2407,171 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     native_a540_panel_diag[36] = finalOk;
     native_a540_panel_diag[37] = finalTotal;
 }
-/* H628: watch the panel blocks every beat instead of only at the thirtieth
- * beat when the test redraws them. H627 proved the content is already gone by
- * the next run and that none of the four instrumented display writers did it,
- * so the open question is when the loss happens. Sampling at one hertz turns
- * "somewhere in the thirty seconds between runs" into a specific beat, which
- * can then be correlated with whatever else runs on that cadence. The count is
- * of pixels still holding the colour this test wrote, so a drop is a change and
- * not a read artefact. Observation only: nothing here writes the panel. */
+    /* H629: the write just happened, so the following beats measure the decay. */
+    gPanelBeatsSinceWrite = 0u;
+}
+/* H629: H628 sampled every beat but kept a single total, and the line that
+ * reports it is printed three beats after the blit, so all it could say was
+ * "the content is different by now". Three measurements are added, and none of
+ * them changes what any writer writes.
+ *
+ * A count per block, because one total cannot show whether the loss covers the
+ * whole panel or only the rows a text console uses.
+ *
+ * A signature of the replacement pixels, classified against the colours the
+ * other panel writers emit. A pixel that is no longer ours still names who put
+ * it there; a pixel holding a different block's own test colour can only have
+ * come from this test's addressing, so it is counted apart.
+ *
+ * A decay curve at fixed beats after the write, which dates the loss to a beat
+ * instead of to a print.
+ *
+ * Finally the observation checked against itself: a small probe set read twice
+ * inside one beat with nothing written in between. If the same uncached pixels
+ * disagree, the read path is not trustworthy and no count above means anything. */
 extern "C" void native_a540_hb_panel_watch(void) {
     if (!gC3 || !gC3->panelReady || !gC3->surfaceReady || !gC3->panelWindowReady)
         return;
     Ctx &c = *gC3;
     volatile uint32_t *panel = c.panelWindow.base;
     const uint32_t rowBytes = c.panelRowBytes;
+
+    if (!gPanelProbeReady) {
+        const unsigned xs[4] = { 0u, kPatWidth - 1u, 0u, kPatWidth - 1u };
+        const unsigned ys[4] = { 0u, 0u, kPatHeight - 1u, kPatHeight - 1u };
+        for (unsigned r = 0; r < kRectCount; ++r)
+            for (unsigned i = 0; i < 4; ++i)
+                gPanelProbe[r * 4u + i] =
+                    ((uint64_t)(kRectY[r] + ys[i]) * rowBytes) / 4u + kRectX[r] + xs[i];
+        gPanelProbeReady = true;
+    }
+
     unsigned mask = 0, total = 0;
+    unsigned blockGood[kRectCount] = { 0, 0, 0, 0, 0, 0 };
+    unsigned black = 0, white = 0, grey = 0, ownOtherTile = 0;
+    unsigned unexplained = 0;   /* a foreign pixel is 3072 - total, so it needs no counter */
+    uint32_t unknownValue = 0, unknownOffset = 0xffffffffu;
+
     for (unsigned r = 0; r < kRectCount; ++r) {
         unsigned good = 0;
         for (unsigned y = 0; y < kPatHeight; ++y) {
             const uint64_t rowWords = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u;
-            for (unsigned x = 0; x < kPatWidth; ++x)
-                if (panel[rowWords + kRectX[r] + x] == kRectColor[r]) ++good;
+            for (unsigned x = 0; x < kPatWidth; ++x) {
+                const uint64_t index = rowWords + kRectX[r] + x;
+                const uint32_t seen = panel[index];
+                if (seen == kRectColor[r]) { ++good; continue; }
+                bool explained = false;
+                if (seen == 0xff000000u) { ++black; explained = true; }
+                else if (seen == 0xffffffffu) { ++white; explained = true; }
+                else if (seen == 0xff404040u) { ++grey; explained = true; }
+                else {
+                    for (unsigned j = 0; j < kRectCount; ++j) {
+                        if (seen == kRectColor[j]) { ++ownOtherTile; explained = true; break; }
+                    }
+                }
+                if (!explained) {
+                    ++unexplained;
+                    if (unknownOffset == 0xffffffffu) {
+                        unknownOffset = (uint32_t)index;
+                        unknownValue = seen;
+                    }
+                }
+            }
         }
+        blockGood[r] = good;
         total += good;
         if (good == kPatWidth * kPatHeight) mask |= (1u << r);
+    }
+
+    /* Same beat, nothing written between the two passes. The device window is
+     * read again rather than reused, so a difference is the read path and not a
+     * writer. */
+    if ((native_a540_panel_diag[38] & 15u) == 0) {
+        uint32_t first[kRectCount * 4];
+        for (unsigned i = 0; i < kRectCount * 4; ++i)
+            first[i] = panel[gPanelProbe[i]];
+        unsigned disagree = 0;
+        for (unsigned i = 0; i < kRectCount * 4; ++i)
+            if (panel[gPanelProbe[i]] != first[i]) ++disagree;
+        native_a540_panel_diag[53] = native_a540_panel_diag[53] + disagree;
+        native_a540_panel_diag[54] = native_a540_panel_diag[54] + kRectCount * 4u;
     }
 
     native_a540_panel_diag[38] = native_a540_panel_diag[38] + 1u;
     native_a540_panel_diag[40] = mask;
     if (total != native_a540_panel_diag[39]) {
-        /* A change between beats. Remember the previous value, the new one and
-         * when it happened, and count the transition. */
         native_a540_panel_diag[41] = native_a540_panel_diag[41] + 1u;
         native_a540_panel_diag[42] = native_a540_panel_diag[39];   /* value before */
         native_a540_panel_diag[43] = native_a540_panel_diag[38];   /* sample index */
     }
     native_a540_panel_diag[39] = total;
+
+    native_a540_panel_diag[44] = (blockGood[0] & 0x3ffu)
+                               | ((blockGood[1] & 0x3ffu) << 10)
+                               | ((blockGood[2] & 0x3ffu) << 20);
+    native_a540_panel_diag[45] = (blockGood[3] & 0x3ffu)
+                               | ((blockGood[4] & 0x3ffu) << 10)
+                               | ((blockGood[5] & 0x3ffu) << 20);
+    native_a540_panel_diag[46] = black;
+    native_a540_panel_diag[47] = white;
+    native_a540_panel_diag[48] = grey;
+    native_a540_panel_diag[49] = ownOtherTile;
+    native_a540_panel_diag[50] = unexplained;
+    native_a540_panel_diag[51] = unknownValue;
+    native_a540_panel_diag[52] = unknownOffset;
+
+    /* Did the console write to the panel in this beat, and did the panel change
+     * in this beat? Counting the two together, and each alone, is what either
+     * ties the loss to the console or separates them. A beat where the panel
+     * changed with no console write is the measurement still missing. */
+    {
+        const unsigned long long scrollCalls =
+            video_console_panel_counts[0] + video_console_panel_counts[1];
+        const unsigned long long drawCalls =
+            video_console_panel_counts[4] + video_console_panel_counts[5]
+            + video_console_panel_counts[6];
+        const unsigned long long scrollDelta =
+            scrollCalls - gPanelConsoleLast[0] - gPanelConsoleLast[1];
+        const unsigned long long rowsDelta =
+            video_console_panel_counts[2] - gPanelConsoleLast[2];
+        const unsigned long long drawDelta =
+            drawCalls - gPanelConsoleLast[4] - gPanelConsoleLast[5]
+            - gPanelConsoleLast[6];
+        const bool consoleWrote = scrollDelta || drawDelta;
+        const bool panelChanged =
+            native_a540_panel_diag[41] != gPanelLastTransitions;
+        if (consoleWrote) native_a540_panel_diag[63] += 1u;
+        if (consoleWrote && panelChanged) native_a540_panel_diag[64] += 1u;
+        if (!consoleWrote && panelChanged) native_a540_panel_diag[65] += 1u;
+        gPanelLastTransitions = native_a540_panel_diag[41];
+
+        native_a540_panel_diag[66] = (uint32_t)scrollCalls;
+        native_a540_panel_diag[67] = (uint32_t)drawCalls;
+        native_a540_panel_diag[68] = (uint32_t)video_console_panel_counts[9];
+        native_a540_panel_diag[69] = (uint32_t)video_console_panel_counts[10];
+        native_a540_panel_diag[70] = (uint32_t)video_console_panel_counts[7];
+        native_a540_panel_diag[71] = (uint32_t)video_console_panel_counts[8];
+        native_a540_panel_diag[72] = (uint32_t)video_console_panel_counts[11];
+        native_a540_panel_diag[73] = (uint32_t)rowsDelta;
+
+        for (unsigned i = 0; i < 12; ++i)
+            gPanelConsoleLast[i] = video_console_panel_counts[i];
+    }
+
+    if (gPanelBeatsSinceWrite != 0xffffffffu) {
+        gPanelBeatsSinceWrite++;
+        native_a540_panel_diag[55] = gPanelBeatsSinceWrite;
+        switch (gPanelBeatsSinceWrite) {
+            case 1:  native_a540_panel_diag[56] = total; break;
+            case 2:  native_a540_panel_diag[57] = total; break;
+            case 3:  native_a540_panel_diag[58] = total; break;
+            case 5:  native_a540_panel_diag[59] = total; break;
+            case 10: native_a540_panel_diag[60] = total; break;
+            case 20: native_a540_panel_diag[61] = total; break;
+            case 29: native_a540_panel_diag[62] = total; break;
+            default: break;
+        }
+    }
 }
 
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
