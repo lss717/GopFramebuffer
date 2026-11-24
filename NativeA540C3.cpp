@@ -322,8 +322,12 @@ extern "C" { volatile uint32_t native_a540_blit_diag[8]; }
  * kPatWidth*kPatHeight, [5] first failing destination pixel index
  * (0xffffffff when all match), [6] source allocation succeeded,
  * [7] destination allocation succeeded, [8] plane 0 row padding still clear
- * after the copy, [9] alpha plane still clear after the copy. */
-extern "C" { volatile uint32_t native_a540_surface_diag[10]; }
+ * after the copy, [9] alpha plane still clear after the copy. H613 adds the
+ * geometry detail: [10] row mask, bit y set when all kPatWidth pixels of
+ * pattern row y matched, [11] the value actually found at the first failing
+ * destination pixel, [12] how many pixels matched inside that first failing
+ * row, which separates a whole missing row from a column-step error. */
+extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -1922,15 +1926,23 @@ extern "C" void native_a540_hb_surface_selftest(void) {
     invalidateDcache(c.surfDst.cpu, c.surfDst.bytes);
 
     unsigned matched = 0, firstBad = 0xffffffffu;
+    unsigned rowMask = 0, badGot = 0, firstBadRowMatched = 0;
     for (unsigned y = 0; y < kPatHeight; ++y) {
+        unsigned rowGood = 0;
         for (unsigned x = 0; x < kPatWidth; ++x) {
             const uint32_t want = 0xff000000u | (y << 16) | (x << 8);
             const unsigned index = (kDstOriginY + y) * dstRowWords + kDstOriginX + x;
-            if (surf[index] == want)
+            if (surf[index] == want) {
                 ++matched;
-            else if (firstBad == 0xffffffffu)
+                ++rowGood;
+            } else if (firstBad == 0xffffffffu) {
                 firstBad = index;
+                badGot = surf[index];
+                firstBadRowMatched = rowGood;
+            }
         }
+        if (rowGood == kPatWidth)
+            rowMask |= (1u << y);
     }
     /* Padding inside plane 0 that the copy must not have touched. */
     unsigned paddingClean = 1;
@@ -1950,6 +1962,9 @@ extern "C" void native_a540_hb_surface_selftest(void) {
     native_a540_surface_diag[5] = firstBad;
     native_a540_surface_diag[8] = paddingClean ? 1u : 0u;
     native_a540_surface_diag[9] = alphaClean ? 1u : 0u;
+    native_a540_surface_diag[10] = rowMask;
+    native_a540_surface_diag[11] = badGot;
+    native_a540_surface_diag[12] = firstBadRowMatched;
 }
 extern "C" void *native_a540_bo_descriptor(unsigned slot) {
     return (gC3 && slot < kBoSlots) ? reinterpret_cast<void *>(gC3->bo[slot].desc) : nullptr;
