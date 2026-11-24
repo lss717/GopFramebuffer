@@ -274,6 +274,9 @@ static uint32_t type7(uint32_t opcode, uint32_t count) {
            ((opcode & 0x7fu) << 16) | (parity(opcode) << 23);
 }
 
+/* H632: how many submissions had to wrap the ring. Non-zero is normal on a long
+ * session; it only matters if it changes while a case is running. */
+static volatile uint32_t gRingWrapCount = 0;
 /* H603: last C3 progress code, re-emitted from the UFS heartbeat (survives ring rotation). */
 static volatile uint32_t gA540LastPut;
 
@@ -359,7 +362,12 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
  * (0xffffffff when all match), [18] the CPU window mapping,
  * [19] sentinel pixels outside the rectangle that changed. */
-extern "C" { volatile uint32_t native_a540_panel_diag[112]; }
+extern "C" { volatile uint32_t native_a540_panel_diag[160]; }
+/* One build tag for every panel line, so a capture cannot mix rounds. H629 and
+ * H631 each carried the round number in more than one IOLog and H631 shipped
+ * with the watch line still saying H630. */
+#define NATIVE_PANEL_BUILD "H632"
+
 /* H629 adds, on top of the indices documented above:
  * [38] watch samples          [39] pixels still holding their block colour
  * [40] blocks fully intact    [41] watch transitions
@@ -2187,6 +2195,15 @@ static uint32_t gPanelLastTransitions = 0;
 static uint64_t gPanelProbe[kRectCount * 4];
 static bool gPanelProbeReady = false;
 
+/* H632 case state. gPanelPreWrite holds every test pixel as it stood before
+ * this run's blits, so the post-blit pass can say, column by column, whether
+ * the blit actually changed it. A column whose value already equalled the
+ * target proves nothing either way, so only columns where the value differed
+ * from the target beforehand are counted; a column that differed beforehand
+ * and still equals the old value afterwards was not written this run. */
+static uint32_t gPanelPreWrite[kRectCount][kPatHeight][kPatWidth];
+static uint32_t gPanelUnwritten[kRectCount][kPatHeight][2];
+
 extern "C" void native_a540_hb_panel_selftest(void) {
     using namespace A5xxBlit;
     if (!gC3 || !gA540Ready || !gC3->panelReady || !gC3->surfaceReady)
@@ -2223,7 +2240,10 @@ extern "C" void native_a540_hb_panel_selftest(void) {
                 for (unsigned x = 0; x < kPatWidth; ++x) {
                     const uint64_t index = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u
                                          + kRectX[r] + x;
-                    if (panel[index] == kRectColor[r]) ++good;
+                    /* H632 C0: keep the pre-blit value per column. */
+                    const uint32_t before = panel[index];
+                    gPanelPreWrite[r][y][x] = before;
+                    if (before == kRectColor[r]) ++good;
                 }
             carryTotal += good;
             if (good == kPatWidth * kPatHeight) carry |= (1u << r);
@@ -2277,21 +2297,39 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     }
 
     /* Fault accounting for the panel step. */
+    /* H632: the fault channel was read at CB+0x58 and CB+0x60 and written back
+     * to clear, but this same file uses CB+0x618 TLBIALL, CB+0x7f0 TLBSYNC and
+     * CB+0x7f4 TBFSR for the very same context bank, which is the SMMUv2
+     * (arm-smmu.c) layout. In that layout CB+0x58 and CB+0x60 are PREFR and
+     * PAR, the fault status is CB+0x78 and the address is CB+0x7C/0x80, and
+     * CB+0x68 holds FSYNR0 for a fault that is still pending. The observed
+     * "cleared" value never moved off 0x400, which is what writing a control
+     * register and reading it back unchanged looks like, so the previous claim
+     * that no new fault occurred was not supported by these registers. Read the
+     * SMMUv2 offsets now, and record the old pair as well so the change is
+     * auditable rather than silent. */
     uint32_t fsrBefore = 0, farBefore = 0, fsrCleared = 0;
+    uint32_t fsrS2 = 0, farS2Lo = 0, farS2Hi = 0, fsynr0 = 0;
     c.io.read32(c.io.cookie, 0x8058, &fsrBefore);
     c.io.read32(c.io.cookie, 0x8060, &farBefore);
-    c.io.write32(c.io.cookie, 0x8058, fsrBefore);
     c.io.read32(c.io.cookie, 0x8058, &fsrCleared);
+    c.io.read32(c.io.cookie, 0x8078, &fsrS2);
+    c.io.read32(c.io.cookie, 0x807c, &farS2Lo);
+    c.io.read32(c.io.cookie, 0x8080, &farS2Hi);
+    c.io.read32(c.io.cookie, 0x8068, &fsynr0);
 
     /* Sentinels just outside every rectangle, where in bounds. */
     uint32_t sentinel[4 * kRectCount];
     for (unsigned i = 0; i < 16; ++i) sentinel[i] = 0u;
     if (c.panelWindowReady) {
         for (unsigned r = 0; r < kRectCount; ++r) {
+            /* H632: the fourth point used to be (kRectX+32, kRectY), inside the
+             * rectangle, so three of the four sentinels were real and one could
+             * never show a change. All four are outside now. */
             const uint32_t xs[4] = { kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth,
-                                     kRectX[r], kRectX[r] + kPatWidth / 2u };
+                                     kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth };
             const uint32_t ys[4] = { kRectY[r] ? kRectY[r] - 1u : 0u, kRectY[r] + kPatHeight,
-                                     kRectY[r] + kPatHeight, kRectY[r] };
+                                     kRectY[r] + kPatHeight, kRectY[r] ? kRectY[r] - 1u : 0u };
             for (unsigned i = 0; i < 4; ++i) {
                 const uint64_t off = ((uint64_t)ys[i] * rowBytes) / 4u + xs[i];
                 if (xs[i] < c.panelWidth && ys[i] < c.panelHeight && off < c.panelBytes / 4u)
@@ -2336,6 +2374,37 @@ extern "C" void native_a540_hb_panel_selftest(void) {
             ib[w++] = shiftPixels;
             ib[w++] = shiftPixels + kPatWidth - 1u;
             ib[w++] = type7(CpSetRenderMode, 1); ib[w++] = RenderEnd2d;
+
+        }
+        /* H632 C1: the indirect buffer has to be verified in memory, not
+         * against the formula that produced it. H631 printed dst, aligned and
+         * shift recomputed from the same expression that built the command, so
+         * it could not tell a wrong address from a wrong reading of one. Here
+         * the words are set aside, the cache is pushed out and then dropped,
+         * and the same addresses are read back. A difference would mean the
+         * command stream the CP fetches is not the one this code wrote, which
+         * is the one failure mode no amount of recomputing addresses shows. */
+        {
+            static uint32_t expected[kBoPage / 4];
+            for (unsigned j = 0; j < w; ++j) expected[j] = ib[j];
+            cleanDcache(c.bo[2].cpu, kBoPage);
+            invalidateDcache(c.bo[2].cpu, kBoPage);
+            unsigned mismatch = 0;
+            for (unsigned j = 0; j < w; ++j) {
+                const uint32_t seen = ib[j];
+                if (seen == expected[j]) continue;
+                ++mismatch;
+                if (native_a540_panel_diag[134] == 0u
+                    && native_a540_panel_diag[135] == 0u) {
+                    native_a540_panel_diag[132] = r;
+                    native_a540_panel_diag[133] = j;
+                    native_a540_panel_diag[134] = expected[j];
+                    native_a540_panel_diag[135] = seen;
+                }
+            }
+            native_a540_panel_diag[130] = native_a540_panel_diag[130] + mismatch;
+            native_a540_panel_diag[131] = native_a540_panel_diag[131] + w;
+            if (mismatch) native_a540_panel_diag[136] = native_a540_panel_diag[136] + 1u;
         }
         fenceB = 0;
         submitB = native_a540_submit_bo(2, w, &fenceB);
@@ -2357,16 +2426,34 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     }
 
     uint32_t fsrAfter = 0, farAfter = 0;
+    uint32_t fsrS2After = 0, farS2LoAfter = 0, farS2HiAfter = 0, fsynr0After = 0;
     c.io.read32(c.io.cookie, 0x8058, &fsrAfter);
     c.io.read32(c.io.cookie, 0x8060, &farAfter);
+    c.io.read32(c.io.cookie, 0x8078, &fsrS2After);
+    c.io.read32(c.io.cookie, 0x807c, &farS2LoAfter);
+    c.io.read32(c.io.cookie, 0x8080, &farS2HiAfter);
+    c.io.read32(c.io.cookie, 0x8068, &fsynr0After);
+    /* Writing the fault status back to clear it belongs on FSR, and only once a
+     * fault has actually been recorded there. */
+    if (fsrS2After)
+        c.io.write32(c.io.cookie, 0x8078, fsrS2After);
+    native_a540_panel_diag[105] = fsrS2;
+    native_a540_panel_diag[106] = farS2Lo;
+    native_a540_panel_diag[107] = farS2Hi;
+    native_a540_panel_diag[108] = fsynr0;
+    native_a540_panel_diag[109] = fsrS2After;
+    native_a540_panel_diag[110] = farS2LoAfter;
+    native_a540_panel_diag[111] = fsynr0After;
 
     unsigned sentinelChanged = 0;
     if (c.panelWindowReady) {
         for (unsigned r = 0; r < kRectCount; ++r) {
+            /* H632: must stay identical to the two sampling passes above,
+             * otherwise the before and after values describe different pixels. */
             const uint32_t xs[4] = { kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth,
-                                     kRectX[r], kRectX[r] + kPatWidth / 2u };
+                                     kRectX[r] ? kRectX[r] - 1u : 0u, kRectX[r] + kPatWidth };
             const uint32_t ys[4] = { kRectY[r] ? kRectY[r] - 1u : 0u, kRectY[r] + kPatHeight,
-                                     kRectY[r] + kPatHeight, kRectY[r] };
+                                     kRectY[r] + kPatHeight, kRectY[r] ? kRectY[r] - 1u : 0u };
             for (unsigned i = 0; i < 4; ++i) {
                 if (sentinel[r * 4u + i] == 0xffffffffu) continue;
                 const uint64_t off = ((uint64_t)ys[i] * rowBytes) / 4u + xs[i];
@@ -2409,15 +2496,110 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     if (c.panelWindowReady) {
         for (unsigned r = 0; r < kRectCount; ++r) {
             unsigned good = 0;
-            for (unsigned y = 0; y < kPatHeight; ++y)
+            for (unsigned y = 0; y < kPatHeight; ++y) {
+                uint32_t low = 0u, high = 0u;
                 for (unsigned x = 0; x < kPatWidth; ++x) {
                     const uint64_t index = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u
                                          + kRectX[r] + x;
-                    if (panel[index] == kRectColor[r]) ++good;
+                    const uint32_t now = panel[index];
+                    if (now == kRectColor[r]) ++good;
+                    /* H632 C0: a column that already held the target colour
+                     * before this run proves nothing either way, so it is not
+                     * counted. A column that held something else and still
+                     * holds that same something else was not written by this
+                     * run's blit. That is the distinction H631 could not make,
+                     * because it only ever compared against the target. */
+                    const uint32_t before = gPanelPreWrite[r][y][x];
+                    if (before != kRectColor[r] && now == before) {
+                        if (x < 32u) low |= (1u << x);
+                        else high |= (1u << (x - 32u));
+                    }
                 }
+                gPanelUnwritten[r][y][0] = low;
+                gPanelUnwritten[r][y][1] = high;
+            }
             finalTotal += good;
             if (good == kPatWidth * kPatHeight) finalOk |= (1u << r);
         }
+    }
+    /* H632 C0 summary: total columns that should have changed and did not,
+     * how many rows had at least one, and the masks for the first short block
+     * so a single line can say whether that row was skipped or overwritten
+     * with the wrong data. */
+    {
+        unsigned totalUnwritten = 0, rowsWithUnwritten = 0, shortBlock = 0xffu;
+        for (unsigned r = 0; r < kRectCount; ++r) {
+            if (!(finalOk & (1u << r)) && shortBlock == 0xffu) shortBlock = r;
+            for (unsigned y = 0; y < kPatHeight; ++y) {
+                const uint32_t lo = gPanelUnwritten[r][y][0], hi = gPanelUnwritten[r][y][1];
+                totalUnwritten += __builtin_popcount(lo) + __builtin_popcount(hi);
+                if (lo || hi) ++rowsWithUnwritten;
+            }
+        }
+        native_a540_panel_diag[112] = totalUnwritten;
+        native_a540_panel_diag[113] = shortBlock;
+        native_a540_panel_diag[145] = rowsWithUnwritten;
+        for (unsigned i = 0; i < 8; ++i) {
+            const unsigned b = (shortBlock == 0xffu) ? 0u : shortBlock;
+            native_a540_panel_diag[114 + i * 2u] = gPanelUnwritten[b][i][0];
+            native_a540_panel_diag[115 + i * 2u] = gPanelUnwritten[b][i][1];
+        }
+    }
+
+    /* H632 C3: nothing outside the six rectangles has ever been examined, so
+     * "the blit wrote somewhere else" was never tested, and the earlier claim
+     * that nothing else was touched rested on eighteen sentinel points and
+     * twenty-four corners. Scan the same sixty-four columns down every panel
+     * row and count rows carrying a test colour. A hit outside the forty-eight
+     * expected rows means the data landed where it was not told to; no hit
+     * anywhere else, together with a C0 mask that says a row was not written,
+     * means those blits produced no panel write at all. */
+    if (c.panelWindowReady) {
+        static bool expectedRow[2048];
+        static bool expectedRowReady = false;
+        if (!expectedRowReady) {
+            for (unsigned r = 0; r < kRectCount; ++r)
+                for (unsigned y = 0; y < kPatHeight; ++y)
+                    if (kRectY[r] + y < 2048u) expectedRow[kRectY[r] + y] = true;
+            expectedRowReady = true;
+        }
+        unsigned hitRows = 0, minRow = 0xffffffffu, maxRow = 0, unexpectedPixels = 0;
+        uint32_t firstUnexpectedRow = 0xffffffffu, firstUnexpectedCol = 0, firstUnexpectedValue = 0;
+        const uint64_t lastWord = c.panelBytes / 4u;
+        for (unsigned row = 0; row < c.panelHeight; ++row) {
+            unsigned inRow = 0;
+            uint32_t hitCol = 0, hitValue = 0;
+            for (unsigned x = 0; x < kPatWidth; ++x) {
+                const uint64_t index = ((uint64_t)row * rowBytes) / 4u + kRectX[0] + x;
+                if (index >= lastWord) break;
+                const uint32_t v = panel[index];
+                for (unsigned j = 0; j < kRectCount; ++j) {
+                    if (v != kRectColor[j]) continue;
+                    if (!inRow) { hitCol = x; hitValue = v; }
+                    ++inRow;
+                    break;
+                }
+            }
+            if (!inRow) continue;
+            ++hitRows;
+            if (row < minRow) minRow = row;
+            if (row > maxRow) maxRow = row;
+            if (!expectedRow[row]) {
+                unexpectedPixels += inRow;
+                if (firstUnexpectedRow == 0xffffffffu) {
+                    firstUnexpectedRow = row;
+                    firstUnexpectedCol = hitCol;
+                    firstUnexpectedValue = hitValue;
+                }
+            }
+        }
+        native_a540_panel_diag[137] = hitRows;
+        native_a540_panel_diag[138] = minRow;
+        native_a540_panel_diag[139] = maxRow;
+        native_a540_panel_diag[140] = unexpectedPixels;
+        native_a540_panel_diag[141] = firstUnexpectedRow;
+        native_a540_panel_diag[142] = firstUnexpectedCol;
+        native_a540_panel_diag[143] = firstUnexpectedValue;
     }
     native_a540_panel_diag[36] = finalOk;
     native_a540_panel_diag[37] = finalTotal;
@@ -2430,7 +2612,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
      * pixel that should have been copied there contains. If the surface holds the
      * right colour and the panel does not, the blit is wrong; if both are wrong,
      * the surface step is. */
-    {
+    if (c.panelWindowReady) {
         for (unsigned r = 0; r < kRectCount; ++r) {
             if (finalOk & (1u << r))
                 continue;   /* this block is fully intact */
@@ -2504,6 +2686,12 @@ extern "C" void native_a540_hb_panel_selftest(void) {
             native_a540_panel_diag[103] = panel[((uint64_t)(kRectY[r] + firstY) * rowBytes) / 4u
                 + kRectX[r] + kPatWidth - 1u];
             break;
+        }
+        if (finalOk == ((1u << kRectCount) - 1u)) {
+            /* Nothing is short this run, so the previous run's diagnosis must
+             * not keep printing as though it were still true. */
+            for (unsigned i = 79; i <= 104; ++i)
+                native_a540_panel_diag[i] = 0xffffffffu;
         }
     }
     /* H630: start a fresh decay row. H629 left the previous cycle's later
@@ -2699,26 +2887,47 @@ extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fe
      * lines so the GPU-side read cannot come from a stale cache line. */
     cleanDcache(c.bo[slot].cpu, kBoPage);
     uint32_t *ring = reinterpret_cast<uint32_t *>(c.ring.cpu);
-    unsigned n = rd(CP_RB_RPTR);
+    /* H632: the ring is a circular buffer and the CP wraps its read pointer
+     * inside it, but this path wrote ring[n++] with no wrap and no capacity
+     * check. The RPTR was observed at 7227 of 8192 words, so a long session
+     * walks off the end: the next submission would write past the ring into
+     * whatever kernel memory follows it, and the CP would then read from the
+     * wrapped start. Wrap the write index and clean the two pieces separately.
+     * This is a precondition for the H632 case matrix, which adds roughly a
+     * hundred more submissions to one boot, and it is unrelated to the two
+     * missing panel rows, which are wrong from the very first run. */
+    constexpr unsigned kRingDwords = static_cast<unsigned>(kRingBytes / 4);
+    /* Ten ring words per submission: CP_INDIRECT_BUFFER_PFE with three
+     * arguments, CP_EVENT_WRITE with four, and CP_WAIT_MEM_WRITES. */
+    constexpr unsigned kRingSubmissionWords = 10u;
+    unsigned n = rd(CP_RB_RPTR) % kRingDwords;
     const unsigned start = n;
     const uint64_t iova = kBoBase + slot * kBoPage;
-    ring[n++] = type7(0x3f /*CP_INDIRECT_BUFFER_PFE*/, 3);
-    ring[n++] = (uint32_t)iova;
-    ring[n++] = (uint32_t)(iova >> 32);
-    ring[n++] = words;
+    auto emit = [&](uint32_t v) { ring[n] = v; n = (n + 1) % kRingDwords; };
+    emit(type7(0x3f /*CP_INDIRECT_BUFFER_PFE*/, 3));
+    emit((uint32_t)iova);
+    emit((uint32_t)(iova >> 32));
+    emit(words);
     const uint64_t f = ++gA540Fence;
-    ring[n++] = type7(0x46 /*CP_EVENT_WRITE*/, 4);
-    ring[n++] = 4u;                       /* CACHE_FLUSH_TS */
-    ring[n++] = (uint32_t)kRptrIova;
-    ring[n++] = (uint32_t)(kRptrIova >> 32);
-    ring[n++] = (uint32_t)f;
-    ring[n++] = type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0);
-    cleanDcache(ring + start, (n - start) * 4);
+    emit(type7(0x46 /*CP_EVENT_WRITE*/, 4));
+    emit(4u);                       /* CACHE_FLUSH_TS */
+    emit((uint32_t)kRptrIova);
+    emit((uint32_t)(kRptrIova >> 32));
+    emit((uint32_t)f);
+    emit(type7(0x12 /*CP_WAIT_MEM_WRITES*/, 0));
+    const unsigned first = (start + kRingSubmissionWords <= kRingDwords)
+                         ? kRingSubmissionWords : (kRingDwords - start);
+    cleanDcache(ring + start, first * 4);
+    if (first < kRingSubmissionWords) {
+        gRingWrapCount = gRingWrapCount + 1u;
+        native_a540_panel_diag[144] = gRingWrapCount;
+        cleanDcache(ring, (kRingSubmissionWords - first) * 4);
+    }
     cleanDcache(c.rptr.cpu, kRptrBytes);
     wr(CP_RB_WPTR, n);
     bool done = false;
     for (unsigned ms = 0; ms < 2000; ++ms) {
-        if (rd(CP_RB_RPTR) == n) { done = true; break; }
+        if (rd(CP_RB_RPTR) % kRingDwords == n) { done = true; break; }
         spinMs(1);
     }
     for (unsigned ms = 0; ms < 500 && (rd(RBBM_STATUS_REG) & 0x7eu); ++ms)
