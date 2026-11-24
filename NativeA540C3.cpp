@@ -359,7 +359,7 @@ extern "C" { volatile uint32_t native_a540_surface_diag[13]; }
  * kPatWidth*kPatHeight, [17] first failing panel pixel offset in dwords
  * (0xffffffff when all match), [18] the CPU window mapping,
  * [19] sentinel pixels outside the rectangle that changed. */
-extern "C" { volatile uint32_t native_a540_panel_diag[80]; }
+extern "C" { volatile uint32_t native_a540_panel_diag[112]; }
 /* H629 adds, on top of the indices documented above:
  * [38] watch samples          [39] pixels still holding their block colour
  * [40] blocks fully intact    [41] watch transitions
@@ -380,6 +380,17 @@ extern "C" { volatile uint32_t native_a540_panel_diag[80]; }
  * [74] vc_paint_char calls  [75] vc_clear_screen calls  [76] cursor flips
  * [77] the H630 console control ran  [78] last gc_enable() argument
  * Decay slots 56..62 start each cycle at 0xffffffff, meaning not reached yet. */
+ * H631, for the first block that is still short after the console is off:
+ * [79] block [80] row within it [104] column of the first bad pixel
+ * [81..82] destination byte address [83..84] the 64-byte aligned address sent
+ * [85] pixel shift that alignment forced [86] surface row the blit was told to read
+ * [87..88] bad-pixel count for each of the eight rows, eight bits per row
+ * [89..90] how many bad pixels hold each block's own colour
+ * [91] bad pixels holding some other block's colour  [92] holding anything else
+ * [93..94] first such value and its panel dword  [95..96] the second pair
+ * [97] bad pixels in the first bad row
+ * [98..100] the surface words the blit reads for that row at x 0, firstX, 63
+ * [101..103] what the panel holds at those same three places */
 namespace A5xxBlit {
 constexpr uint32_t CpSetRenderMode = 0x6cu;
 constexpr uint32_t CpBlit          = 0x2cu;
@@ -2409,6 +2420,91 @@ extern "C" void native_a540_hb_panel_selftest(void) {
     }
     native_a540_panel_diag[36] = finalOk;
     native_a540_panel_diag[37] = finalTotal;
+
+    /* H631: with the console off, the only block still short is the one the same
+     * offset has named since H623. Everything about it is now our own geometry,
+     * so record the row that fails, the addresses the hardware was given for it,
+     * how the shortfall splits across the eight rows, which other block's colour
+     * the wrong pixels actually hold, and - the decisive one - what the surface
+     * pixel that should have been copied there contains. If the surface holds the
+     * right colour and the panel does not, the blit is wrong; if both are wrong,
+     * the surface step is. */
+    {
+        for (unsigned r = 0; r < kRectCount; ++r) {
+            if (finalOk & (1u << r))
+                continue;   /* this block is fully intact */
+            unsigned rowBad[kPatHeight] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            unsigned colourOf[kRectCount] = { 0, 0, 0, 0, 0, 0 };
+            unsigned firstY = 0, firstX = 0, otherColour = 0, odd = 0;
+            uint32_t oddValue = 0, oddOffset = 0xffffffffu, oddValue2 = 0, oddOffset2 = 0xffffffffu;
+            bool haveFirst = false;
+            for (unsigned y = 0; y < kPatHeight; ++y) {
+                const uint64_t rowWords = ((uint64_t)(kRectY[r] + y) * rowBytes) / 4u;
+                for (unsigned x = 0; x < kPatWidth; ++x) {
+                    const uint64_t index = rowWords + kRectX[r] + x;
+                    const uint32_t seen = panel[index];
+                    if (seen == kRectColor[r])
+                        continue;
+                    ++rowBad[y];
+                    bool known = false;
+                    for (unsigned j = 0; j < kRectCount; ++j) {
+                        if (seen == kRectColor[j]) { ++colourOf[j]; known = true; break; }
+                    }
+                    if (!known) {
+                        ++odd;
+                        if (oddOffset == 0xffffffffu) { oddOffset = (uint32_t)index; oddValue = seen; }
+                        else if (oddOffset2 == 0xffffffffu) { oddOffset2 = (uint32_t)index; oddValue2 = seen; }
+                    }
+                    if (!haveFirst) { haveFirst = true; firstY = y; firstX = x; }
+                }
+            }
+            otherColour = 0;
+            for (unsigned j = 0; j < kRectCount; ++j)
+                if (j != r) otherColour += colourOf[j];
+
+            const uint64_t dstByte = kPanelIova
+                + (uint64_t)(kRectY[r] + firstY) * rowBytes + (uint64_t)kRectX[r] * 4u;
+            const uint64_t dstAligned = dstByte & ~UINT64_C(63);
+            const uint32_t srcRow = kTileY[r] + firstY;
+
+            native_a540_panel_diag[79] = r;
+            native_a540_panel_diag[80] = firstY;
+            native_a540_panel_diag[104] = firstX;
+            native_a540_panel_diag[81] = (uint32_t)(dstByte & 0xffffffffu);
+            native_a540_panel_diag[82] = (uint32_t)(dstByte >> 32);
+            native_a540_panel_diag[83] = (uint32_t)(dstAligned & 0xffffffffu);
+            native_a540_panel_diag[84] = (uint32_t)(dstAligned >> 32);
+            native_a540_panel_diag[85] = (uint32_t)((dstByte - dstAligned) / 4u);
+            native_a540_panel_diag[86] = srcRow;
+            native_a540_panel_diag[87] = (rowBad[0] & 0xffu) | ((rowBad[1] & 0xffu) << 8)
+                | ((rowBad[2] & 0xffu) << 16) | ((rowBad[3] & 0xffu) << 24);
+            native_a540_panel_diag[88] = (rowBad[4] & 0xffu) | ((rowBad[5] & 0xffu) << 8)
+                | ((rowBad[6] & 0xffu) << 16) | ((rowBad[7] & 0xffu) << 24);
+            native_a540_panel_diag[89] = (colourOf[0] & 0xffu) | ((colourOf[1] & 0xffu) << 8)
+                | ((colourOf[2] & 0xffu) << 16);
+            native_a540_panel_diag[90] = (colourOf[3] & 0xffu) | ((colourOf[4] & 0xffu) << 8)
+                | ((colourOf[5] & 0xffu) << 16);
+            native_a540_panel_diag[91] = otherColour;
+            native_a540_panel_diag[92] = odd;
+            native_a540_panel_diag[93] = oddValue;
+            native_a540_panel_diag[94] = oddOffset;
+            native_a540_panel_diag[95] = oddValue2;
+            native_a540_panel_diag[96] = oddOffset2;
+            native_a540_panel_diag[97] = rowBad[firstY];
+            /* The surface words the blit was told to read for this panel row. */
+            native_a540_panel_diag[98] = surface[(uint32_t)srcRow * surfaceWords + 16u];
+            native_a540_panel_diag[99] = surface[(uint32_t)srcRow * surfaceWords + 16u + firstX];
+            native_a540_panel_diag[100] = surface[(uint32_t)srcRow * surfaceWords + 16u + kPatWidth - 1u];
+            /* What the panel holds at the same three places. */
+            native_a540_panel_diag[101] = panel[((uint64_t)(kRectY[r] + firstY) * rowBytes) / 4u
+                + kRectX[r]];
+            native_a540_panel_diag[102] = panel[((uint64_t)(kRectY[r] + firstY) * rowBytes) / 4u
+                + kRectX[r] + firstX];
+            native_a540_panel_diag[103] = panel[((uint64_t)(kRectY[r] + firstY) * rowBytes) / 4u
+                + kRectX[r] + kPatWidth - 1u];
+            break;
+        }
+    }
     /* H630: start a fresh decay row. H629 left the previous cycle's later
      * offsets in these slots, so a printed row could mix two writes. */
     for (unsigned i = 56; i <= 62; ++i)
