@@ -2123,7 +2123,11 @@ extern "C" void native_a540_hb_panel_selftest(void) {
         static_cast<char *>(c.surfSrc.cpu) + kPanelSrcOffset);
     volatile uint32_t *ib = reinterpret_cast<volatile uint32_t *>(c.bo[2].cpu);
     const uint64_t srcIova = kSurfSrcIova + kPanelSrcOffset;
-    const uint64_t panelBase = c.panelPhys;
+    /* H619: the CP addresses the destination through the GPU page table, so the
+     * blit must use the IOVA the panel was mapped at, not its physical address.
+     * H618 used c.panelPhys here and the SMMU faulted at 0x9d4d3000, which is
+     * panelPhys plus 200*4320 + 64*4, exactly the first destination pixel. */
+    const uint64_t panelBase = kPanelIova;
     const uint32_t rowBytes = c.panelRowBytes;
     static const uint32_t probeX[4] = { kPanelOriginX - 1u, kPanelOriginX + kPatWidth,
                                         kPanelOriginX - 1u, kPanelOriginX + kPatWidth };
@@ -2192,7 +2196,7 @@ extern "C" void native_a540_hb_panel_selftest(void) {
 
     /* The panel is device memory mapped uncached, so these reads reach the same
      * place the GPU wrote and need no cache maintenance either way. */
-    volatile uint32_t *panel = c.panelWindow.base;
+    volatile uint32_t *panel = c.panelWindow.base;   /* CPU view stays physical */
     unsigned matched = 0;
     unsigned firstBad = 0xffffffffu;
     for (unsigned y = 0; y < kPatHeight; ++y) {
