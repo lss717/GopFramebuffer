@@ -84,7 +84,10 @@ constexpr uint64_t kSurfBytes      = kSurfPlane0 + kSurfPlane1;
 constexpr uint32_t kPatWidth       = 64u;
 constexpr uint32_t kPatHeight      = 8u;
 constexpr uint32_t kPatRowBytes    = kPatWidth * 4u;
-constexpr uint32_t kDstOriginX     = 1u;
+constexpr uint32_t kDstOriginX     = 16u;   /* H614: 16 RGBA8 pixels = 64 bytes, so the
+                                              * destination start address satisfies the
+                                              * 64-byte alignment rule Mesa states in
+                                              * emit_blit_buffer. H612 and H613 used 1. */
 constexpr uint32_t kDstOriginY     = 3u;
 #define kIbIova  (kBoBase)
 #define kTgtIova (kBoBase + kBoPage)
