@@ -1894,7 +1894,9 @@ extern "C" void native_a540_hb_surface_selftest(void) {
     ib[w++] = SurfRgba8Linear;
     ib[w++] = static_cast<uint32_t>(kSurfSrcIova);
     ib[w++] = 0u;
-    ib[w++] = (kPatRowBytes >> 6) | ((128u >> 6) << 16);
+    /* H615: the pattern image layer stride is kPatRowBytes * kPatHeight, not the
+     * 128 bytes the H612 through H614 runs borrowed from the buffer path. */
+    ib[w++] = (kPatRowBytes >> 6) | (((kPatRowBytes * kPatHeight) >> 6) << 16);
     for (unsigned i = 0; i < 5; ++i)
         ib[w++] = 0;
     ib[w++] = type4(Gras2dSrcInfo, 1);
