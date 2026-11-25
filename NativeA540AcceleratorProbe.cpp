@@ -308,6 +308,30 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
             native_a540_abi_reports = native_a540_abi_reports + 1;
             return kIOReturnSuccess;
         }
+        case NativeAdrenoMethodGetMetadata: {
+            /* H648: the ABI declares GetMetadata but this switch never implemented it, so it fell
+             * through to kIOReturnUnsupported. SetMetadata already keeps the last text in
+             * native_a540_abi_report, and the desktop context id has to travel from SpringBoard to
+             * the render server inside one boot before the cross-process control can be run at
+             * all, so the symmetric read is what makes that possible. It returns exactly what
+             * SetMetadata stored and nothing else, and reports the stored length so a caller can
+             * tell an empty slot from a value. */
+            if (!arguments->structureOutput ||
+                arguments->structureOutputSize < sizeof(NativeAdrenoAbiMetadata))
+                return kIOReturnBadArgument;
+            NativeAdrenoAbiMetadata meta = {};
+            size_t stored = 0;
+            while (stored < NativeAdrenoAbiMetadataBytes &&
+                   native_a540_abi_report[stored] != 0) {
+                ++stored;
+            }
+            meta.handle = (uint64_t) native_a540_abi_reports;
+            meta.bytes = (uint32_t) stored;
+            for (size_t i = 0; i < stored; ++i) {
+                meta.text[i] = native_a540_abi_report[i];
+            }
+            return accelCopyOut(arguments, &meta, sizeof meta);
+        }
         default:
             return kIOReturnUnsupported;
     }
