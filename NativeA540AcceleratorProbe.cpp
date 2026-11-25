@@ -275,7 +275,7 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
                 unsigned long long pidv = 0, ctx = 0, port = 0;
                 if (pp != nullptr && cp != nullptr && np != nullptr &&
                     h680ScanDec(pp + 5, end, &pidv) &&
-                    h680ScanHex(cp + 11, end, &ctx) &&
+                    h680ScanHex(cp + 9, end, &ctx) &&
                     h680ScanHex(np + 8, end, &port)) {
                     native_render_report_ctxport((int) pidv, ctx,
                         (unsigned) port);
