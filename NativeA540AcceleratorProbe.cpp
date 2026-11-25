@@ -34,6 +34,62 @@ extern "C" void *native_a540_bo_descriptor(unsigned slot);
 extern "C" int native_a540_submit_bo(unsigned slot, unsigned words, uint64_t *fence);
 extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns);
 
+/* H680: observer-reported desktop context render-port binding.
+ * native_render_report_ctxport lives in osfmk/kern/task.c
+ * (patches/xnu/native-render-ipc.patch). */
+extern "C" void native_render_report_ctxport(int pid,
+    unsigned long long ctxid, unsigned name);
+
+static const char *
+h680Find(const char *p, const char *end, const char *token)
+{
+    unsigned len = 0;
+    while (token[len]) ++len;
+    while (p + len <= end) {
+        unsigned i = 0;
+        while (i < len && p[i] == token[i]) ++i;
+        if (i == len) return p;
+        ++p;
+    }
+    return nullptr;
+}
+
+static bool
+h680ScanDec(const char *p, const char *end, unsigned long long *out)
+{
+    unsigned long long v = 0;
+    unsigned digits = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        v = v * 10 + (unsigned long long) (*p - '0');
+        ++digits;
+        ++p;
+    }
+    if (!digits) return false;
+    *out = v;
+    return true;
+}
+
+static bool
+h680ScanHex(const char *p, const char *end, unsigned long long *out)
+{
+    unsigned long long v = 0;
+    unsigned digits = 0;
+    while (p < end) {
+        unsigned d;
+        if (*p >= '0' && *p <= '9') d = (unsigned) (*p - '0');
+        else if (*p >= 'a' && *p <= 'f') d = (unsigned) (*p - 'a' + 10);
+        else break;
+        v = (v << 4) | d;
+        ++digits;
+        ++p;
+        if (digits > 16) return false;
+    }
+    if (!digits) return false;
+    *out = v;
+    return true;
+}
+
+
 extern "C" volatile int native_a540_abi_calls;
 extern "C" volatile int native_a540_abi_last_method;
 extern "C" volatile int native_a540_abi_reports;
@@ -209,6 +265,22 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
             text[n] = 0;
             for (uint32_t i = 0; i < n; ++i)
                 if (text[i] == '\n' || text[i] == '\r') text[i] = ' ';
+            /* H680: bind the kernel render probe from this line,
+             * independently of the 1200-line console quota. */
+            if (n >= 22 && memcmp(text, "event=h680_render_port", 22) == 0) {
+                const char *end = text + n;
+                const char *pp = h680Find(text, end, " pid=");
+                const char *cp = h680Find(text, end, " ctxid=0x");
+                const char *np = h680Find(text, end, " port=0x");
+                unsigned long long pidv = 0, ctx = 0, port = 0;
+                if (pp != nullptr && cp != nullptr && np != nullptr &&
+                    h680ScanDec(pp + 5, end, &pidv) &&
+                    h680ScanHex(cp + 11, end, &ctx) &&
+                    h680ScanHex(np + 8, end, &port)) {
+                    native_render_report_ctxport((int) pidv, ctx,
+                        (unsigned) port);
+                }
+            }
             static unsigned logged;
             if (logged < 1200) { ++logged; IOLog("NATIVE_MTL: %s\n", text); }
             return kIOReturnSuccess;
