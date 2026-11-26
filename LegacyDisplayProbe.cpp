@@ -146,6 +146,38 @@ void native_legacy_pm_observed(unsigned stage,IOReturn status,unsigned long ordi
     native_legacy_pm_calls=native_legacy_pm_calls+1;
     if(stage==3)native_legacy_pm_callbacks=native_legacy_pm_callbacks+1;
 }
+/* H708: producer attribution for accepted swaps (STATUS 416). The checkpoint
+ * runs on the client thread that called the swap selector, so current_thread
+ * and current_proc there ARE the submitter, alive and legal to read. Keep a
+ * bounded per-thread histogram: the first four accepted swaps still print the
+ * full request dump, and every distinct submitter thread gets one description
+ * line in the 300 s heartbeat dump no matter how many frames it sends. */
+struct AcceptThreadStat {
+    uintptr_t thread;uint64_t tid;int pid;uint32_t resolved;char comm[20];
+    uint64_t count,first_us,last_us;
+};
+static AcceptThreadStat acceptThreads[4];
+static uint64_t acceptThreadOverflow;
+static void acceptThreadObserved(struct thread *kt) {
+    if(!kt)return;
+    const uintptr_t tp=reinterpret_cast<uintptr_t>(kt);
+    const uint64_t now=probeNowUs();
+    for(unsigned i=0;i<4;++i) {
+        if(acceptThreads[i].thread==tp) {++acceptThreads[i].count;acceptThreads[i].last_us=now;return;}
+    }
+    for(unsigned i=0;i<4;++i) {
+        if(acceptThreads[i].thread)continue;
+        AcceptThreadStat &a=acceptThreads[i];
+        a.thread=tp;a.tid=(uint64_t)thread_tid(kt);a.count=1;a.first_us=now;a.last_us=now;a.resolved=0;a.comm[0]=0;
+        proc_t self=current_proc();
+        int pid=self?proc_pid(self):0;
+        a.pid=pid;
+        if(pid>0) {proc_name(pid,a.comm,sizeof(a.comm));a.comm[sizeof(a.comm)-1]=0;a.resolved=1;}
+        if(!a.resolved)a.comm[0]=45; /* hyphen */
+        return;
+    }
+    ++acceptThreadOverflow;
+}
 __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool accepted,unsigned reason,const void *request,const void *surface) {
     __asm__ volatile("" ::: "memory");
     /* H701 (STATUS 408): an accepted swap was never described anywhere.
@@ -155,7 +187,9 @@ __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool acc
      * IOSurfaceID property.  Runs on the client thread that called the
      * selector, so tid here IS the submitter.  Reads only. */
     static unsigned accDumped;
-    if(!accepted||!request||accDumped>=4)return;
+    if(!accepted||!request)return;
+    acceptThreadObserved(current_thread());
+    if(accDumped>=4)return;
     accDumped++;
     const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
     uint64_t surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));
@@ -171,8 +205,10 @@ __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool acc
      * (class/IOSurfaceID) moves to a place where the object is known
      * live - kickOnce already metaCasts the same surface safely. */
     struct thread *kt=current_thread();
-    IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu kt=%p surface=%p surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
-        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,(void*)kt,(void*)surface,
+    int apid=0;char acomm[20]="-";uint32_t ares=0;
+    for(unsigned i=0;i<4;++i)if(acceptThreads[i].thread==reinterpret_cast<uintptr_t>(kt)) {apid=acceptThreads[i].pid;ares=acceptThreads[i].resolved;if(ares)memcpy(acomm,acceptThreads[i].comm,20);break;}
+    IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu pid=%d comm=%s r=%u kt=%p surface=%p surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
+        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,apid,acomm,ares,(void*)kt,(void*)surface,
         (unsigned long long)surfaces[0],(unsigned long long)surfaces[1],
         (unsigned long long)surfaces[2],(unsigned long long)surfaces[3],
         st[0],st[1],st[2],op[0],op[1],op[2],w,h,
@@ -548,6 +584,11 @@ extern "C" unsigned native_legacy_clients_dump(char *out,unsigned cap) {
         }
         if(n)at+=snprintf(out+at,cap-at,"\n");
     }
+    for(unsigned i=0;i<4&&at+110<cap;++i)if(acceptThreads[i].thread)
+        at+=snprintf(out+at,cap-at,"\n  AT tid=%llu pid=%d r=%u comm=%s cnt=%llu first_us=%llu last_us=%llu",
+            (unsigned long long)acceptThreads[i].tid,acceptThreads[i].pid,acceptThreads[i].resolved,acceptThreads[i].comm,
+            (unsigned long long)acceptThreads[i].count,(unsigned long long)acceptThreads[i].first_us,(unsigned long long)acceptThreads[i].last_us);
+    if(acceptThreadOverflow&&at+48<cap)at+=snprintf(out+at,cap-at,"\n  AT overflow=%llu",(unsigned long long)acceptThreadOverflow);
     return at;
 }
 void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
