@@ -169,8 +169,8 @@ __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool acc
         if(meta)scls=meta->getClassName();
         if(object->metaCast("IOSurface")){
             IORegistryEntry *ent=const_cast<IORegistryEntry *>(static_cast<const IORegistryEntry *>(object));
-            const OSNumber *n=OSDynamicCast(OSNumber,ent->getProperty("IOSurfaceID"),false);
-            if(n)soid=(uint32_t)n->unsigned32BitValue();
+            const OSObject *pid=ent->getProperty("IOSurfaceID");
+            if(pid&&pid->metaCast("OSNumber"))soid=(uint32_t)static_cast<const OSNumber *>(pid)->unsigned32BitValue();
         }}
     struct thread *kt=current_thread();
     IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu kt=%p surface=%p class=%s iosid=%u surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
