@@ -39,6 +39,7 @@ extern "C" int native_a540_wait_fence(uint64_t fence, uint64_t timeout_ns);
  * (patches/xnu/native-render-ipc.patch). */
 extern "C" void native_render_report_ctxport(int pid,
     unsigned long long ctxid, unsigned name);
+extern "C" void native_render_calibration_started(int pid);
 
 static const char *
 h680Find(const char *p, const char *end, const char *token)
@@ -279,6 +280,18 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
                     h680ScanHex(np + 8, end, &port)) {
                     native_render_report_ctxport((int) pidv, ctx,
                         (unsigned) port);
+                }
+            }
+            /* H685: the observer's controlled commit arms the kernel
+             * calibration window; the first client send seen inside it
+             * names the CA transaction port from behavior alone. */
+            if (n >= 27 &&
+                memcmp(text, "event=h685_control_committed", 27) == 0) {
+                const char *cp2 = h680Find(text, text + n, " pid=");
+                unsigned long long cpid = 0;
+                if (cp2 != nullptr &&
+                    h680ScanDec(cp2 + 5, text + n, &cpid)) {
+                    native_render_calibration_started((int) cpid);
                 }
             }
             static unsigned logged;

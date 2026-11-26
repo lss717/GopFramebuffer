@@ -240,6 +240,15 @@ extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
 // properties reported at that rate, and the rate.
 static volatile uint64_t vsyncEvents[6];
 static volatile unsigned vsyncHz;
+extern "C" void native_legacy_vsync_counts(unsigned *hz,
+    unsigned long long *sent, unsigned long long *arms,
+    unsigned long long *idle)
+{
+    *hz = vsyncHz;
+    *sent = (unsigned long long)vsyncEvents[1];
+    *arms = (unsigned long long)vsyncEvents[0];
+    *idle = (unsigned long long)vsyncEvents[2];
+}
 void native_legacy_vsync_observed(unsigned event,unsigned hz) {
     if(event<6)vsyncEvents[event]=vsyncEvents[event]+1;
     vsyncHz=hz;
