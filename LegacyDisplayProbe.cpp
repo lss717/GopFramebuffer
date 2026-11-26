@@ -163,18 +163,16 @@ __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool acc
     for(unsigned i=0;i<3;i++){memcpy(&st[i],bytes+792+i*4,4);memcpy(&op[i],bytes+804+i*4,4);}
     uint32_t w=0,h=0;memcpy(&w,bytes+816,4);memcpy(&h,bytes+820,4);
     uint32_t r0[4]={},r1[4]={};memcpy(r0,bytes+17,16);memcpy(r1,bytes+81,16);
-    uint32_t soid=0;const char *scls="-";
-    if(surface){const OSObject *object=reinterpret_cast<const OSObject *>(surface);
-        const OSMetaClass *meta=object->getMetaClass();
-        if(meta)scls=meta->getClassName();
-        if(object->metaCast("IOSurface")){
-            IORegistryEntry *ent=const_cast<IORegistryEntry *>(static_cast<const IORegistryEntry *>(object));
-            const OSObject *pid=ent->getProperty("IOSurfaceID");
-            if(pid&&pid->metaCast("OSNumber"))soid=(uint32_t)static_cast<const OSNumber *>(pid)->unsigned32BitValue();
-        }}
+    /* H705 (STATUS 413): the surface pointer at validate time is NOT a
+     * safe OSObject to dereference - getMetaClass/metaCast on it produced
+     * an instruction-fetch panic at boot+28 through a wild vtable slot in
+     * H702/703/704 (all three ended at swap validate accepted+58us with
+     * lr inside this function). Print the pointer only; identity
+     * (class/IOSurfaceID) moves to a place where the object is known
+     * live - kickOnce already metaCasts the same surface safely. */
     struct thread *kt=current_thread();
-    IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu kt=%p surface=%p class=%s iosid=%u surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
-        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,(void*)kt,(void*)surface,scls,soid,
+    IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu kt=%p surface=%p surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
+        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,(void*)kt,(void*)surface,
         (unsigned long long)surfaces[0],(unsigned long long)surfaces[1],
         (unsigned long long)surfaces[2],(unsigned long long)surfaces[3],
         st[0],st[1],st[2],op[0],op[1],op[2],w,h,
