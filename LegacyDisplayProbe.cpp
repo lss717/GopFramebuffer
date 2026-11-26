@@ -26,6 +26,7 @@ extern "C" int native_a540_accelerator_probe(void);
 // H116: the UFS probe exports this to force one log flush from the display event
 // path, which still runs after the UFS read path has gone quiet.
 extern "C" void native_log_flush_hook(void) __attribute__((weak_import));
+extern "C" void native_journal_add(unsigned, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, const char *);
 static IOService *pendingLegacyDisplay;
 static IOService *activeGOPPresenter,*activeGOPNub;
 // GPU hand-off presenter (sheng-fb-gpu=1, phase 4): lives beside the display driver, which offers it frames instead of copying them.
@@ -358,7 +359,6 @@ struct ClientStat {
 static ClientStat seenClients[kSeenClients];static unsigned seenClientCount;
 typedef IOReturn (*ExternalFn)(IOUserClient *,uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *);
 typedef IOReturn (*RegisterFn)(IOUserClient *,mach_port_t,UInt32,UInt32);
-extern "C" void native_journal_add(unsigned, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, const char *);
 static ClientStat *statFor(IOUserClient *client) {
     for(unsigned i=0;i<seenClientCount;++i)if(seenClients[i].object==(uintptr_t)client)return &seenClients[i];
     return nullptr;
