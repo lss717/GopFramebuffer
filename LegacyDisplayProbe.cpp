@@ -337,7 +337,7 @@ void native_legacy_client_enter(task_t task,uint32_t type) {
     proc_t proc=task?(proc_t)get_bsdtask_info(task):nullptr;
     int pid=proc?proc_pid(proc):0;
     if(pid)proc_name(pid,native_legacy_client_comm,sizeof(native_legacy_client_comm));
-    IOLog("NATIVE_LEGACY: client enter pid=%d comm=%s type=%u\n",pid,native_legacy_client_comm,type);
+    IOLog("NATIVE_LEGACY: client enter pid=%d comm=%s type=%u\n",pid,native_legacy_client_comm,type);native_journal_add(6,(uint32_t)pid,type,0,0,0,native_legacy_client_comm);
     native_legacy_client_calls=native_legacy_client_calls+1;native_legacy_client_task=(uintptr_t)task;
     native_legacy_client_type=type;native_legacy_client_pid=pid;
     // H116: the display client is open; write the log before the console can be
@@ -358,6 +358,7 @@ struct ClientStat {
 static ClientStat seenClients[kSeenClients];static unsigned seenClientCount;
 typedef IOReturn (*ExternalFn)(IOUserClient *,uint32_t,IOExternalMethodArguments *,IOExternalMethodDispatch *,OSObject *,void *);
 typedef IOReturn (*RegisterFn)(IOUserClient *,mach_port_t,UInt32,UInt32);
+extern "C" void native_journal_add(unsigned, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, const char *);
 static ClientStat *statFor(IOUserClient *client) {
     for(unsigned i=0;i<seenClientCount;++i)if(seenClients[i].object==(uintptr_t)client)return &seenClients[i];
     return nullptr;
@@ -417,6 +418,7 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
         }
         ++stat->calls;if(status)++stat->fails;
         if(selector<kSelectors){++stat->selector_calls[selector];if(status)++stat->selector_fails[selector];stat->selector_status[selector]=(uint32_t)status;}
+        native_journal_add(7,(uint32_t)stat->pid,selector,(uint32_t)status,0,0,nullptr);
         uint32_t seen=selector<kSelectors?stat->selector_calls[selector]:0;
         if(tracedSelector(selector) && seen<=4) {
             uint64_t in0=0,in1=0,in2=0,out0=0,out1=0,out2=0;
