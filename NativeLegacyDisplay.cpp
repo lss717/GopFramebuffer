@@ -781,6 +781,35 @@ public:
                   scan[stride4*(height/2)+width/2],
                   scan[stride4*(height-1)+width-1],
                   scan[stride4*(height/4)+width/4]);
+            /* H701 (STATUS 408): four read-back points cannot describe the
+             * frame (an all-zero quad proves nothing about the rest).  This
+             * samples the SOURCE surface and the scanout at the SAME 64
+             * grid points and reports equality, the first mismatch and the
+             * per-side zero counts: clear-fill vs empty-surface vs
+             * content-present-but-unpresented become separable.  64 device
+             * reads only; no locks, no allocation. */
+            {const volatile uint32_t *src=
+                 reinterpret_cast<const volatile uint32_t *>(source->getVirtualAddress());
+             const uint64_t sstride4=sourceStride/4;
+             uint32_t same=0,diff=0,firstd=0xffffffffu,zs=0,zd=0;
+             uint32_t s0=0,d0=0,sM=0,dM=0,sB=0,dB=0;
+             if(src && sstride4){
+                 for(unsigned sy=0;sy<8;sy++)for(unsigned sx=0;sx<8;sx++){
+                     uint32_t yy=(uint32_t)(((uint64_t)height*(2*sy+1))/16);
+                     uint32_t xx=(width*(2*sx+1))/16;
+                     uint32_t sv=src[(uint64_t)yy*sstride4+xx];
+                     uint32_t dv=scan[(uint64_t)yy*stride4+xx];
+                     if(!sv)zs++;
+                     if(!dv)zd++;
+                     if(sv==dv)same++;
+                     else {diff++;if(firstd==0xffffffffu)firstd=yy*65536u+xx;}
+                     if(sy==0&&sx==0){s0=sv;d0=dv;}
+                     if(sy==4&&sx==4){sM=sv;dM=dv;}
+                     if(sy==7&&sx==7){sB=sv;dB=dv;}
+                 }
+                 IOLog("NATIVE_LEGACY_SAMPLE: same=%u diff=%u first=%u zs=%u zd=%u s0=%08x d0=%08x sM=%08x dM=%08x sB=%08x dB=%08x\n",
+                     same,diff,firstd,zs,zd,s0,d0,sM,dM,sB,dB);
+             }}
         }
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);

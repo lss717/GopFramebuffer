@@ -8,12 +8,16 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSNumber.h>
 #include <kern/task.h>
 #include <sys/proc.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 #include <machine/machine_routines.h>
 extern "C" kmod_info_t g_kernel_kmod_info;
+/* H701: submitting-thread identity for the swap-path records (STATUS 408).
+ * thread_tid is already declared by the in-tree kernel headers (uint64_t). */
+extern "C" struct thread *current_thread(void);
 extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" volatile uint32_t native_boot_flags;
@@ -142,7 +146,40 @@ void native_legacy_pm_observed(unsigned stage,IOReturn status,unsigned long ordi
     native_legacy_pm_calls=native_legacy_pm_calls+1;
     if(stage==3)native_legacy_pm_callbacks=native_legacy_pm_callbacks+1;
 }
-__attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool,unsigned,const void *,const void *) {__asm__ volatile("" ::: "memory");}
+__attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool accepted,unsigned reason,const void *request,const void *surface) {
+    __asm__ volatile("" ::: "memory");
+    /* H701 (STATUS 408): an accepted swap was never described anywhere.
+     * Dump the first four accepted requests with the same offsets the
+     * reject capture uses (surfaces at 2624, state/options at 792/804,
+     * size at 816, rects at 17/81), plus the submitting thread and the
+     * IOSurfaceID property.  Runs on the client thread that called the
+     * selector, so tid here IS the submitter.  Reads only. */
+    static unsigned accDumped;
+    if(!accepted||!request||accDumped>=4)return;
+    accDumped++;
+    const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);
+    uint64_t surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));
+    uint32_t st[3],op[3];
+    for(unsigned i=0;i<3;i++){memcpy(&st[i],bytes+792+i*4,4);memcpy(&op[i],bytes+804+i*4,4);}
+    uint32_t w=0,h=0;memcpy(&w,bytes+816,4);memcpy(&h,bytes+820,4);
+    uint32_t r0[4]={},r1[4]={};memcpy(r0,bytes+17,16);memcpy(r1,bytes+81,16);
+    uint32_t soid=0;const char *scls="-";
+    if(surface){const OSObject *object=reinterpret_cast<const OSObject *>(surface);
+        const OSMetaClass *meta=object->getMetaClass();
+        if(meta)scls=meta->getClassName();
+        if(object->metaCast("IOSurface")){
+            IORegistryEntry *ent=const_cast<IORegistryEntry *>(static_cast<const IORegistryEntry *>(object));
+            const OSNumber *n=OSDynamicCast(OSNumber,ent->getProperty("IOSurfaceID"),false);
+            if(n)soid=(uint32_t)n->unsigned32Value();
+        }}
+    struct thread *kt=current_thread();
+    IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu kt=%p surface=%p class=%s iosid=%u surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
+        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,(void*)kt,surface,scls,(unsigned long long)soid,
+        (unsigned long long)surfaces[0],(unsigned long long)surfaces[1],
+        (unsigned long long)surfaces[2],(unsigned long long)surfaces[3],
+        st[0],st[1],st[2],op[0],op[1],op[2],w,h,
+        r0[0],r0[1],r0[2],r0[3],r1[0],r1[1],r1[2],r1[3]);
+}
 // Last rejected swap request, copied from the original request layout the validator reads (offsets
 // qualified in NativeLegacyDisplay::validateSwap). Observation only; nothing here changes the verdict.
 volatile uint32_t native_legacy_swap_accepted_count,native_legacy_swap_rejected_count,native_legacy_rej_reason;
@@ -299,11 +336,13 @@ void native_legacy_gpu_fallback_observed(int status) {
     native_legacy_gpu_last_status=(uint32_t)status;native_legacy_gpu_fallbacks=native_legacy_gpu_fallbacks+1;
 }
 __attribute__((noinline)) void native_legacy_retirement_observed(IOService *display) {
-    IOLog("NATIVE_LEGACY: retirement observed\n");
     const unsigned char *bytes=reinterpret_cast<const unsigned char *>(display);
     uint64_t current=0,pending=0;uint32_t completed=0,presented=0,frames=0;
     memcpy(&current,bytes+5472,8);memcpy(&pending,bytes+5480,8);
     memcpy(&completed,bytes+5820,4);memcpy(&presented,bytes+5824,4);memcpy(&frames,bytes+252,4);
+    /* H701 (STATUS 408): the generations are read anyway; print them so
+     * "retired but never presented" is visible in the stream itself. */
+    IOLog("NATIVE_LEGACY: retirement observed done=%u presented=%u frames=%u\n",completed,presented,frames);
     native_legacy_retired_current=current;native_legacy_retired_pending=pending;
     native_legacy_retired_generation=completed;native_legacy_presented_generation=presented;native_legacy_retired_frames=frames;
     native_legacy_retirement_calls=native_legacy_retirement_calls+1;
@@ -395,9 +434,11 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
         }
         status=kIOReturnSuccess;
         if(stat) {
-            if(stat->fixups<24)
-                IOLog("NATIVE_LEGACY: client fixup pid=%d selector=%u unsupported->0\n",
-                      stat->pid,selector);
+            if(stat->fixups<24) {
+                struct thread *fx_kt=current_thread();
+                IOLog("NATIVE_LEGACY: client fixup pid=%d tid=%llu selector=%u unsupported->0\n",
+                      stat->pid,fx_kt?(unsigned long long)thread_tid(fx_kt):0ULL,selector);
+            }
             ++stat->fixups;
         }
     }
@@ -433,8 +474,9 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
                 if(outc>1)out1=args->scalarOutput[1];
                 if(outc>2)out2=args->scalarOutput[2];
             }
-            IOLog("NATIVE_LEGACY: client io pid=%d selector=%u status=%x in=%llx,%llx,%llx ni=%u out=%llx,%llx,%llx no=%u struct=%llu\n",
-                  stat->pid,selector,(unsigned)status,
+            struct thread *io_kt=current_thread();
+            IOLog("NATIVE_LEGACY: client io pid=%d tid=%llu kt=%p selector=%u status=%x in=%llx,%llx,%llx ni=%u out=%llx,%llx,%llx no=%u struct=%llu\n",
+                  stat->pid,io_kt?(unsigned long long)thread_tid(io_kt):0ULL,(void*)io_kt,selector,(unsigned)status,
                   (unsigned long long)in0,(unsigned long long)in1,(unsigned long long)in2,(unsigned)inc,
                   (unsigned long long)out0,(unsigned long long)out1,(unsigned long long)out2,(unsigned)outc,
                   args?(unsigned long long)args->structureOutputSize:0ULL);
