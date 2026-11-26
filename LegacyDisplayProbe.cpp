@@ -174,7 +174,7 @@ __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool acc
         }}
     struct thread *kt=current_thread();
     IOLog("NATIVE_LEGACY: accept dump n=%u tid=%llu kt=%p surface=%p class=%s iosid=%u surfs=%llx,%llx,%llx,%llx st=%u,%u,%u op=%u,%u,%u size=%ux%u r0=%u,%u,%u,%u r1=%u,%u,%u,%u\n",
-        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,(void*)kt,surface,scls,(unsigned long long)soid,
+        accDumped,kt?(unsigned long long)thread_tid(kt):0ULL,(void*)kt,surface,scls,soid,
         (unsigned long long)surfaces[0],(unsigned long long)surfaces[1],
         (unsigned long long)surfaces[2],(unsigned long long)surfaces[3],
         st[0],st[1],st[2],op[0],op[1],op[2],w,h,
