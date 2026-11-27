@@ -170,6 +170,7 @@ struct SurfaceReg {
     int spid;uint64_t stid;char comm[20];uint32_t who;
     uint32_t w,h,fmt,planes,dims;
     uint32_t scans,nz_scans;
+    uint32_t v9c;
 };
 static SurfaceReg surfaceRegs[16];static uint64_t surfaceRegOverflow;
 static SurfaceReg *surfaceRegSlot(uintptr_t ptr,bool create) {
@@ -201,12 +202,12 @@ static void acceptSurfaceObserved(uintptr_t ptr) {
             (void*)ptr,pid,r->comm,(unsigned long long)r->stid,(unsigned long long)r->first_us);
     }
 }
-extern "C" void native_legacy_surface_record(uintptr_t ptr,uint32_t w,uint32_t h,uint32_t fmt,uint32_t planes) {
+extern "C" void native_legacy_surface_record(uintptr_t ptr,uint32_t w,uint32_t h,uint32_t fmt,uint32_t planes,uint32_t v9c) {
     SurfaceReg *r=surfaceRegSlot(ptr,true);
     if(!r||r->dims)return;
-    r->dims=1;r->w=w;r->h=h;r->fmt=fmt;r->planes=planes;
-    IOLog("NATIVE_SURF: dims ptr=%p %ux%u fmt=%u planes=%u submits=%u\n",
-        (void*)ptr,w,h,fmt,planes,r->submits);
+    r->dims=1;r->w=w;r->h=h;r->fmt=fmt;r->planes=planes;r->v9c=v9c;
+    IOLog("NATIVE_SURF: dims ptr=%p %ux%u fmt=%u planes=%u submits=%u id9c=0x%x\n",
+        (void*)ptr,w,h,fmt,planes,r->submits,r->v9c);
 }
 extern "C" void native_legacy_surface_scan(uintptr_t ptr,uint32_t zs,uint32_t total,uint32_t first_nz_yx) {
     SurfaceReg *r=surfaceRegSlot(ptr,true);
@@ -214,8 +215,8 @@ extern "C" void native_legacy_surface_scan(uintptr_t ptr,uint32_t zs,uint32_t to
     ++r->scans;
     if(zs<total) {
         ++r->nz_scans;
-        if(r->nz_scans==1)IOLog("NATIVE_SURF: content ptr=%p nz=%u/%u first_yx=%ux%u scans=%u\n",
-            (void*)ptr,total-zs,total,first_nz_yx>>16,first_nz_yx&0xffffu,r->scans);
+        if(r->nz_scans==1)IOLog("NATIVE_SURF: content ptr=%p nz=%u/%u first_yx=%ux%u scans=%u id9c=0x%x\n",
+            (void*)ptr,total-zs,total,first_nz_yx>>16,first_nz_yx&0xffffu,r->scans,r->v9c);
     }
 }
 static void acceptThreadObserved(struct thread *kt) {
@@ -345,6 +346,8 @@ void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *
 // and retired. Times are microseconds since boot; the last 64 are kept.
 struct SwapEvent {uint64_t submitted,offered,done;uint32_t number;};
 static SwapEvent swapEvents[64];static uint32_t swapEventCount;
+extern "C" unsigned native_legacy_swap_seq(void){return swapEventCount;}
+extern "C" uint64_t native_legacy_probe_now_us(void){return probeNowUs();}
 extern "C" void native_legacy_swap_stage(unsigned stage) {
     const uint64_t now=probeNowUs();
     uint32_t total=swapEventCount;

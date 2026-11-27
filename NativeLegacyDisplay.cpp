@@ -28,7 +28,10 @@ extern "C" uint64_t native_legacy_surface_stride(OSObject *),native_legacy_surfa
 extern "C" uint32_t native_legacy_surface_format(OSObject *),native_legacy_surface_planes(OSObject *);
 extern "C" void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy);
 extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *counts,uint64_t other);
-extern "C" void native_legacy_surface_record(uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t);
+extern "C" void native_legacy_surface_record(uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+extern "C" uint32_t native_legacy_surface_id(OSObject *);
+extern "C" uint64_t native_legacy_probe_now_us(void);
+extern "C" unsigned native_legacy_swap_seq(void);
 extern "C" void native_legacy_surface_scan(uintptr_t,uint32_t,uint32_t,uint32_t);
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
 // Color-status panel inputs. These are diagnostics only; the panel is drawn
@@ -646,6 +649,9 @@ public:
         // synchronous CPU surfaces, with no GPU or display fence fabricated.
         OSObject *surface=nullptr;
         memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+2624,sizeof(surface));
+        {const bool blankNow=(surface==nullptr);
+         static bool prevBlank=true;
+         if(blankNow!=prevBlank){prevBlank=blankNow;IOLog("NATIVE_LEGACY: PATH seq=%u has_surface=%u at_us=%llu\n",native_legacy_swap_seq(),blankNow?0u:1u,(unsigned long long)native_legacy_probe_now_us());}}
         if(!surface) {
             panelEnter(2);
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
@@ -815,7 +821,9 @@ public:
                  native_legacy_surface_scan(reinterpret_cast<uintptr_t>(surface),zs,256u,fnz);
              }}
         }
-        native_legacy_surface_record(reinterpret_cast<uintptr_t>(surface), (uint32_t)native_legacy_surface_width(surface), (uint32_t)native_legacy_surface_height(surface), sourceFormat, native_legacy_surface_planes(surface));
+                {uint32_t sid=native_legacy_surface_id(surface);
+                native_legacy_surface_record(reinterpret_cast<uintptr_t>(surface), (uint32_t)native_legacy_surface_width(surface), (uint32_t)native_legacy_surface_height(surface), sourceFormat, native_legacy_surface_planes(surface), sid);
+                }
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
