@@ -158,6 +158,66 @@ struct AcceptThreadStat {
 };
 static AcceptThreadStat acceptThreads[4];
 static uint64_t acceptThreadOverflow;
+/* H711 (STATUS 420): per-surface registry for the pixel-provenance question.
+ * Keys are POINTER VALUES only, captured on legal threads: the accept
+ * checkpoint runs on the submitting client thread (pid/comm via current_proc
+ * there); dims and scan outcomes are filled from kickOnce where metaCast has
+ * proven the object live. Nothing is dereferenced at validate time (H705).
+ * One line per new entry, per dims fill and per first content sighting;
+ * 16-entry bound, overflow counted. */
+struct SurfaceReg {
+    uintptr_t ptr;uint64_t first_us,last_us;uint32_t submits;
+    int spid;uint64_t stid;char comm[20];uint32_t who;
+    uint32_t w,h,fmt,planes,dims;
+    uint32_t scans,nz_scans;
+};
+static SurfaceReg surfaceRegs[16];static uint64_t surfaceRegOverflow;
+static SurfaceReg *surfaceRegSlot(uintptr_t ptr,bool create) {
+    for(unsigned i=0;i<16;++i)if(surfaceRegs[i].ptr==ptr&&ptr)return &surfaceRegs[i];
+    if(!create)return nullptr;
+    for(unsigned i=0;i<16;++i)if(!surfaceRegs[i].ptr) {
+        SurfaceReg &r=surfaceRegs[i];
+        r.ptr=ptr;r.first_us=probeNowUs();r.last_us=r.first_us;r.submits=1;
+        r.spid=0;r.stid=0;r.who=0;r.dims=0;r.scans=0;r.nz_scans=0;r.comm[0]=0;
+        return &r;
+    }
+    ++surfaceRegOverflow;return nullptr;
+}
+static void acceptSurfaceObserved(uintptr_t ptr) {
+    if(!ptr)return;   // validated blank swap: no surface by design
+    SurfaceReg *ex=surfaceRegSlot(ptr,false);
+    if(ex){++ex->submits;ex->last_us=probeNowUs();return;}
+    SurfaceReg *r=surfaceRegSlot(ptr,true);
+    if(!r)return;
+    if(!r->who) {
+        proc_t self=current_proc();
+        int pid=self?proc_pid(self):0;
+        r->who=1;r->spid=pid;
+        struct thread *kt=current_thread();
+        r->stid=kt?(uint64_t)thread_tid(kt):0ULL;
+        if(pid>0)proc_name(pid,r->comm,sizeof(r->comm));
+        r->comm[sizeof(r->comm)-1]=0;
+        IOLog("NATIVE_SURF: new ptr=%p pid=%d comm=%s tid=%llu first_us=%llu\n",
+            (void*)ptr,pid,r->comm,(unsigned long long)r->stid,(unsigned long long)r->first_us);
+    }
+}
+extern "C" void native_legacy_surface_record(uintptr_t ptr,uint32_t w,uint32_t h,uint32_t fmt,uint32_t planes) {
+    SurfaceReg *r=surfaceRegSlot(ptr,true);
+    if(!r||r->dims)return;
+    r->dims=1;r->w=w;r->h=h;r->fmt=fmt;r->planes=planes;
+    IOLog("NATIVE_SURF: dims ptr=%p %ux%u fmt=%u planes=%u submits=%u\n",
+        (void*)ptr,w,h,fmt,planes,r->submits);
+}
+extern "C" void native_legacy_surface_scan(uintptr_t ptr,uint32_t zs,uint32_t total,uint32_t first_nz_yx) {
+    SurfaceReg *r=surfaceRegSlot(ptr,true);
+    if(!r)return;
+    ++r->scans;
+    if(zs<total) {
+        ++r->nz_scans;
+        if(r->nz_scans==1)IOLog("NATIVE_SURF: content ptr=%p nz=%u/%u first_yx=%ux%u scans=%u\n",
+            (void*)ptr,total-zs,total,first_nz_yx>>16,first_nz_yx&0xffffu,r->scans);
+    }
+}
 static void acceptThreadObserved(struct thread *kt) {
     if(!kt)return;
     const uintptr_t tp=reinterpret_cast<uintptr_t>(kt);
@@ -174,6 +234,7 @@ static void acceptThreadObserved(struct thread *kt) {
         a.pid=pid;
         if(pid>0) {proc_name(pid,a.comm,sizeof(a.comm));a.comm[sizeof(a.comm)-1]=0;a.resolved=1;}
         if(!a.resolved)a.comm[0]=45; /* hyphen */
+        IOLog("NATIVE_LEGACY: AT tid=%llu pid=%d r=%u comm=%s first_us=%llu\n",(unsigned long long)a.tid,a.pid,a.resolved,a.comm,(unsigned long long)a.first_us);
         return;
     }
     ++acceptThreadOverflow;
@@ -189,6 +250,7 @@ __attribute__((noinline)) void native_legacy_swap_validation_checkpoint(bool acc
     static unsigned accDumped;
     if(!accepted||!request)return;
     acceptThreadObserved(current_thread());
+    acceptSurfaceObserved(reinterpret_cast<uintptr_t>(surface));
     if(accDumped>=4)return;
     accDumped++;
     const unsigned char *bytes=reinterpret_cast<const unsigned char *>(request);

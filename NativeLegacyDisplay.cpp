@@ -28,6 +28,8 @@ extern "C" uint64_t native_legacy_surface_stride(OSObject *),native_legacy_surfa
 extern "C" uint32_t native_legacy_surface_format(OSObject *),native_legacy_surface_planes(OSObject *);
 extern "C" void native_legacy_frame_observed(unsigned kind,uint64_t count,uint64_t minx,uint64_t miny,uint64_t maxx,uint64_t maxy);
 extern "C" void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *counts,uint64_t other);
+extern "C" void native_legacy_surface_record(uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t);
+extern "C" void native_legacy_surface_scan(uintptr_t,uint32_t,uint32_t,uint32_t);
 extern "C" void native_legacy_swap_validation_observed(bool,unsigned,const void *,const void *);
 // Color-status panel inputs. These are diagnostics only; the panel is drawn
 // from the UFS heartbeat so it remains visible even when the console scrolls.
@@ -791,26 +793,29 @@ public:
             {const volatile uint32_t *src=
                  reinterpret_cast<const volatile uint32_t *>(source->getVirtualAddress());
              const uint64_t sstride4=sourceStride/4;
-             uint32_t same=0,diff=0,firstd=0xffffffffu,zs=0,zd=0;
+             uint32_t same=0,diff=0,firstd=0xffffffffu,zs=0,zd=0,nz=0,fnz=0;
              uint32_t s0=0,d0=0,sM=0,dM=0,sB=0,dB=0;
              if(src && sstride4){
-                 for(unsigned sy=0;sy<8;sy++)for(unsigned sx=0;sx<8;sx++){
-                     uint32_t yy=(uint32_t)(((uint64_t)height*(2*sy+1))/16);
-                     uint32_t xx=(width*(2*sx+1))/16;
+                 for(unsigned sy=0;sy<16;sy++)for(unsigned sx=0;sx<16;sx++){
+                     uint32_t yy=(uint32_t)(((uint64_t)height*(2*sy+1))/32);
+                     uint32_t xx=(width*(2*sx+1))/32;
                      uint32_t sv=src[(uint64_t)yy*sstride4+xx];
                      uint32_t dv=scan[(uint64_t)yy*stride4+xx];
                      if(!sv)zs++;
+                     else {++nz;if(!fnz)fnz=yy*65536u+xx;}
                      if(!dv)zd++;
                      if(sv==dv)same++;
                      else {diff++;if(firstd==0xffffffffu)firstd=yy*65536u+xx;}
                      if(sy==0&&sx==0){s0=sv;d0=dv;}
-                     if(sy==4&&sx==4){sM=sv;dM=dv;}
-                     if(sy==7&&sx==7){sB=sv;dB=dv;}
+                     if(sy==8&&sx==8){sM=sv;dM=dv;}
+                     if(sy==15&&sx==15){sB=sv;dB=dv;}
                  }
-                 IOLog("NATIVE_LEGACY_SAMPLE: same=%u diff=%u first=%u zs=%u zd=%u s0=%08x d0=%08x sM=%08x dM=%08x sB=%08x dB=%08x\n",
-                     same,diff,firstd,zs,zd,s0,d0,sM,dM,sB,dB);
+                 IOLog("NATIVE_LEGACY_SAMPLE: same=%u diff=%u first=%u zs=%u zd=%u nz=%u fnz=%ux%u s0=%08x d0=%08x sM=%08x dM=%08x sB=%08x dB=%08x\n",
+                     same,diff,firstd,zs,zd,nz,fnz>>16,fnz&0xffffu,s0,d0,sM,dM,sB,dB);
+                 native_legacy_surface_scan(reinterpret_cast<uintptr_t>(surface),zs,256u,fnz);
              }}
         }
+        native_legacy_surface_record(reinterpret_cast<uintptr_t>(surface), (uint32_t)native_legacy_surface_width(surface), (uint32_t)native_legacy_surface_height(surface), sourceFormat, native_legacy_surface_planes(surface));
         OSSafeReleaseNULL(source);transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
