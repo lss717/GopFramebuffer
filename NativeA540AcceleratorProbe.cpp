@@ -294,8 +294,33 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector, IOExternalMethod
                     native_render_calibration_started((int) cpid);
                 }
             }
-            static unsigned logged;
-            if (logged < 1200) { ++logged; IOLog("NATIVE_MTL: %s\n", text); }
+            /* H716: shared quota 1200->20000 with a readable drop counter.
+             * PID-tagged heartbeats, observer-load markers and h578/h593 arm
+             * rows keep dedicated quotas so they stay printable after the
+             * shared budget ends (STATUS 426: the 1200-line silent drop made
+             * the periodic loop look hung). */
+            static unsigned logged, dropped, txLines, loadLines, armLines;
+            bool prio = false;
+            if (n >= 19 && memcmp(text, "event=h714_tx_state", 19) == 0) {
+                if (txLines < 4000) { ++txLines; IOLog("NATIVE_MTL: %s\n", text); }
+                prio = true;
+            } else if (n >= 13 && memcmp(text, "observer load", 13) == 0) {
+                if (loadLines < 512) { ++loadLines; IOLog("NATIVE_MTL: %s\n", text); }
+                prio = true;
+            } else if ((n >= 11 && memcmp(text, "event=h578_", 11) == 0) ||
+                       (n >= 23 && memcmp(text, "event=h593_signal_hooks", 23) == 0)) {
+                if (armLines < 2048) { ++armLines; IOLog("NATIVE_MTL: %s\n", text); }
+                prio = true;
+            }
+            if (!prio) {
+                if (logged < 20000) { ++logged; IOLog("NATIVE_MTL: %s\n", text); }
+                else {
+                    ++dropped;
+                    if ((dropped & 0x3ff) == 1)
+                        IOLog("NATIVE_MTL_BUDGET: logged=%u dropped=%u tx=%u load=%u arm=%u\n",
+                              logged, dropped, txLines, loadLines, armLines);
+                }
+            }
             return kIOReturnSuccess;
         }
         case NativeAdrenoMethodBoAlloc: {
