@@ -397,7 +397,12 @@ extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
         (unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[3],(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[5]);
 }
 void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *request,const void *surface) {
-    IOLog("NATIVE_LEGACY: swap validate accepted=%d reason=%u\n",accepted,reason);
+    /* H722: attribute the swap submitter. The validation runs on the submitting
+     * client thread (the accept-dump note above), so current_proc here names
+     * who handed each frame, including the surface-less reason=5 accepts. */
+    proc_t caller=current_proc();int cpid=caller?proc_pid(caller):0;char ccomm[24]="?";
+    if(cpid>0){proc_name(cpid,ccomm,sizeof ccomm);ccomm[sizeof(ccomm)-1]=0;}
+    IOLog("NATIVE_LEGACY: swap validate accepted=%d reason=%u pid=%d comm=%s\n",accepted,reason,cpid,ccomm);
     if(accepted)native_legacy_swap_stage(0);
     if(accepted)native_legacy_swap_accepted_count=native_legacy_swap_accepted_count+1;
     else {native_legacy_swap_rejected_count=native_legacy_swap_rejected_count+1;recordRejectedSwap(reason,request,surface);}
@@ -442,6 +447,12 @@ __attribute__((noinline)) void native_legacy_retirement_observed(IOService *disp
     /* H701 (STATUS 408): the generations are read anyway; print them so
      * "retired but never presented" is visible in the stream itself. */
     IOLog("NATIVE_LEGACY: retirement observed done=%u presented=%u frames=%u\n",completed,presented,frames);
+    /* H722: vsync tick audit. arms/sent/idle are the refresh-timer event
+     * counters (LegacyDisplayProbe); arms stays 0 while no client registered
+     * via selector 72, independent of the sheng-vsync boot arg. */
+    if(completed%600==0){unsigned hz=0;unsigned long long sent=0,arms=0,idle=0;
+        native_legacy_vsync_counts(&hz,&sent,&arms,&idle);
+        IOLog("NATIVE_LEGACY: vsync hz=%u arms=%llu sent=%llu idle=%llu at=%u\n",hz,arms,sent,idle,completed);}
     native_legacy_retired_current=current;native_legacy_retired_pending=pending;
     native_legacy_retired_generation=completed;native_legacy_presented_generation=presented;native_legacy_retired_frames=frames;
     native_legacy_retirement_calls=native_legacy_retirement_calls+1;
