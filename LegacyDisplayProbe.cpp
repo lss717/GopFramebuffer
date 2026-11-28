@@ -396,13 +396,24 @@ extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
         (unsigned long long)(native_legacy_prepare_wait_us/1000),vsyncHz,(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[0],
         (unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[3],(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[5]);
 }
+/* H729 (STATUS 451): join key between the swap submit path and the CA
+ * context-request traffic. task.c's bound-port journal records the most
+ * recent 0x9d0a(132B) SEND and its matching DELIVER (serial + event ms) on
+ * the render server port; both counters and the lost counter ride every
+ * validate row so coverage is self-evidenced on the same line. Extern
+ * globals from the kernel proper (same prelinked image). */
+extern "C" volatile unsigned long long native_bnd_9d0a_send_serial;
+extern "C" volatile unsigned long long native_bnd_9d0a_send_ms;
+extern "C" volatile unsigned long long native_bnd_9d0a_deliver_serial;
+extern "C" volatile unsigned long long native_bnd_9d0a_deliver_ms;
+extern "C" volatile unsigned long long native_bnd_lost;
 void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *request,const void *surface) {
     /* H722: attribute the swap submitter. The validation runs on the submitting
      * client thread (the accept-dump note above), so current_proc here names
      * who handed each frame, including the surface-less reason=5 accepts. */
     proc_t caller=current_proc();int cpid=caller?proc_pid(caller):0;char ccomm[24]="?";
     if(cpid>0){proc_name(cpid,ccomm,sizeof ccomm);ccomm[sizeof(ccomm)-1]=0;}
-    IOLog("NATIVE_LEGACY: swap validate accepted=%d reason=%u pid=%d comm=%s\n",accepted,reason,cpid,ccomm);
+    IOLog("NATIVE_LEGACY: swap validate accepted=%d reason=%u pid=%d comm=%s 9d0a s=%llu@%llu d=%llu@%llu lost=%llu\n",accepted,reason,cpid,ccomm,(unsigned long long)native_bnd_9d0a_send_serial,(unsigned long long)native_bnd_9d0a_send_ms,(unsigned long long)native_bnd_9d0a_deliver_serial,(unsigned long long)native_bnd_9d0a_deliver_ms,(unsigned long long)native_bnd_lost);
     if(accepted)native_legacy_swap_stage(0);
     if(accepted)native_legacy_swap_accepted_count=native_legacy_swap_accepted_count+1;
     else {native_legacy_swap_rejected_count=native_legacy_swap_rejected_count+1;recordRejectedSwap(reason,request,surface);}
