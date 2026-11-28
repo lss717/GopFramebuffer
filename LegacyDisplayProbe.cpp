@@ -396,24 +396,31 @@ extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
         (unsigned long long)(native_legacy_prepare_wait_us/1000),vsyncHz,(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[0],
         (unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[3],(unsigned long long)vsyncEvents[4],(unsigned long long)vsyncEvents[5]);
 }
-/* H729 (STATUS 451): join key between the swap submit path and the CA
- * context-request traffic. task.c's bound-port journal records the most
- * recent 0x9d0a(132B) SEND and its matching DELIVER (serial + event ms) on
- * the render server port; both counters and the lost counter ride every
- * validate row so coverage is self-evidenced on the same line. Extern
- * globals from the kernel proper (same prelinked image). */
-extern "C" volatile unsigned long long native_bnd_9d0a_send_serial;
-extern "C" volatile unsigned long long native_bnd_9d0a_send_ms;
-extern "C" volatile unsigned long long native_bnd_9d0a_deliver_serial;
-extern "C" volatile unsigned long long native_bnd_9d0a_deliver_ms;
-extern "C" volatile unsigned long long native_bnd_lost;
+/* H730 (STATUS 453): the H729 join was keyed on the bound render port and
+ * that port only ever showed WidgetRenderer generations, so the key moved to
+ * the runtime-tracked SpringBoard pid: task.c's ctxreq observer records the
+ * destination port object of the newest 0x9d0a(132B) SEND from the tracked
+ * SpringBoard pid, whether that port equals the bound render port at that
+ * instant, and the send/deliver/dequeue stages followed on THAT port. These
+ * volatile globals come from the kernel proper (same prelinked image). */
+extern "C" volatile unsigned long long native_ctxreq_sb_send_seq;
+extern "C" volatile unsigned long long native_ctxreq_sb_send_ms;
+extern "C" volatile unsigned long long native_ctxreq_sb_port;
+extern "C" volatile unsigned long long native_ctxreq_sb_deliver_count;
+extern "C" volatile unsigned long long native_ctxreq_sb_deliver_ms;
+extern "C" volatile unsigned long long native_ctxreq_sb_deliver_tid;
+extern "C" volatile unsigned long long native_ctxreq_sb_dequeue_count;
+extern "C" volatile unsigned long long native_ctxreq_sb_requests;
+extern "C" volatile unsigned long long native_ctxreq_sb_bound_hits;
+extern "C" volatile unsigned long long native_ctxreq_sb_other_ports;
+extern "C" void native_ctxreq_dump(unsigned);
 void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *request,const void *surface) {
     /* H722: attribute the swap submitter. The validation runs on the submitting
      * client thread (the accept-dump note above), so current_proc here names
      * who handed each frame, including the surface-less reason=5 accepts. */
     proc_t caller=current_proc();int cpid=caller?proc_pid(caller):0;char ccomm[24]="?";
     if(cpid>0){proc_name(cpid,ccomm,sizeof ccomm);ccomm[sizeof(ccomm)-1]=0;}
-    IOLog("NATIVE_LEGACY: swap validate accepted=%d reason=%u pid=%d comm=%s 9d0a s=%llu@%llu d=%llu@%llu lost=%llu\n",accepted,reason,cpid,ccomm,(unsigned long long)native_bnd_9d0a_send_serial,(unsigned long long)native_bnd_9d0a_send_ms,(unsigned long long)native_bnd_9d0a_deliver_serial,(unsigned long long)native_bnd_9d0a_deliver_ms,(unsigned long long)native_bnd_lost);
+    IOLog("NATIVE_LEGACY: swap validate accepted=%d reason=%u pid=%d comm=%s sb s=%llu@%llu p=%llx d=%llu@%llu/%llu r=%llu n=%llu/%llu/%llu\n",accepted,reason,cpid,ccomm,(unsigned long long)native_ctxreq_sb_send_seq,(unsigned long long)native_ctxreq_sb_send_ms,(unsigned long long)native_ctxreq_sb_port,(unsigned long long)native_ctxreq_sb_deliver_count,(unsigned long long)native_ctxreq_sb_deliver_ms,(unsigned long long)native_ctxreq_sb_deliver_tid,(unsigned long long)native_ctxreq_sb_dequeue_count,(unsigned long long)native_ctxreq_sb_requests,(unsigned long long)native_ctxreq_sb_bound_hits,(unsigned long long)native_ctxreq_sb_other_ports);
     if(accepted)native_legacy_swap_stage(0);
     if(accepted)native_legacy_swap_accepted_count=native_legacy_swap_accepted_count+1;
     else {native_legacy_swap_rejected_count=native_legacy_swap_rejected_count+1;recordRejectedSwap(reason,request,surface);}
@@ -463,7 +470,8 @@ __attribute__((noinline)) void native_legacy_retirement_observed(IOService *disp
      * via selector 72, independent of the sheng-vsync boot arg. */
     if(completed%600==0){unsigned hz=0;unsigned long long sent=0,arms=0,idle=0;
         native_legacy_vsync_counts(&hz,&sent,&arms,&idle);
-        IOLog("NATIVE_LEGACY: vsync hz=%u arms=%llu sent=%llu idle=%llu at=%u\n",hz,arms,sent,idle,completed);}
+        IOLog("NATIVE_LEGACY: vsync hz=%u arms=%llu sent=%llu idle=%llu at=%u\n",hz,arms,sent,idle,completed);
+        native_ctxreq_dump(completed);}
     native_legacy_retired_current=current;native_legacy_retired_pending=pending;
     native_legacy_retired_generation=completed;native_legacy_presented_generation=presented;native_legacy_retired_frames=frames;
     native_legacy_retirement_calls=native_legacy_retirement_calls+1;
