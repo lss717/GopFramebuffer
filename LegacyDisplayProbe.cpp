@@ -394,14 +394,10 @@ void native_legacy_vsync_observed(unsigned event,unsigned hz) {
     // timer path itself: start once, late and idle rate-limited, ticks on a fixed rate. Three-state
     // accounting: registration lives in the selector-72 arms counter, trigger in these LIVE rows,
     // observation (what the compositor saw) in the existing d0/srv rows elsewhere.
-    if(event==4)IOLog("NATIVE_LEGACY: vsync LIVE start hz=%u arms=%llu
-",hz,(unsigned long long)vsyncEvents[0]);
-    else if(event==1 && vsyncEvents[1]%600==1)IOLog("NATIVE_LEGACY: vsync LIVE tick sent=%llu hz=%u
-",(unsigned long long)vsyncEvents[1],hz);
-    else if(event==2 && vsyncEvents[2]%16==1)IOLog("NATIVE_LEGACY: vsync LIVE idle sent=%llu arms=%llu
-",(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[0]);
-    else if(event==3 && vsyncEvents[3]%100==1)IOLog("NATIVE_LEGACY: vsync LIVE late sent=%llu
-",(unsigned long long)vsyncEvents[1]);
+    if(event==4)IOLog("NATIVE_LEGACY: vsync LIVE start hz=%u arms=%llu"\n",hz,(unsigned long long)vsyncEvents[0]);
+    else if(event==1 && vsyncEvents[1]%600==1)IOLog("NATIVE_LEGACY: vsync LIVE tick sent=%llu hz=%u"\n",(unsigned long long)vsyncEvents[1],hz);
+    else if(event==2 && vsyncEvents[2]%16==1)IOLog("NATIVE_LEGACY: vsync LIVE idle sent=%llu arms=%llu"\n",(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[0]);
+    else if(event==3 && vsyncEvents[3]%100==1)IOLog("NATIVE_LEGACY: vsync LIVE late sent=%llu"\n",(unsigned long long)vsyncEvents[1]);
 }
 extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
     return snprintf(out,cap,"prepare calls=%u failures=%u retried=%u max_attempts=%u waited_ms=%llu vsync hz=%u sent=%llu arms=%llu idle=%llu late=%llu start=%llu refresh=%llu",
