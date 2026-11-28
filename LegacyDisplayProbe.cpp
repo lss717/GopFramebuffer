@@ -590,8 +590,23 @@ static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExterna
                   (unsigned long long)in0,(unsigned long long)in1,(unsigned long long)in2,(unsigned)inc,
                   (unsigned long long)out0,(unsigned long long)out1,(unsigned long long)out2,(unsigned)outc,
                   args?(unsigned long long)args->structureOutputSize:0ULL);
-        } else if(stat->calls<16) {
-            IOLog("NATIVE_LEGACY: client sel pid=%d selector=%u status=%x\n",stat->pid,selector,(unsigned)status);
+        }
+        /* H723 (STATUS 441): the old gating (traced-selector io rows at
+         * seen<=4, short rows only while calls<16) left backboardd's 16-call
+         * sequence unreconstructable. Every call now gets an ordinal seq row
+         * until a 64-call budget per client, and selector 72 (vsync client
+         * registration) always arrives visibly inside its first four calls. */
+        if(selector==72 && seen<=4) {
+            struct thread *a72_kt=current_thread();
+            IOLog("NATIVE_LEGACY: client sel72 arrive pid=%d n=%u tid=%llu status=%x\n",
+                  stat->pid,(unsigned)stat->calls,a72_kt?(unsigned long long)thread_tid(a72_kt):0ULL,(unsigned)status);
+        }
+        if(stat->calls<=64) {
+            struct thread *sq_kt=current_thread();
+            IOLog("NATIVE_LEGACY: client seq pid=%d n=%u tid=%llu selector=%u status=%x\n",
+                  stat->pid,(unsigned)stat->calls,sq_kt?(unsigned long long)thread_tid(sq_kt):0ULL,selector,(unsigned)status);
+        } else if(stat->calls==65) {
+            IOLog("NATIVE_LEGACY: client seq pid=%d n=%u capped\n",stat->pid,(unsigned)stat->calls);
         }
     }
     return status;
